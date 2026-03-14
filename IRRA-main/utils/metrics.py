@@ -52,6 +52,27 @@ class Evaluator():
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("IRRA.eval")
 
+    def _encode_text_feature(self, model, caption):
+        if hasattr(model, "encode_text_eval"):
+            return model.encode_text_eval(caption)
+        # Prefer explicit deterministic text encoder when provided by model.
+        if hasattr(model, "encode_text_deterministic"):
+            return model.encode_text_deterministic(caption)
+        return model.encode_text(caption)
+
+    def _encode_gallery_feature(self, model, img, thermal_img=None):
+        if hasattr(model, "encode_rgbt_eval"):
+            return model.encode_rgbt_eval(img, thermal_img)
+        # Prefer explicit deterministic fused visual encoder when available.
+        if thermal_img is not None and hasattr(model, "encode_rgbt_deterministic"):
+            return model.encode_rgbt_deterministic(img, thermal_img)
+        if thermal_img is None:
+            return model.encode_image(img)
+        # Fallback for models without dedicated RGBT helper.
+        rgb_feat = model.encode_image(img)
+        t_feat = model.encode_image(thermal_img)
+        return rgb_feat + t_feat
+
     def _compute_embedding(self, model):
         # Encode all queries and gallery samples once, then evaluate by matrix ops.
         model = model.eval()
@@ -62,17 +83,27 @@ class Evaluator():
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
             with torch.no_grad():
-                text_feat = model.encode_text(caption)
+                text_feat = self._encode_text_feature(model, caption)
             qids.append(pid.view(-1)) # flatten 
             qfeats.append(text_feat)
         qids = torch.cat(qids, 0)
         qfeats = torch.cat(qfeats, 0)
 
         # Encode gallery images.
-        for pid, img in self.img_loader:
-            img = img.to(device)
+        for data in self.img_loader:
+            # Compatible with:
+            #   (pid, img) for RGB-only gallery
+            #   (pid, rgb_img, thermal_img) for RGB-T gallery
+            if len(data) == 3:
+                pid, img, thermal_img = data
+                img = img.to(device)
+                thermal_img = thermal_img.to(device)
+            else:
+                pid, img = data
+                img = img.to(device)
+                thermal_img = None
             with torch.no_grad():
-                img_feat = model.encode_image(img)
+                img_feat = self._encode_gallery_feature(model, img, thermal_img)
             gids.append(pid.view(-1)) # flatten 
             gfeats.append(img_feat)
         gids = torch.cat(gids, 0)

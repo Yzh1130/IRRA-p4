@@ -76,10 +76,24 @@ class ImageTextDataset(Dataset):
 
     def __getitem__(self, index):
         # Each item returns one image-text pair plus identity metadata.
-        pid, image_id, img_path, caption = self.dataset[index]
+        sample = self.dataset[index]
+        # Legacy format: (pid, image_id, img_path, caption)
+        # RGBT format:  (pid, image_id, rgb_path, thermal_path, caption)
+        if len(sample) == 5:
+            pid, image_id, img_path, t_img_path, caption = sample
+        else:
+            pid, image_id, img_path, caption = sample
+            t_img_path = None
+
         img = read_image(img_path)
         if self.transform is not None:
             img = self.transform(img)
+
+        if t_img_path is not None:
+            # Thermal image uses the same transform pipeline/size as RGB.
+            t_img = read_image(t_img_path)
+            if self.transform is not None:
+                t_img = self.transform(t_img)
 
         # Tokenize caption into fixed-length CLIP token ids.
         tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
@@ -90,6 +104,8 @@ class ImageTextDataset(Dataset):
             'images': img,
             'caption_ids': tokens,
         }
+        if t_img_path is not None:
+            ret['thermal_images'] = t_img
 
         return ret
 
@@ -110,6 +126,30 @@ class ImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return pid, img
+
+
+class ImageDatasetRGBT(Dataset):
+    def __init__(self, image_pids, img_paths_rgb, img_paths_t, transform=None):
+        self.image_pids = image_pids
+        self.img_paths_rgb = img_paths_rgb
+        self.img_paths_t = img_paths_t
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_pids)
+
+    def __getitem__(self, index):
+        # Gallery item for text-to-RGBT retrieval evaluation.
+        pid = self.image_pids[index]
+        rgb_path = self.img_paths_rgb[index]
+        t_path = self.img_paths_t[index]
+
+        rgb_img = read_image(rgb_path)
+        t_img = read_image(t_path)
+        if self.transform is not None:
+            rgb_img = self.transform(rgb_img)
+            t_img = self.transform(t_img)
+        return pid, rgb_img, t_img
 
 
 class TextDataset(Dataset):
@@ -154,10 +194,24 @@ class ImageTextMLMDataset(Dataset):
 
     def __getitem__(self, index):
         # Same as ImageTextDataset, but also builds MLM inputs/labels.
-        pid, image_id, img_path, caption = self.dataset[index]
+        sample = self.dataset[index]
+        # Legacy format: (pid, image_id, img_path, caption)
+        # RGBT format:  (pid, image_id, rgb_path, thermal_path, caption)
+        if len(sample) == 5:
+            pid, image_id, img_path, t_img_path, caption = sample
+        else:
+            pid, image_id, img_path, caption = sample
+            t_img_path = None
+
         img = read_image(img_path)
         if self.transform is not None:
             img = self.transform(img)
+
+        if t_img_path is not None:
+            # Thermal image uses the same transform pipeline/size as RGB.
+            t_img = read_image(t_img_path)
+            if self.transform is not None:
+                t_img = self.transform(t_img)
         
         caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
 
@@ -172,6 +226,8 @@ class ImageTextMLMDataset(Dataset):
             'mlm_ids': mlm_tokens,
             'mlm_labels': mlm_labels
         }
+        if t_img_path is not None:
+            ret['thermal_images'] = t_img
 
         return ret
 

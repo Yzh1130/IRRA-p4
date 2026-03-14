@@ -34,6 +34,29 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+
+    ######################## MUM / probabilistic alignment settings ########################
+    parser.add_argument("--use_mum", default=False, action='store_true', help="use probabilistic global alignment")
+    parser.add_argument("--omega", type=float, default=0.5, help="batch/id uncertainty mixing weight")
+    parser.add_argument("--uncertainty_scale", type=float, default=1.0, help="global uncertainty scale")
+    parser.add_argument("--memory_bank_size", type=int, default=0, help="0 means using num_classes as memory size")
+    parser.add_argument("--lambda_mlm", type=float, default=1.0, help="weight for mlm loss in probabilistic training")
+    parser.add_argument("--use_rgbt_add_fusion", default=True, action='store_true', help="use F_c = V_rgb_c + V_t_c")
+    parser.add_argument("--no_use_rgbt_add_fusion", dest='use_rgbt_add_fusion', action='store_false', help="disable RGB-T add fusion, use RGB-only global feature")
+    parser.add_argument("--use_batch_uncertainty", default=True, action='store_true', help="enable batch-level uncertainty")
+    parser.add_argument("--no_use_batch_uncertainty", dest='use_batch_uncertainty', action='store_false', help="disable batch-level uncertainty")
+    parser.add_argument("--use_id_uncertainty", default=True, action='store_true', help="enable identity-level uncertainty from memory bank")
+    parser.add_argument("--no_use_id_uncertainty", dest='use_id_uncertainty', action='store_false', help="disable identity-level uncertainty")
+    parser.add_argument("--use_prob_sampling", default=False, action='store_true', help="enable probabilistic reparameterization sampling")
+    parser.add_argument("--no_use_prob_sampling", dest='use_prob_sampling', action='store_false', help="disable probabilistic reparameterization sampling")
+    # Ablation presets:
+    # 1) no MUM: --no_use_rgbt_add_fusion(optional baseline) --loss_names sdm+...
+    #    with --use_mum omitted (False by default)
+    # 2) batch-only UM: --use_mum --use_batch_uncertainty --no_use_id_uncertainty
+    # 3) id-only UM: --use_mum --no_use_batch_uncertainty --use_id_uncertainty
+    # 4) full MUM: --use_mum --use_batch_uncertainty --use_id_uncertainty
+    # 5) deterministic training: --use_mum --no_use_prob_sampling (default)
+    # 6) probabilistic training: --use_mum --use_prob_sampling
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

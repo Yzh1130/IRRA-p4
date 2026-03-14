@@ -8,13 +8,25 @@ from torch.utils.data.distributed import DistributedSampler
 
 from utils.comm import get_world_size
 
-from .bases import ImageDataset, TextDataset, ImageTextDataset, ImageTextMLMDataset
+from .bases import (
+    ImageDataset,
+    ImageDatasetRGBT,
+    TextDataset,
+    ImageTextDataset,
+    ImageTextMLMDataset,
+)
 
 from .cuhkpedes import CUHKPEDES
 from .icfgpedes import ICFGPEDES
 from .rstpreid import RSTPReid
+from .rgbtpedes import RGBTPEDES
 
-__factory = {'CUHK-PEDES': CUHKPEDES, 'ICFG-PEDES': ICFGPEDES, 'RSTPReid': RSTPReid}
+__factory = {
+    'CUHK-PEDES': CUHKPEDES,
+    'ICFG-PEDES': ICFGPEDES,
+    'RSTPReid': RSTPReid,
+    'RGBT-PEDES': RGBTPEDES,
+}
 
 
 def build_transforms(img_size=(384, 128), aug=False, is_train=True):
@@ -137,8 +149,13 @@ def build_dataloader(args, tranforms=None):
 
         # Validation split can be val or test, controlled by args.val_dataset.
         ds = dataset.val if args.val_dataset == 'val' else dataset.test
-        val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                   val_transforms)
+        if "img_paths_t" in ds:
+            val_img_set = ImageDatasetRGBT(
+                ds["image_pids"], ds["img_paths"], ds["img_paths_t"], val_transforms
+            )
+        else:
+            val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
+                                       val_transforms)
         val_txt_set = TextDataset(ds['caption_pids'],
                                   ds['captions'],
                                   text_length=args.text_length)
@@ -164,8 +181,13 @@ def build_dataloader(args, tranforms=None):
                                                is_train=False)
 
         ds = dataset.test
-        test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                    test_transforms)
+        if "img_paths_t" in ds:
+            test_img_set = ImageDatasetRGBT(
+                ds["image_pids"], ds["img_paths"], ds["img_paths_t"], test_transforms
+            )
+        else:
+            test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
+                                        test_transforms)
         test_txt_set = TextDataset(ds['caption_pids'],
                                    ds['captions'],
                                    text_length=args.text_length)
