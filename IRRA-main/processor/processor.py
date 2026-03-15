@@ -21,7 +21,7 @@ def _to_scalar(value):
 def _build_total_loss(args, ret):
     """
     When use_mum is enabled:
-      total_loss = loss_sdm_prob + lambda_mlm * loss_mlm
+      total_loss = loss_sdm_prob + lambda_det * loss_sdm_det + lambda_mlm * loss_mlm
     Otherwise keep legacy behavior:
       total_loss = sum(all keys containing 'loss')
     """
@@ -31,10 +31,17 @@ def _build_total_loss(args, ret):
             raise KeyError(
                 "use_mum=True requires model to return 'loss_sdm_prob' or 'sdm_loss'."
             )
+        loss_sdm_det = ret.get("loss_sdm_det", None)
+        if loss_sdm_det is None:
+            loss_sdm_det = loss_sdm_prob.new_zeros(())
         loss_mlm = ret.get("loss_mlm", ret.get("mlm_loss", None))
         if loss_mlm is None:
             loss_mlm = loss_sdm_prob.new_zeros(())
-        return loss_sdm_prob + getattr(args, "lambda_mlm", 1.0) * loss_mlm
+        return (
+            loss_sdm_prob
+            + getattr(args, "lambda_det", 0.5) * loss_sdm_det
+            + getattr(args, "lambda_mlm", 1.0) * loss_mlm
+        )
 
     # Legacy mode: sum all losses but avoid double-counting SDM alias
     # ('sdm_loss' and 'loss_sdm_prob' point to the same term).
@@ -75,6 +82,7 @@ def do_train(
         "loss": AverageMeter(),
         "sdm_loss": AverageMeter(),
         "loss_sdm_prob": AverageMeter(),
+        "loss_sdm_det": AverageMeter(),
         "itc_loss": AverageMeter(),
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
@@ -106,6 +114,10 @@ def do_train(
             meters["sdm_loss"].update(_to_scalar(ret.get("sdm_loss", 0)), batch_size)
             meters["loss_sdm_prob"].update(
                 _to_scalar(ret.get("loss_sdm_prob", ret.get("sdm_loss", 0))),
+                batch_size,
+            )
+            meters["loss_sdm_det"].update(
+                _to_scalar(ret.get("loss_sdm_det", 0)),
                 batch_size,
             )
             meters["itc_loss"].update(_to_scalar(ret.get("itc_loss", 0)), batch_size)

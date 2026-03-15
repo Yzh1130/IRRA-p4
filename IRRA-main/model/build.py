@@ -248,6 +248,8 @@ class IRRA(nn.Module):
 
         p_f = uncertainty_outputs["fused_feat_sampled"]  # [B, C]
         p_t = uncertainty_outputs["text_feat_sampled"]   # [B, C]
+        f_det = uncertainty_outputs["fused_feat_det"]    # [B, C]
+        t_det = uncertainty_outputs["text_feat_det"]     # [B, C]
 
         # Required outputs for downstream losses/logging.
         ret.update(uncertainty_outputs)
@@ -255,6 +257,11 @@ class IRRA(nn.Module):
             {
                 "v_rgb_c": v_rgb_c,  # [B, C]
                 "v_t_c": v_t_c,      # [B, C]
+                # Canonical aliases requested by trainer side.
+                "fused_det_feat": f_det,
+                "text_det_feat": t_det,
+                "fused_prob_feat": p_f,
+                "text_prob_feat": p_t,
             }
         )
 
@@ -276,6 +283,14 @@ class IRRA(nn.Module):
                     "sdm_loss": loss_sdm_prob,
                 }
             )
+            if self.use_mum:
+                ret.update(
+                    {
+                        "loss_sdm_det": objectives.compute_sdm(
+                            f_det, t_det, batch["pids"], logit_scale
+                        )
+                    }
+                )
 
         if "cmpm" in self.current_task:
             ret.update({"cmpm_loss": objectives.compute_cmpm(p_f, p_t, batch["pids"])})

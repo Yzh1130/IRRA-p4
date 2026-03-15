@@ -40,6 +40,7 @@ def get_args():
     parser.add_argument("--omega", type=float, default=0.5, help="batch/id uncertainty mixing weight")
     parser.add_argument("--uncertainty_scale", type=float, default=1.0, help="global uncertainty scale")
     parser.add_argument("--memory_bank_size", type=int, default=0, help="0 means using num_classes as memory size")
+    parser.add_argument("--lambda_det", type=float, default=0.5, help="weight for deterministic SDM loss")
     parser.add_argument("--lambda_mlm", type=float, default=1.0, help="weight for mlm loss in probabilistic training")
     parser.add_argument("--use_rgbt_add_fusion", default=True, action='store_true', help="use F_c = V_rgb_c + V_t_c")
     parser.add_argument("--no_use_rgbt_add_fusion", dest='use_rgbt_add_fusion', action='store_false', help="disable RGB-T add fusion, use RGB-only global feature")
