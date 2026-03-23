@@ -4,6 +4,7 @@ import time
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from model import objectives
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
@@ -37,25 +38,169 @@ def _build_total_loss(args, ret):
         loss_mlm = ret.get("loss_mlm", ret.get("mlm_loss", None))
         if loss_mlm is None:
             loss_mlm = loss_sdm_prob.new_zeros(())
-        return (
+        total_loss = (
             loss_sdm_prob
             + getattr(args, "lambda_det", 0.5) * loss_sdm_det
             + getattr(args, "lambda_mlm", 1.0) * loss_mlm
         )
+    else:
+        # Legacy mode: sum all losses but avoid double-counting SDM alias
+        # ('sdm_loss' and 'loss_sdm_prob' point to the same term).
+        total_loss = None
+        for k, v in ret.items():
+            if "loss" not in k:
+                continue
+            if k == "loss_sdm_prob" and "sdm_loss" in ret:
+                continue
+            # These terms are added explicitly with dedicated weights below.
+            if k in {
+                "loss_unc_total",
+                "loss_unc_text_rgb",
+                "loss_unc_rgb_thermal",
+                "loss_unc_text_thermal",
+                "loss_var_reg",
+            }:
+                continue
+            total_loss = v if total_loss is None else total_loss + v
 
-    # Legacy mode: sum all losses but avoid double-counting SDM alias
-    # ('sdm_loss' and 'loss_sdm_prob' point to the same term).
-    total_loss = None
-    for k, v in ret.items():
-        if "loss" not in k:
-            continue
-        if k == "loss_sdm_prob" and "sdm_loss" in ret:
-            continue
-        total_loss = v if total_loss is None else total_loss + v
+        if total_loss is None:
+            raise KeyError("No loss term found in model outputs.")
 
-    if total_loss is None:
-        raise KeyError("No loss term found in model outputs.")
+    if getattr(args, "use_global_uncertainty", False):
+        if "loss_unc_total" in ret:
+            total_loss = total_loss + getattr(args, "lambda_unc", 0.1) * ret["loss_unc_total"]
+        if "loss_var_reg" in ret:
+            total_loss = total_loss + getattr(args, "lambda_var_reg", 1e-4) * ret["loss_var_reg"]
     return total_loss
+
+
+def _mean_positive_pairwise_distance(dist_matrix, pids=None):
+    """
+    Average pairwise distance over positive matches.
+
+    If pids are provided, positives are defined by pid equality (same as SDM label logic).
+    Otherwise, fallback to diagonal matched pairs (index-aligned assumption).
+    """
+    if pids is None:
+        return torch.diagonal(dist_matrix).mean()
+
+    pids = pids.reshape(-1)
+    pos_mask = pids.unsqueeze(1).eq(pids.unsqueeze(0))
+    if pos_mask.any():
+        return dist_matrix[pos_mask].mean()
+    return torch.diagonal(dist_matrix).mean()
+
+
+def _compute_uncertainty_alignment_terms(args, ret, batch):
+    """
+    Compute global uncertainty alignment losses from model outputs.
+
+    Uses closed-form diagonal Gaussian W2^2 on global features:
+      - text <-> rgb
+      - rgb <-> thermal
+      - text <-> thermal (optional, weighted by lambda_tt)
+
+    Assumption:
+      Current dataloader provides paired image-text samples per batch row.
+      When repeated identities appear in a batch, we use pid-equality positive masks.
+    """
+    if not getattr(args, "use_global_uncertainty", False):
+        return {}
+
+    required = [
+        "text_mu",
+        "text_logvar",
+        "rgb_mu",
+        "rgb_logvar",
+        "thermal_mu",
+        "thermal_logvar",
+    ]
+    missing = [k for k in required if k not in ret]
+    if missing:
+        raise KeyError(
+            "use_global_uncertainty=True requires model outputs to include "
+            f"{missing}, but got keys: {list(ret.keys())}"
+        )
+
+    text_mu = ret["text_mu"]
+    text_logvar = ret["text_logvar"]
+    rgb_mu = ret["rgb_mu"]
+    rgb_logvar = ret["rgb_logvar"]
+    thermal_mu = ret["thermal_mu"]
+    thermal_logvar = ret["thermal_logvar"]
+    pids = batch.get("pids", None)
+    has_thermal = "thermal_images" in batch
+
+    eps = float(getattr(args, "uncertainty_eps", 1e-6))
+    logvar_min = float(getattr(args, "logvar_min", -6.0))
+    logvar_max = float(getattr(args, "logvar_max", 4.0))
+
+    tr_dist = objectives.compute_w2_diag_pairwise_matrix(
+        mu1=text_mu,
+        logvar1=text_logvar,
+        mu2=rgb_mu,
+        logvar2=rgb_logvar,
+        eps=eps,
+        logvar_min=logvar_min,
+        logvar_max=logvar_max,
+    )
+    loss_unc_text_rgb = _mean_positive_pairwise_distance(tr_dist, pids)
+
+    if has_thermal:
+        rt_dist = objectives.compute_w2_diag_pairwise_matrix(
+            mu1=rgb_mu,
+            logvar1=rgb_logvar,
+            mu2=thermal_mu,
+            logvar2=thermal_logvar,
+            eps=eps,
+            logvar_min=logvar_min,
+            logvar_max=logvar_max,
+        )
+        loss_unc_rgb_thermal = _mean_positive_pairwise_distance(rt_dist, pids)
+    else:
+        loss_unc_rgb_thermal = loss_unc_text_rgb.new_zeros(())
+
+    if has_thermal and float(getattr(args, "lambda_tt", 0.0)) > 0.0:
+        tt_dist = objectives.compute_w2_diag_pairwise_matrix(
+            mu1=text_mu,
+            logvar1=text_logvar,
+            mu2=thermal_mu,
+            logvar2=thermal_logvar,
+            eps=eps,
+            logvar_min=logvar_min,
+            logvar_max=logvar_max,
+        )
+        loss_unc_text_thermal = _mean_positive_pairwise_distance(tt_dist, pids)
+    else:
+        loss_unc_text_thermal = loss_unc_text_rgb.new_zeros(())
+
+    loss_unc_total = (
+        float(getattr(args, "lambda_tr", 1.0)) * loss_unc_text_rgb
+        + float(getattr(args, "lambda_rt", 1.0)) * loss_unc_rgb_thermal
+        + float(getattr(args, "lambda_tt", 0.0)) * loss_unc_text_thermal
+    )
+
+    # Lightweight logvar regularization to avoid explosion/collapse.
+    var_reg_terms = [text_logvar.pow(2).mean(), rgb_logvar.pow(2).mean()]
+    if has_thermal:
+        var_reg_terms.append(thermal_logvar.pow(2).mean())
+    if "fused_logvar" in ret and torch.is_tensor(ret["fused_logvar"]):
+        var_reg_terms.append(ret["fused_logvar"].pow(2).mean())
+    loss_var_reg = sum(var_reg_terms) / len(var_reg_terms)
+
+    out = {
+        "loss_unc_total": loss_unc_total,
+        "loss_unc_text_rgb": loss_unc_text_rgb,
+        "loss_unc_rgb_thermal": loss_unc_rgb_thermal,
+        "loss_unc_text_thermal": loss_unc_text_thermal,
+        "loss_var_reg": loss_var_reg,
+        "mean_text_logvar": text_logvar.mean(),
+        "mean_rgb_logvar": rgb_logvar.mean(),
+        "mean_thermal_logvar": thermal_logvar.mean(),
+    }
+    if "fused_logvar" in ret and torch.is_tensor(ret["fused_logvar"]):
+        out["mean_fused_logvar"] = ret["fused_logvar"].mean()
+    return out
 
 
 def do_train(
@@ -87,6 +232,15 @@ def do_train(
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
         "loss_mlm": AverageMeter(),
+        "loss_unc_total": AverageMeter(),
+        "loss_unc_text_rgb": AverageMeter(),
+        "loss_unc_rgb_thermal": AverageMeter(),
+        "loss_unc_text_thermal": AverageMeter(),
+        "loss_var_reg": AverageMeter(),
+        "mean_text_logvar": AverageMeter(),
+        "mean_rgb_logvar": AverageMeter(),
+        "mean_thermal_logvar": AverageMeter(),
+        "mean_fused_logvar": AverageMeter(),
         "avg_fused_batch_uncertainty": AverageMeter(),
         "avg_text_batch_uncertainty": AverageMeter(),
         "img_acc": AverageMeter(),
@@ -107,6 +261,7 @@ def do_train(
             batch = {k: v.to(device) for k, v in batch.items()}
 
             ret = model(batch)
+            ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             total_loss = _build_total_loss(args, ret)
 
             batch_size = batch["images"].shape[0]
@@ -125,6 +280,33 @@ def do_train(
             meters["mlm_loss"].update(_to_scalar(ret.get("mlm_loss", 0)), batch_size)
             meters["loss_mlm"].update(
                 _to_scalar(ret.get("loss_mlm", ret.get("mlm_loss", 0))), batch_size
+            )
+            meters["loss_unc_total"].update(
+                _to_scalar(ret.get("loss_unc_total", 0)), batch_size
+            )
+            meters["loss_unc_text_rgb"].update(
+                _to_scalar(ret.get("loss_unc_text_rgb", 0)), batch_size
+            )
+            meters["loss_unc_rgb_thermal"].update(
+                _to_scalar(ret.get("loss_unc_rgb_thermal", 0)), batch_size
+            )
+            meters["loss_unc_text_thermal"].update(
+                _to_scalar(ret.get("loss_unc_text_thermal", 0)), batch_size
+            )
+            meters["loss_var_reg"].update(
+                _to_scalar(ret.get("loss_var_reg", 0)), batch_size
+            )
+            meters["mean_text_logvar"].update(
+                _to_scalar(ret.get("mean_text_logvar", 0)), batch_size
+            )
+            meters["mean_rgb_logvar"].update(
+                _to_scalar(ret.get("mean_rgb_logvar", 0)), batch_size
+            )
+            meters["mean_thermal_logvar"].update(
+                _to_scalar(ret.get("mean_thermal_logvar", 0)), batch_size
+            )
+            meters["mean_fused_logvar"].update(
+                _to_scalar(ret.get("mean_fused_logvar", 0)), batch_size
             )
 
             if "sigma_batch_f" in ret:

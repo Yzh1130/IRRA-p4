@@ -9,8 +9,8 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--name", default="baseline", help="experiment name to save")
     parser.add_argument("--output_dir", default="logs")
-    parser.add_argument("--log_period", default=100)
-    parser.add_argument("--eval_period", default=1)
+    parser.add_argument("--log_period", type=int, default=100)
+    parser.add_argument("--eval_period", type=int, default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
@@ -34,6 +34,26 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+
+    ######################## global uncertainty feature settings ########################
+    # Feature-level uncertainty modeling over global embeddings only.
+    parser.add_argument("--use_global_uncertainty", default=False, action='store_true', help="enable global diagonal-Gaussian feature heads")
+    parser.add_argument("--uncertainty_dist_type", type=str, default="diag_gaussian", help="global uncertainty distribution type")
+    parser.add_argument("--logvar_min", type=float, default=-6.0, help="minimum clamp value for predicted log-variance")
+    parser.add_argument("--logvar_max", type=float, default=4.0, help="maximum clamp value for predicted log-variance")
+    parser.add_argument("--use_precision_fusion", default=None, action='store_true', help="use precision-weighted RGB-T fusion for Gaussian globals")
+    parser.add_argument("--no_use_precision_fusion", dest='use_precision_fusion', action='store_false', help="disable precision fusion and fallback to baseline fusion")
+    parser.add_argument("--uncertainty_loss_type", type=str, default="w2", help="closed-form uncertainty distance type")
+    parser.add_argument("--uncertainty_eps", type=float, default=1e-6, help="numeric epsilon for uncertainty computations")
+    parser.add_argument("--lambda_unc", type=float, default=0.1, help="weight for uncertainty distribution alignment loss")
+    parser.add_argument("--lambda_tr", type=float, default=1.0, help="inner weight for text-rgb uncertainty alignment")
+    parser.add_argument("--lambda_rt", type=float, default=1.0, help="inner weight for rgb-thermal uncertainty alignment")
+    parser.add_argument("--lambda_tt", type=float, default=0.0, help="inner weight for text-thermal uncertainty alignment")
+    parser.add_argument("--lambda_var_reg", type=float, default=1e-4, help="weight for log-variance regularization")
+    parser.add_argument("--eval_use_fused_mu", default=True, action='store_true', help="use fused_mu as visual embedding in evaluation when available")
+    parser.add_argument("--no_eval_use_fused_mu", dest='eval_use_fused_mu', action='store_false', help="disable fused_mu in evaluation")
+    parser.add_argument("--eval_use_mu_only", default=False, action='store_true', help="force evaluation to use rgb_mu only")
+    parser.add_argument("--no_eval_use_mu_only", dest='eval_use_mu_only', action='store_false', help="disable rgb_mu-only evaluation")
 
     ######################## MUM / probabilistic alignment settings ########################
     parser.add_argument("--use_mum", default=False, action='store_true', help="use probabilistic global alignment")

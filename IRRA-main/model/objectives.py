@@ -127,3 +127,150 @@ def compute_cmpm(image_embeddings, text_embeddings, labels, epsilon=1e-8):
     cmpm_loss = torch.mean(torch.sum(i2t_loss, dim=1)) + torch.mean(torch.sum(t2i_loss, dim=1))
 
     return cmpm_loss
+
+
+def _diag_gaussian_sigma_from_logvar(
+    logvar,
+    eps=1e-6,
+    logvar_min=-6.0,
+    logvar_max=4.0,
+):
+    """
+    Convert log-variance to std for diagonal Gaussian with safety clamps.
+
+    Args:
+        logvar: [B, D] or [N, D], per-dimension log-variance.
+        eps: scalar, minimum variance epsilon.
+        logvar_min: scalar, lower clamp bound for logvar.
+        logvar_max: scalar, upper clamp bound for logvar.
+    Returns:
+        sigma: same shape as logvar, where sigma = exp(0.5 * clamp(logvar)).
+    """
+    clamped_logvar = torch.clamp(logvar, min=logvar_min, max=logvar_max)
+    sigma = torch.exp(0.5 * clamped_logvar)
+    sigma = sigma.clamp_min(eps ** 0.5)
+    return sigma
+
+
+def compute_w2_diag_distance(
+    mu1,
+    logvar1,
+    mu2,
+    logvar2,
+    pairwise=False,
+    squared=True,
+    eps=1e-6,
+    logvar_min=-6.0,
+    logvar_max=4.0,
+):
+    """
+    Closed-form diagonal Gaussian W2 distance.
+
+    For N(mu, diag(sigma^2)), diagonal Gaussian 2-Wasserstein (squared) is:
+      W2^2 = ||mu1 - mu2||^2 + ||sigma1 - sigma2||^2
+      sigma = exp(0.5 * logvar)
+
+    Args:
+        mu1: [B1, D], first mean tensor.
+        logvar1: [B1, D], first log-variance tensor.
+        mu2: [B2, D] for pairwise=True, else [B1, D].
+        logvar2: [B2, D] for pairwise=True, else [B1, D].
+        pairwise: bool, return full [B1, B2] distance matrix if True.
+        squared: bool, return W2^2 if True, else return W2.
+        eps: scalar epsilon for numeric stability.
+        logvar_min/logvar_max: clamp range for logvar.
+    Returns:
+        dist:
+          - [B1] for matched pairs (pairwise=False)
+          - [B1, B2] for pairwise matrix (pairwise=True)
+    """
+    sigma1 = _diag_gaussian_sigma_from_logvar(
+        logvar1, eps=eps, logvar_min=logvar_min, logvar_max=logvar_max
+    )
+    sigma2 = _diag_gaussian_sigma_from_logvar(
+        logvar2, eps=eps, logvar_min=logvar_min, logvar_max=logvar_max
+    )
+
+    if pairwise:
+        mu_term = torch.cdist(mu1, mu2, p=2).pow(2)
+        sigma_term = torch.cdist(sigma1, sigma2, p=2).pow(2)
+        dist_sq = mu_term + sigma_term
+    else:
+        dist_sq = (mu1 - mu2).pow(2).sum(dim=-1) + (sigma1 - sigma2).pow(2).sum(
+            dim=-1
+        )
+
+    if squared:
+        return dist_sq
+    return torch.sqrt(dist_sq + eps)
+
+
+def compute_w2_diag_matched_loss(
+    mu1,
+    logvar1,
+    mu2,
+    logvar2,
+    reduction="mean",
+    eps=1e-6,
+    logvar_min=-6.0,
+    logvar_max=4.0,
+):
+    """
+    Matched-pair diagonal Gaussian W2^2 loss over a batch.
+
+    Args:
+        mu1, logvar1, mu2, logvar2: [B, D]
+        reduction: one of {"mean", "sum", "none"}.
+    Returns:
+        Scalar loss for mean/sum or [B] vector for none.
+    """
+    dist_sq = compute_w2_diag_distance(
+        mu1=mu1,
+        logvar1=logvar1,
+        mu2=mu2,
+        logvar2=logvar2,
+        pairwise=False,
+        squared=True,
+        eps=eps,
+        logvar_min=logvar_min,
+        logvar_max=logvar_max,
+    )
+
+    if reduction == "mean":
+        return dist_sq.mean()
+    if reduction == "sum":
+        return dist_sq.sum()
+    if reduction == "none":
+        return dist_sq
+    raise ValueError(f"Unsupported reduction: {reduction}")
+
+
+def compute_w2_diag_pairwise_matrix(
+    mu1,
+    logvar1,
+    mu2,
+    logvar2,
+    eps=1e-6,
+    logvar_min=-6.0,
+    logvar_max=4.0,
+):
+    """
+    Pairwise diagonal Gaussian W2^2 matrix.
+
+    Args:
+        mu1, logvar1: [B1, D]
+        mu2, logvar2: [B2, D]
+    Returns:
+        dist_matrix: [B1, B2], W2^2 for each pair.
+    """
+    return compute_w2_diag_distance(
+        mu1=mu1,
+        logvar1=logvar1,
+        mu2=mu2,
+        logvar2=logvar2,
+        pairwise=True,
+        squared=True,
+        eps=eps,
+        logvar_min=logvar_min,
+        logvar_max=logvar_max,
+    )

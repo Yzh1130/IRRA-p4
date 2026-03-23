@@ -32,9 +32,43 @@ class IRRA(nn.Module):
 
         # Ablation switches.
         self.use_rgbt_add_fusion = getattr(args, "use_rgbt_add_fusion", True)
-        self.use_mum = getattr(
-            args, "use_mum", getattr(args, "use_global_uncertainty", False)
+        self.use_mum = bool(getattr(args, "use_mum", False))
+        self.use_global_uncertainty = bool(
+            getattr(args, "use_global_uncertainty", False)
         )
+        self.uncertainty_dist_type = str(
+            getattr(args, "uncertainty_dist_type", "diag_gaussian")
+        ).lower()
+        self.logvar_min = float(getattr(args, "logvar_min", -6.0))
+        self.logvar_max = float(getattr(args, "logvar_max", 4.0))
+        self.uncertainty_loss_type = str(
+            getattr(args, "uncertainty_loss_type", "w2")
+        ).lower()
+        self.uncertainty_eps = float(getattr(args, "uncertainty_eps", 1e-6))
+        configured_precision_fusion = getattr(args, "use_precision_fusion", None)
+        if configured_precision_fusion is None:
+            # Default: enable precision fusion whenever global uncertainty is enabled.
+            self.use_precision_fusion = self.use_global_uncertainty
+        else:
+            self.use_precision_fusion = bool(configured_precision_fusion)
+        self.eval_use_fused_mu = bool(getattr(args, "eval_use_fused_mu", True))
+        self.eval_use_mu_only = bool(getattr(args, "eval_use_mu_only", False))
+        if self.use_global_uncertainty and self.uncertainty_dist_type != "diag_gaussian":
+            raise ValueError(
+                f"Unsupported uncertainty_dist_type={self.uncertainty_dist_type}. "
+                "Only 'diag_gaussian' is currently implemented."
+            )
+
+        # Global uncertainty heads (pooled global feature -> mu/logvar).
+        # They are only activated by use_global_uncertainty switch.
+        self.text_mu_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self.text_logvar_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self.rgb_mu_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self.rgb_logvar_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self.thermal_mu_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self.thermal_logvar_head = nn.Linear(self.embed_dim, self.embed_dim)
+        self._init_global_uncertainty_heads()
+
         self.use_batch_uncertainty = getattr(
             args, "use_batch_uncertainty", getattr(args, "mum_use_batch_var", True)
         )
@@ -44,7 +78,6 @@ class IRRA(nn.Module):
         self.use_prob_sampling = getattr(
             args, "use_prob_sampling", getattr(args, "mum_sample_enabled", False)
         )
-        self.use_global_uncertainty = self.use_mum
         configured_bank_size = int(getattr(args, "memory_bank_size", 0) or 0)
         bank_size = (
             max(self.num_classes, configured_bank_size)
@@ -64,7 +97,7 @@ class IRRA(nn.Module):
             # Keep evaluation deterministic regardless of use_prob_sampling.
             sample_on_eval=False,
             memory_momentum=getattr(args, "mum_memory_momentum", 0.9),
-            eps=getattr(args, "mum_eps", 1e-6),
+            eps=getattr(args, "mum_eps", self.uncertainty_eps),
         )
 
         if "id" in args.loss_names:
@@ -116,6 +149,150 @@ class IRRA(nn.Module):
         self.current_task = [l.strip() for l in loss_names.split("+")]
         print(f"Training Model with {self.current_task} tasks")
 
+    def _init_global_uncertainty_heads(self):
+        # Initialize mu head as near-identity projection and logvar head as zeros.
+        for head in [self.text_mu_head, self.rgb_mu_head, self.thermal_mu_head]:
+            nn.init.eye_(head.weight.data)
+            nn.init.constant_(head.bias.data, 0.0)
+        for head in [
+            self.text_logvar_head,
+            self.rgb_logvar_head,
+            self.thermal_logvar_head,
+        ]:
+            nn.init.constant_(head.weight.data, 0.0)
+            nn.init.constant_(head.bias.data, 0.0)
+
+    def _use_diag_gaussian_global(self):
+        return self.use_global_uncertainty and self.uncertainty_dist_type == "diag_gaussian"
+
+    def _project_global_gaussian(self, feats, mu_head, logvar_head):
+        # Keep head computation dtype-compatible with fp16-converted parameters.
+        mu = mu_head(feats.to(mu_head.weight.dtype)).float()
+        logvar = logvar_head(feats.to(logvar_head.weight.dtype)).float()
+        logvar = torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
+        return mu, logvar
+
+    def _encode_text_global_gaussian(self, text_global_feat):
+        if not self._use_diag_gaussian_global():
+            return text_global_feat, None
+        return self._project_global_gaussian(
+            text_global_feat, self.text_mu_head, self.text_logvar_head
+        )
+
+    def _encode_visual_global_gaussian(
+        self, rgb_global_feat, thermal_global_feat, thermal_available
+    ):
+        if not self._use_diag_gaussian_global():
+            return rgb_global_feat, None, thermal_global_feat, None
+
+        rgb_mu, rgb_logvar = self._project_global_gaussian(
+            rgb_global_feat, self.rgb_mu_head, self.rgb_logvar_head
+        )
+        if thermal_available:
+            thermal_mu, thermal_logvar = self._project_global_gaussian(
+                thermal_global_feat, self.thermal_mu_head, self.thermal_logvar_head
+            )
+        else:
+            # Keep single-image datasets fully backward compatible.
+            thermal_mu = torch.zeros_like(rgb_mu)
+            thermal_logvar = torch.zeros_like(rgb_logvar)
+        return rgb_mu, rgb_logvar, thermal_mu, thermal_logvar
+
+    def _safe_var_from_logvar(self, logvar):
+        # var = exp(logvar), with clamped logvar for numeric stability.
+        clamped_logvar = torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
+        return torch.exp(clamped_logvar).clamp_min(self.uncertainty_eps)
+
+    def _safe_logvar_from_var(self, var):
+        # log(var + eps) with clamped var floor.
+        safe_var = var.clamp_min(self.uncertainty_eps)
+        logvar = torch.log(safe_var + self.uncertainty_eps)
+        return torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
+
+    def _fuse_rgbt_global(
+        self,
+        rgb_mu,
+        rgb_logvar,
+        thermal_mu,
+        thermal_logvar,
+        thermal_available,
+    ):
+        """
+        Fuse RGB/T thermal global features.
+
+        If diagonal-Gaussian global uncertainty is enabled and use_precision_fusion=True:
+          precision = 1 / (var + eps), var = exp(logvar)
+          precision_fused = precision_rgb + precision_th
+          mu_fused = (precision_rgb * mu_rgb + precision_th * mu_th) / precision_fused
+          var_fused = 1 / precision_fused
+          logvar_fused = log(var_fused + eps)
+
+        Otherwise fallback to baseline-style deterministic add fusion.
+        """
+        if not self._use_diag_gaussian_global():
+            if self.use_rgbt_add_fusion:
+                fused_mu = rgb_mu + thermal_mu
+            else:
+                fused_mu = rgb_mu
+            fused_logvar = torch.zeros_like(fused_mu)
+            return fused_mu, fused_logvar
+
+        rgb_var = self._safe_var_from_logvar(rgb_logvar)
+        thermal_var = self._safe_var_from_logvar(thermal_logvar)
+
+        if thermal_available and self.use_precision_fusion:
+            precision_rgb = 1.0 / (rgb_var + self.uncertainty_eps)
+            precision_th = 1.0 / (thermal_var + self.uncertainty_eps)
+            precision_fused = (precision_rgb + precision_th).clamp_min(
+                self.uncertainty_eps
+            )
+            fused_mu = (
+                precision_rgb * rgb_mu + precision_th * thermal_mu
+            ) / precision_fused
+            fused_var = 1.0 / precision_fused
+            fused_logvar = self._safe_logvar_from_var(fused_var)
+            return fused_mu, fused_logvar
+
+        # Fallback: keep baseline fused representation path.
+        if self.use_rgbt_add_fusion and thermal_available:
+            fused_mu = rgb_mu + thermal_mu
+            fused_var = rgb_var + thermal_var
+        else:
+            fused_mu = rgb_mu
+            fused_var = rgb_var
+        fused_logvar = self._safe_logvar_from_var(fused_var)
+        return fused_mu, fused_logvar
+
+    def compute_uncertainty_distance(
+        self,
+        mu1,
+        logvar1,
+        mu2,
+        logvar2,
+        pairwise=False,
+        squared=True,
+    ):
+        """
+        Compute closed-form uncertainty distance for global Gaussian features.
+        Currently supports diagonal-Gaussian W2 family.
+        """
+        if self.uncertainty_loss_type != "w2":
+            raise ValueError(
+                f"Unsupported uncertainty_loss_type={self.uncertainty_loss_type}. "
+                "Only 'w2' is currently implemented."
+            )
+        return objectives.compute_w2_diag_distance(
+            mu1=mu1,
+            logvar1=logvar1,
+            mu2=mu2,
+            logvar2=logvar2,
+            pairwise=pairwise,
+            squared=squared,
+            eps=self.uncertainty_eps,
+            logvar_min=self.logvar_min,
+            logvar_max=self.logvar_max,
+        )
+
     def cross_former(self, q, k, v):
         x = self.cross_attn(
             self.ln_pre_t(q), self.ln_pre_i(k), self.ln_pre_i(v), need_weights=False
@@ -141,12 +318,35 @@ class IRRA(nn.Module):
 
     def encode_text_deterministic(self, text):
         # Deterministic global text feature used by retrieval evaluation.
-        return self.encode_text(text)
+        text_global_feat = self.encode_text(text)
+        text_mu, _ = self._encode_text_global_gaussian(text_global_feat)
+        # Default deterministic representation remains compatible: use mu if enabled.
+        return text_mu
 
     def encode_rgbt_deterministic(self, rgb_image, thermal_image=None):
         # Deterministic fused visual feature used by retrieval evaluation.
-        _, _, f_c, _ = self.encode_rgbt_global(rgb_image, thermal_image)
-        return f_c
+        rgb_global_feat, thermal_global_feat, _, _ = self.encode_rgbt_global(
+            rgb_image, thermal_image
+        )
+        rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
+            rgb_global_feat,
+            thermal_global_feat,
+            thermal_available=thermal_image is not None,
+        )
+        f_c, _ = self._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=thermal_image is not None,
+        )
+        if self.eval_use_mu_only:
+            return rgb_mu
+        if self.eval_use_fused_mu:
+            return f_c
+        if self.use_rgbt_add_fusion:
+            return rgb_mu + thermal_mu
+        return rgb_mu
 
     def _maybe_eval_sampling(self, feats):
         """
@@ -226,17 +426,39 @@ class IRRA(nn.Module):
         thermal_images = batch.get("thermal_images", None)
         caption_ids = batch["caption_ids"]
 
-        # 1) RGB/Thermal global branch.
-        v_rgb_c, v_t_c, f_c, rgb_tokens = self.encode_rgbt_global(
+        # 1) RGB/Thermal pooled global branch (before uncertainty heads).
+        v_rgb_c_raw, v_t_c_raw, _, rgb_tokens = self.encode_rgbt_global(
             images, thermal_images
         )
 
-        # 2) Text global branch.
+        # 2) Text pooled global branch (before uncertainty heads).
         text_tokens = self.base_model.encode_text(caption_ids)  # [B, L_t, C]
         batch_index = torch.arange(text_tokens.shape[0], device=text_tokens.device)
-        l_c = text_tokens[batch_index, caption_ids.argmax(dim=-1)].float()  # [B, C]
+        l_c_raw = text_tokens[batch_index, caption_ids.argmax(dim=-1)].float()  # [B, C]
 
-        # 3) MUM-style uncertainty over (f_c, l_c).
+        # 3) Optional diagonal-Gaussian heads over global pooled features.
+        # Returned mu/logvar are used by later uncertainty-aware losses/fusion.
+        text_mu, text_logvar = self._encode_text_global_gaussian(l_c_raw)
+        rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
+            v_rgb_c_raw,
+            v_t_c_raw,
+            thermal_available=thermal_images is not None,
+        )
+        fused_mu, fused_logvar = self._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=thermal_images is not None,
+        )
+
+        # Keep existing training/eval flow compatible: deterministic embedding is mu.
+        v_rgb_c = rgb_mu
+        v_t_c = thermal_mu
+        l_c = text_mu
+        f_c = fused_mu
+
+        # 4) MUM-style uncertainty over deterministic global embeddings.
         if self.use_mum:
             uncertainty_outputs = self.global_uncertainty(
                 fused_feats=f_c,
@@ -257,6 +479,8 @@ class IRRA(nn.Module):
             {
                 "v_rgb_c": v_rgb_c,  # [B, C]
                 "v_t_c": v_t_c,      # [B, C]
+                "fused_mu": fused_mu,            # [B, C]
+                "fused_logvar": fused_logvar,    # [B, C]
                 # Canonical aliases requested by trainer side.
                 "fused_det_feat": f_det,
                 "text_det_feat": t_det,
@@ -264,6 +488,19 @@ class IRRA(nn.Module):
                 "text_prob_feat": p_t,
             }
         )
+        if self._use_diag_gaussian_global():
+            ret.update(
+                {
+                    # Per-modality global Gaussian parameters for future
+                    # uncertainty-specific alignment/fusion losses.
+                    "text_mu": text_mu,               # [B, C]
+                    "text_logvar": text_logvar,       # [B, C]
+                    "rgb_mu": rgb_mu,                 # [B, C]
+                    "rgb_logvar": rgb_logvar,         # [B, C]
+                    "thermal_mu": thermal_mu,         # [B, C]
+                    "thermal_logvar": thermal_logvar, # [B, C]
+                }
+            )
 
         logit_scale = self.logit_scale
         ret.update({"temperature": 1 / logit_scale})
@@ -297,8 +534,9 @@ class IRRA(nn.Module):
 
         if "id" in self.current_task:
             # Keep ID branch deterministic.
-            image_logits = self.classifier(f_c.half()).float()
-            text_logits = self.classifier(l_c.half()).float()
+            cls_dtype = self.classifier.weight.dtype
+            image_logits = self.classifier(f_c.to(cls_dtype)).float()
+            text_logits = self.classifier(l_c.to(cls_dtype)).float()
             ret.update(
                 {
                     "id_loss": objectives.compute_id(
