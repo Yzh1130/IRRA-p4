@@ -46,6 +46,61 @@ def compute_sdm(image_fetures, text_fetures, pid, logit_scale, image_id=None, fa
     return loss
 
 
+def compute_distribution_sdm_from_distance(
+    distance_matrix,
+    pid,
+    image_id=None,
+    factor=0.3,
+    epsilon=1e-8,
+    temperature=1.0,
+):
+    """
+    Distribution-aware SDM from pairwise distances.
+
+    Args:
+        distance_matrix: [B, B], pairwise distances (e.g., diagonal Gaussian W2^2).
+        pid: [B], person IDs for positive-pair supervision.
+        image_id: optional [B], same semantics as compute_sdm.
+        factor: optional label fusion factor when image_id is provided.
+        epsilon: numeric epsilon for stable log computation.
+        temperature: positive scalar to scale distance logits.
+    Returns:
+        Scalar bidirectional SDM-style KL loss.
+    """
+    if distance_matrix.dim() != 2 or distance_matrix.shape[0] != distance_matrix.shape[1]:
+        raise ValueError(
+            "distance_matrix for distribution-SDM must be square [B, B], "
+            f"but got shape={tuple(distance_matrix.shape)}"
+        )
+    if temperature <= 0:
+        raise ValueError(f"distribution_sdm_temperature must be > 0, got {temperature}")
+
+    batch_size = distance_matrix.shape[0]
+    pid = pid.reshape((batch_size, 1))
+    pid_dist = pid - pid.t()
+    labels = (pid_dist == 0).float()
+
+    if image_id is not None:
+        image_id = image_id.reshape((-1, 1))
+        image_id_dist = image_id - image_id.t()
+        image_id_mask = (image_id_dist == 0).float()
+        labels = (labels - image_id_mask) * factor + image_id_mask
+
+    labels_distribute = labels / labels.sum(dim=1, keepdim=True).clamp_min(epsilon)
+
+    # Distances are converted to similarities by negative sign.
+    logits_ab = -distance_matrix / temperature
+    logits_ba = logits_ab.t()
+
+    ab_pred = F.softmax(logits_ab, dim=1)
+    ab_loss = ab_pred * (F.log_softmax(logits_ab, dim=1) - torch.log(labels_distribute + epsilon))
+    ba_pred = F.softmax(logits_ba, dim=1)
+    ba_loss = ba_pred * (F.log_softmax(logits_ba, dim=1) - torch.log(labels_distribute + epsilon))
+
+    loss = torch.mean(torch.sum(ab_loss, dim=1)) + torch.mean(torch.sum(ba_loss, dim=1))
+    return loss
+
+
 def compute_mlm(scores, labels):
     # label=0 代表非掩码位置，使用 ignore_index=0 忽略这些位置的损失。
     ce = nn.CrossEntropyLoss(ignore_index=0)

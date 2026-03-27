@@ -59,6 +59,9 @@ def _build_total_loss(args, ret):
                 "loss_unc_rgb_thermal",
                 "loss_unc_text_thermal",
                 "loss_var_reg",
+                "loss_dist_sdm_total",
+                "loss_dist_sdm_text_rgb",
+                "loss_dist_sdm_rgb_thermal",
             }:
                 continue
             total_loss = v if total_loss is None else total_loss + v
@@ -71,6 +74,9 @@ def _build_total_loss(args, ret):
             total_loss = total_loss + getattr(args, "lambda_unc", 0.1) * ret["loss_unc_total"]
         if "loss_var_reg" in ret:
             total_loss = total_loss + getattr(args, "lambda_var_reg", 1e-4) * ret["loss_var_reg"]
+    if getattr(args, "use_distribution_sdm_aux", False):
+        if "loss_dist_sdm_total" in ret:
+            total_loss = total_loss + getattr(args, "lambda_dist_sdm", 1.0) * ret["loss_dist_sdm_total"]
     return total_loss
 
 
@@ -104,7 +110,13 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
       Current dataloader provides paired image-text samples per batch row.
       When repeated identities appear in a batch, we use pid-equality positive masks.
     """
-    if not getattr(args, "use_global_uncertainty", False):
+    use_global_uncertainty = bool(getattr(args, "use_global_uncertainty", False))
+    use_distribution_sdm_aux = bool(getattr(args, "use_distribution_sdm_aux", False))
+    if use_distribution_sdm_aux and not use_global_uncertainty:
+        raise ValueError(
+            "use_distribution_sdm_aux=True requires --use_global_uncertainty."
+        )
+    if not use_global_uncertainty:
         return {}
 
     required = [
@@ -146,6 +158,7 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
     )
     loss_unc_text_rgb = _mean_positive_pairwise_distance(tr_dist, pids)
 
+    rt_dist = None
     if has_thermal:
         rt_dist = objectives.compute_w2_diag_pairwise_matrix(
             mu1=rgb_mu,
@@ -180,6 +193,40 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
         + float(getattr(args, "lambda_tt", 0.0)) * loss_unc_text_thermal
     )
 
+    if use_distribution_sdm_aux:
+        if pids is None:
+            raise KeyError(
+                "use_distribution_sdm_aux=True requires batch to provide 'pids'."
+            )
+        dist_sdm_temp = float(getattr(args, "distribution_sdm_temperature", 1.0))
+        image_ids = batch.get("image_ids", None)
+        loss_dist_sdm_text_rgb = objectives.compute_distribution_sdm_from_distance(
+            distance_matrix=tr_dist,
+            pid=pids,
+            image_id=image_ids,
+            epsilon=eps,
+            temperature=dist_sdm_temp,
+        )
+
+        if has_thermal and bool(
+            getattr(args, "use_distribution_sdm_rgb_thermal", False)
+        ):
+            loss_dist_sdm_rgb_thermal = objectives.compute_distribution_sdm_from_distance(
+                distance_matrix=rt_dist,
+                pid=pids,
+                image_id=image_ids,
+                epsilon=eps,
+                temperature=dist_sdm_temp,
+            )
+        else:
+            loss_dist_sdm_rgb_thermal = loss_dist_sdm_text_rgb.new_zeros(())
+
+        loss_dist_sdm_total = (
+            float(getattr(args, "lambda_dist_sdm_tr", 1.0)) * loss_dist_sdm_text_rgb
+            + float(getattr(args, "lambda_dist_sdm_rt", 1.0))
+            * loss_dist_sdm_rgb_thermal
+        )
+
     # Lightweight logvar regularization to avoid explosion/collapse.
     var_reg_terms = [text_logvar.pow(2).mean(), rgb_logvar.pow(2).mean()]
     if has_thermal:
@@ -198,6 +245,14 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
         "mean_rgb_logvar": rgb_logvar.mean(),
         "mean_thermal_logvar": thermal_logvar.mean(),
     }
+    if use_distribution_sdm_aux:
+        out.update(
+            {
+                "loss_dist_sdm_total": loss_dist_sdm_total,
+                "loss_dist_sdm_text_rgb": loss_dist_sdm_text_rgb,
+                "loss_dist_sdm_rgb_thermal": loss_dist_sdm_rgb_thermal,
+            }
+        )
     if "fused_logvar" in ret and torch.is_tensor(ret["fused_logvar"]):
         out["mean_fused_logvar"] = ret["fused_logvar"].mean()
     return out
@@ -236,6 +291,9 @@ def do_train(
         "loss_unc_text_rgb": AverageMeter(),
         "loss_unc_rgb_thermal": AverageMeter(),
         "loss_unc_text_thermal": AverageMeter(),
+        "loss_dist_sdm_total": AverageMeter(),
+        "loss_dist_sdm_text_rgb": AverageMeter(),
+        "loss_dist_sdm_rgb_thermal": AverageMeter(),
         "loss_var_reg": AverageMeter(),
         "mean_text_logvar": AverageMeter(),
         "mean_rgb_logvar": AverageMeter(),
@@ -243,6 +301,9 @@ def do_train(
         "mean_fused_logvar": AverageMeter(),
         "avg_fused_batch_uncertainty": AverageMeter(),
         "avg_text_batch_uncertainty": AverageMeter(),
+        "avg_img_local_uncertainty": AverageMeter(),
+        "avg_img_local_keep_ratio": AverageMeter(),
+        "avg_img_local_weight_entropy": AverageMeter(),
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
         "mlm_acc": AverageMeter(),
@@ -293,6 +354,15 @@ def do_train(
             meters["loss_unc_text_thermal"].update(
                 _to_scalar(ret.get("loss_unc_text_thermal", 0)), batch_size
             )
+            meters["loss_dist_sdm_total"].update(
+                _to_scalar(ret.get("loss_dist_sdm_total", 0)), batch_size
+            )
+            meters["loss_dist_sdm_text_rgb"].update(
+                _to_scalar(ret.get("loss_dist_sdm_text_rgb", 0)), batch_size
+            )
+            meters["loss_dist_sdm_rgb_thermal"].update(
+                _to_scalar(ret.get("loss_dist_sdm_rgb_thermal", 0)), batch_size
+            )
             meters["loss_var_reg"].update(
                 _to_scalar(ret.get("loss_var_reg", 0)), batch_size
             )
@@ -316,6 +386,18 @@ def do_train(
             if "sigma_batch_t" in ret:
                 meters["avg_text_batch_uncertainty"].update(
                     _to_scalar(ret["sigma_batch_t"]), batch_size
+                )
+            if "avg_img_local_uncertainty" in ret:
+                meters["avg_img_local_uncertainty"].update(
+                    _to_scalar(ret["avg_img_local_uncertainty"]), batch_size
+                )
+            if "avg_img_local_keep_ratio" in ret:
+                meters["avg_img_local_keep_ratio"].update(
+                    _to_scalar(ret["avg_img_local_keep_ratio"]), batch_size
+                )
+            if "avg_img_local_weight_entropy" in ret:
+                meters["avg_img_local_weight_entropy"].update(
+                    _to_scalar(ret["avg_img_local_weight_entropy"]), batch_size
                 )
 
             meters["img_acc"].update(_to_scalar(ret.get("img_acc", 0)), batch_size)

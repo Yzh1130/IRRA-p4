@@ -2,6 +2,7 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model import objectives
 from .clip_model import (
@@ -100,6 +101,34 @@ class IRRA(nn.Module):
             eps=getattr(args, "mum_eps", self.uncertainty_eps),
         )
 
+        # Optional image-only local filtering over patch tokens.
+        self.use_image_local_filter = bool(
+            getattr(args, "use_image_local_filter", False)
+        )
+        self.img_local_topk = int(getattr(args, "img_local_topk", 64))
+        self.img_local_unc_lambda = float(
+            getattr(args, "img_local_unc_lambda", 0.3)
+        )
+        self.img_local_fuse_gamma = float(
+            getattr(args, "img_local_fuse_gamma", 0.1)
+        )
+        self.img_local_score_temp = float(
+            getattr(args, "img_local_score_temp", 0.07)
+        )
+        self.img_local_detach_global = bool(
+            getattr(args, "img_local_detach_global", True)
+        )
+        if self.img_local_topk <= 0:
+            raise ValueError(
+                f"img_local_topk must be > 0, got {self.img_local_topk}."
+            )
+        if self.img_local_score_temp <= 0:
+            raise ValueError(
+                "img_local_score_temp must be > 0, "
+                f"got {self.img_local_score_temp}."
+            )
+        self.img_local_unc_head = None
+
         if "id" in args.loss_names:
             self.classifier = nn.Linear(self.embed_dim, self.num_classes)
             nn.init.normal_(self.classifier.weight.data, std=0.001)
@@ -143,6 +172,13 @@ class IRRA(nn.Module):
             )
             nn.init.normal_(self.mlm_head.dense.weight, std=fc_std)
             nn.init.normal_(self.mlm_head.fc.weight, std=proj_std)
+
+        if self.use_image_local_filter:
+            # Only instantiate the local uncertainty head when the module is enabled.
+            # This keeps baseline initialization and RNG consumption unchanged when off.
+            self.img_local_unc_head = nn.Linear(self.embed_dim, 1)
+            nn.init.constant_(self.img_local_unc_head.weight.data, 0.0)
+            nn.init.constant_(self.img_local_unc_head.bias.data, 0.0)
 
     def _set_task(self):
         loss_names = self.args.loss_names
@@ -303,6 +339,75 @@ class IRRA(nn.Module):
         x = self.ln_post(x)
         return x
 
+    def _apply_image_local_filter(self, image_tokens):
+        """
+        Build the visual global feature from CLIP image tokens.
+
+        Args:
+            image_tokens: [B, 1 + N, C], where token 0 is CLS and tokens 1..N are
+                patch tokens.
+        Returns:
+            visual_global: [B, C]
+                - baseline CLS token when use_image_local_filter=False
+                - image-only locally filtered global feature otherwise
+            local_stats: dict[str, torch.Tensor]
+                Small scalar statistics for training-time observability.
+        """
+        # Keep the baseline global definition unchanged: raw CLS token.
+        g_global = image_tokens[:, 0, :].float()  # [B, C]
+        if not self.use_image_local_filter:
+            return g_global, None
+
+        patch_tokens = image_tokens[:, 1:, :].float()  # [B, N, C], no CLS
+        if patch_tokens.shape[1] == 0:
+            zero = g_global.new_zeros(())
+            return g_global, {
+                "avg_img_local_uncertainty": zero,
+                "avg_img_local_keep_ratio": zero,
+                "avg_img_local_weight_entropy": zero,
+            }
+
+        # Predict scalar uncertainty per patch token: u_i = softplus(head(v_i)).
+        unc_logits = self.img_local_unc_head(
+            patch_tokens.to(self.img_local_unc_head.weight.dtype)
+        )
+        patch_uncertainty = F.softplus(unc_logits.float()).squeeze(-1)  # [B, N]
+
+        # Image-only relevance against the current baseline global feature.
+        score_global = g_global.detach() if self.img_local_detach_global else g_global
+        relevance = F.cosine_similarity(
+            patch_tokens, score_global.unsqueeze(1), dim=-1
+        ) / self.img_local_score_temp  # [B, N]
+
+        # Final token scores: s_i = r_i - lambda_unc * u_i.
+        scores = relevance - self.img_local_unc_lambda * patch_uncertainty  # [B, N]
+
+        # Keep top-k tokens per image, mask all non-top-k scores before softmax.
+        topk = max(1, min(self.img_local_topk, scores.shape[1]))
+        _, topk_indices = torch.topk(scores, k=topk, dim=1, largest=True, sorted=False)
+        topk_mask = torch.zeros_like(scores, dtype=torch.bool)  # [B, N]
+        topk_mask.scatter_(1, topk_indices, True)
+        masked_scores = scores.masked_fill(~topk_mask, float("-inf"))  # [B, N]
+        # Softmax is evaluated only on top-k entries; subtract row-wise max for stability.
+        masked_scores = masked_scores - masked_scores.max(dim=1, keepdim=True).values
+        weights = torch.softmax(masked_scores, dim=1)  # [B, N]
+
+        # Weighted local aggregation over the retained patch tokens only.
+        g_local = torch.sum(weights.unsqueeze(-1) * patch_tokens, dim=1)  # [B, C]
+        fused_global = (
+            (1.0 - self.img_local_fuse_gamma) * g_global
+            + self.img_local_fuse_gamma * g_local
+        )
+        weight_entropy = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=1)
+        local_stats = {
+            "avg_img_local_uncertainty": patch_uncertainty.mean(),
+            "avg_img_local_keep_ratio": scores.new_full(
+                (), float(topk) / float(scores.shape[1])
+            ),
+            "avg_img_local_weight_entropy": weight_entropy.mean(),
+        }
+        return F.normalize(fused_global, p=2, dim=-1), local_stats  # [B, C]
+
     def encode_image(self, image):
         # image: [B, 3, H, W] -> image_tokens: [B, L_v, C]
         image_tokens = self.base_model.encode_image(image)
@@ -325,7 +430,7 @@ class IRRA(nn.Module):
 
     def encode_rgbt_deterministic(self, rgb_image, thermal_image=None):
         # Deterministic fused visual feature used by retrieval evaluation.
-        rgb_global_feat, thermal_global_feat, _, _ = self.encode_rgbt_global(
+        rgb_global_feat, thermal_global_feat, _, _, _ = self.encode_rgbt_global(
             rgb_image, thermal_image
         )
         rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
@@ -384,21 +489,34 @@ class IRRA(nn.Module):
             rgb_tokens: [B, L_v, C]
         """
         rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
-        v_rgb_c = rgb_tokens[:, 0, :].float()  # [B, C]
+        v_rgb_c, rgb_local_stats = self._apply_image_local_filter(rgb_tokens)  # [B, C]
 
         if thermal_image is not None:
             thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
-            v_t_c = thermal_tokens[:, 0, :].float()  # [B, C]
+            v_t_c, thermal_local_stats = self._apply_image_local_filter(
+                thermal_tokens
+            )  # [B, C]
         else:
             # Backward compatibility for old single-image datasets.
             v_t_c = torch.zeros_like(v_rgb_c)  # [B, C]
+            thermal_local_stats = None
 
         if self.use_rgbt_add_fusion:
             f_c = v_rgb_c + v_t_c  # [B, C]
         else:
             # Baseline ablation: RGB-only global feature.
             f_c = v_rgb_c
-        return v_rgb_c, v_t_c, f_c, rgb_tokens
+        local_stats = None
+        modality_stats = [
+            stats for stats in [rgb_local_stats, thermal_local_stats] if stats is not None
+        ]
+        if modality_stats:
+            local_stats = {}
+            for key in modality_stats[0].keys():
+                local_stats[key] = torch.stack(
+                    [stats[key] for stats in modality_stats], dim=0
+                ).mean()
+        return v_rgb_c, v_t_c, f_c, rgb_tokens, local_stats
 
     def _deterministic_uncertainty_outputs(self, f_c, l_c):
         zero_sigma = torch.zeros_like(f_c)
@@ -427,7 +545,7 @@ class IRRA(nn.Module):
         caption_ids = batch["caption_ids"]
 
         # 1) RGB/Thermal pooled global branch (before uncertainty heads).
-        v_rgb_c_raw, v_t_c_raw, _, rgb_tokens = self.encode_rgbt_global(
+        v_rgb_c_raw, v_t_c_raw, _, rgb_tokens, img_local_stats = self.encode_rgbt_global(
             images, thermal_images
         )
 
@@ -475,6 +593,8 @@ class IRRA(nn.Module):
 
         # Required outputs for downstream losses/logging.
         ret.update(uncertainty_outputs)
+        if img_local_stats is not None:
+            ret.update(img_local_stats)
         ret.update(
             {
                 "v_rgb_c": v_rgb_c,  # [B, C]

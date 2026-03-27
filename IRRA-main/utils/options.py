@@ -50,6 +50,12 @@ def get_args():
     parser.add_argument("--lambda_rt", type=float, default=1.0, help="inner weight for rgb-thermal uncertainty alignment")
     parser.add_argument("--lambda_tt", type=float, default=0.0, help="inner weight for text-thermal uncertainty alignment")
     parser.add_argument("--lambda_var_reg", type=float, default=1e-4, help="weight for log-variance regularization")
+    parser.add_argument("--use_distribution_sdm_aux", default=False, action='store_true', help="enable distribution-SDM auxiliary loss over global uncertainty distance matrices")
+    parser.add_argument("--lambda_dist_sdm", type=float, default=1.0, help="outer weight for distribution-SDM auxiliary loss")
+    parser.add_argument("--lambda_dist_sdm_tr", type=float, default=1.0, help="inner weight for text-rgb distribution-SDM term")
+    parser.add_argument("--use_distribution_sdm_rgb_thermal", default=False, action='store_true', help="optionally enable rgb-thermal distribution-SDM term")
+    parser.add_argument("--lambda_dist_sdm_rt", type=float, default=1.0, help="inner weight for rgb-thermal distribution-SDM term")
+    parser.add_argument("--distribution_sdm_temperature", type=float, default=1.0, help="temperature for converting W2 distances into distribution-SDM logits")
     parser.add_argument("--eval_use_fused_mu", default=True, action='store_true', help="use fused_mu as visual embedding in evaluation when available")
     parser.add_argument("--no_eval_use_fused_mu", dest='eval_use_fused_mu', action='store_false', help="disable fused_mu in evaluation")
     parser.add_argument("--eval_use_mu_only", default=False, action='store_true', help="force evaluation to use rgb_mu only")
@@ -78,6 +84,16 @@ def get_args():
     # 4) full MUM: --use_mum --use_batch_uncertainty --use_id_uncertainty
     # 5) deterministic training: --use_mum --no_use_prob_sampling (default)
     # 6) probabilistic training: --use_mum --use_prob_sampling
+
+    ######################## image-only local filtering settings ########################
+    # Optional patch-token filtering over image features only.
+    parser.add_argument("--use_image_local_filter", default=False, action='store_true', help="enable image-only local filtering before visual global alignment")
+    parser.add_argument("--img_local_topk", type=int, default=64, help="number of patch tokens kept by image-only local filtering")
+    parser.add_argument("--img_local_unc_lambda", type=float, default=0.3, help="penalty weight for patch uncertainty in image-only local filtering")
+    parser.add_argument("--img_local_fuse_gamma", type=float, default=0.1, help="fusion weight for local aggregated feature")
+    parser.add_argument("--img_local_score_temp", type=float, default=0.07, help="temperature for image-only patch relevance scores")
+    parser.add_argument("--img_local_detach_global", default=True, action='store_true', help="detach baseline global feature when computing image-only patch relevance")
+    parser.add_argument("--no_img_local_detach_global", dest='img_local_detach_global', action='store_false', help="keep baseline global feature trainable inside image-only patch relevance")
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
