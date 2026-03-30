@@ -7,7 +7,10 @@ import time
 import os.path as op
 
 from datasets import build_dataloader
-from processor.processor import do_inference
+from processor.processor import (
+    apply_img_local_filter_stage,
+    do_inference,
+)
 from utils.checkpoint import Checkpointer
 from utils.logger import setup_logger
 from model import build_model
@@ -35,7 +38,11 @@ if __name__ == '__main__':
     model = build_model(args, num_classes=num_classes)
     # 加载训练得到的最优权重。
     checkpointer = Checkpointer(model)
-    checkpointer.load(f=op.join(args.output_dir, 'best.pth'))
+    checkpoint = checkpointer.load(f=op.join(args.output_dir, 'best.pth'))
+    best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
+    img_local_filter_active = apply_img_local_filter_stage(
+        model, args, best_epoch, logger=logger, prefix="Inference"
+    )
     model.to(device)
     # 执行检索评估并输出 R@K/mAP 等指标。
     do_inference(model, test_img_loader, test_txt_loader)

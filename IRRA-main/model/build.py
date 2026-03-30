@@ -12,6 +12,7 @@ from .clip_model import (
     build_CLIP_from_openai_pretrained,
     convert_weights,
 )
+from .prototype_bank import IdentityPrototypeBank
 from .uncertainty import GlobalUncertaintyModeler
 
 
@@ -101,10 +102,40 @@ class IRRA(nn.Module):
             eps=getattr(args, "mum_eps", self.uncertainty_eps),
         )
 
+        # Optional identity prototype bank over fused visual global features.
+        # Keep it fully disabled unless use_proto_calib=True.
+        self.use_proto_calib = bool(getattr(args, "use_proto_calib", False))
+        self.lambda_proto_v = float(getattr(args, "lambda_proto_v", 1.0))
+        self.lambda_proto_t = float(getattr(args, "lambda_proto_t", 1.0))
+        self.proto_temp = float(getattr(args, "proto_temp", 0.07))
+        self.proto_momentum = float(getattr(args, "proto_momentum", 0.9))
+        self.proto_warmup_epochs = int(getattr(args, "proto_warmup_epochs", 0))
+        self.proto_runtime_epoch = 1
+        if self.proto_temp <= 0:
+            raise ValueError(f"proto_temp must be > 0, got {self.proto_temp}.")
+        if self.proto_warmup_epochs < 0:
+            raise ValueError(
+                "proto_warmup_epochs must be >= 0, "
+                f"got {self.proto_warmup_epochs}."
+            )
+        self.prototype_bank = None
+        if self.use_proto_calib:
+            # Default integration uses zero init; the bank module also supports
+            # random-normalized init for later experiments.
+            self.prototype_bank = IdentityPrototypeBank(
+                num_classes=self.num_classes,
+                feat_dim=self.embed_dim,
+                momentum=self.proto_momentum,
+                init_mode="zero",
+                eps=self.uncertainty_eps,
+            )
+
         # Optional image-only local filtering over patch tokens.
         self.use_image_local_filter = bool(
             getattr(args, "use_image_local_filter", False)
         )
+        # Runtime switch defaults to legacy behavior until the trainer updates it.
+        self.img_local_filter_active = self.use_image_local_filter
         self.img_local_topk = int(getattr(args, "img_local_topk", 64))
         self.img_local_unc_lambda = float(
             getattr(args, "img_local_unc_lambda", 0.3)
@@ -179,6 +210,70 @@ class IRRA(nn.Module):
             self.img_local_unc_head = nn.Linear(self.embed_dim, 1)
             nn.init.constant_(self.img_local_unc_head.weight.data, 0.0)
             nn.init.constant_(self.img_local_unc_head.bias.data, 0.0)
+            self.effective_img_local_fuse_gamma = self.img_local_fuse_gamma
+
+    def set_img_local_runtime(self, active, fuse_gamma):
+        if not self.use_image_local_filter:
+            self.img_local_filter_active = False
+            if hasattr(self, "effective_img_local_fuse_gamma"):
+                delattr(self, "effective_img_local_fuse_gamma")
+            return
+
+        self.img_local_filter_active = bool(active)
+        if self.img_local_filter_active:
+            self.effective_img_local_fuse_gamma = float(fuse_gamma)
+        else:
+            self.effective_img_local_fuse_gamma = 0.0
+
+    def set_img_local_filter_active(self, active):
+        default_runtime_gamma = self.img_local_fuse_gamma if active else 0.0
+        self.set_img_local_runtime(active, default_runtime_gamma)
+
+    def set_proto_runtime_epoch(self, epoch):
+        self.proto_runtime_epoch = int(epoch)
+
+    def _proto_calib_enabled(self):
+        return self.use_proto_calib and self.prototype_bank is not None
+
+    def should_update_proto_bank(self):
+        if not self._proto_calib_enabled():
+            return False
+        return self.training
+
+    def should_enable_proto_loss(self):
+        if not self._proto_calib_enabled():
+            return False
+        if not self.training:
+            return False
+        # Chosen warmup behavior: keep updating the bank, but delay prototype loss.
+        return int(self.proto_runtime_epoch) > self.proto_warmup_epochs
+
+    def _should_update_proto_bank(self):
+        if not self.use_proto_calib or self.prototype_bank is None:
+            return False
+        if not self.training:
+            return False
+        return True
+
+    def get_visual_prototype_matrix(self):
+        if self.prototype_bank is None:
+            return None
+        return self.prototype_bank.get_normalized_prototypes()
+
+    def get_visual_prototype_initialized_mask(self):
+        if self.prototype_bank is None:
+            return None
+        return self.prototype_bank.get_initialized_mask()
+
+    def update_visual_prototype_bank(self, fused_feats, pids):
+        if not self._should_update_proto_bank():
+            return {
+                "updated": False,
+                "num_updated_pids": 0,
+                "num_newly_initialized_pids": 0,
+                "num_initialized_pids": 0,
+            }
+        return self.prototype_bank.update(fused_feats, pids)
 
     def _set_task(self):
         loss_names = self.args.loss_names
@@ -348,14 +443,14 @@ class IRRA(nn.Module):
                 patch tokens.
         Returns:
             visual_global: [B, C]
-                - baseline CLS token when use_image_local_filter=False
+                - baseline CLS token when img_local_filter_active=False
                 - image-only locally filtered global feature otherwise
             local_stats: dict[str, torch.Tensor]
                 Small scalar statistics for training-time observability.
         """
         # Keep the baseline global definition unchanged: raw CLS token.
         g_global = image_tokens[:, 0, :].float()  # [B, C]
-        if not self.use_image_local_filter:
+        if not self.img_local_filter_active:
             return g_global, None
 
         patch_tokens = image_tokens[:, 1:, :].float()  # [B, N, C], no CLS
@@ -394,9 +489,10 @@ class IRRA(nn.Module):
 
         # Weighted local aggregation over the retained patch tokens only.
         g_local = torch.sum(weights.unsqueeze(-1) * patch_tokens, dim=1)  # [B, C]
+        runtime_gamma = float(self.effective_img_local_fuse_gamma)
         fused_global = (
-            (1.0 - self.img_local_fuse_gamma) * g_global
-            + self.img_local_fuse_gamma * g_local
+            (1.0 - runtime_gamma) * g_global
+            + runtime_gamma * g_local
         )
         weight_entropy = -(weights * torch.log(weights.clamp_min(1e-12))).sum(dim=1)
         local_stats = {

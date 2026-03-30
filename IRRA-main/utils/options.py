@@ -34,6 +34,12 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+    parser.add_argument("--use_proto_calib", default=False, action='store_true', help="enable identity prototype calibration bank during training only")
+    parser.add_argument("--lambda_proto_v", type=float, default=1.0, help="reserved visual prototype calibration loss weight")
+    parser.add_argument("--lambda_proto_t", type=float, default=1.0, help="reserved text prototype calibration loss weight")
+    parser.add_argument("--proto_temp", type=float, default=0.07, help="reserved temperature for prototype calibration logits")
+    parser.add_argument("--proto_momentum", type=float, default=0.9, help="EMA momentum for identity prototype bank updates")
+    parser.add_argument("--proto_warmup_epochs", type=int, default=0, help="number of warmup epochs before prototype losses are enabled")
 
     ######################## global uncertainty feature settings ########################
     # Feature-level uncertainty modeling over global embeddings only.
@@ -88,9 +94,18 @@ def get_args():
     ######################## image-only local filtering settings ########################
     # Optional patch-token filtering over image features only.
     parser.add_argument("--use_image_local_filter", default=False, action='store_true', help="enable image-only local filtering before visual global alignment")
+    parser.add_argument("--img_local_stage_mode", type=str, default="always", choices=["always", "window"], help="epoch scheduling mode for image-only local filtering")
+    parser.add_argument("--img_local_stage_start", type=int, default=1, help="inclusive start epoch when img_local_stage_mode=window")
+    parser.add_argument("--img_local_stage_end", type=int, default=9999, help="inclusive end epoch when img_local_stage_mode=window")
     parser.add_argument("--img_local_topk", type=int, default=64, help="number of patch tokens kept by image-only local filtering")
     parser.add_argument("--img_local_unc_lambda", type=float, default=0.3, help="penalty weight for patch uncertainty in image-only local filtering")
     parser.add_argument("--img_local_fuse_gamma", type=float, default=0.1, help="fusion weight for local aggregated feature")
+    parser.add_argument("--img_local_gamma_schedule_mode", type=str, default="constant", choices=["constant", "three_stage"], help="runtime schedule mode for effective image-local fuse gamma")
+    parser.add_argument("--img_local_gamma_stage1_end", type=int, default=6, help="inclusive end epoch of gamma stage 1 when img_local_gamma_schedule_mode=three_stage")
+    parser.add_argument("--img_local_gamma_stage2_end", type=int, default=12, help="inclusive end epoch of gamma stage 2 when img_local_gamma_schedule_mode=three_stage")
+    parser.add_argument("--img_local_gamma_stage1_value", type=float, default=0.05, help="effective gamma used in stage 1 when img_local_gamma_schedule_mode=three_stage")
+    parser.add_argument("--img_local_gamma_stage2_value", type=float, default=0.02, help="effective gamma used in stage 2 when img_local_gamma_schedule_mode=three_stage")
+    parser.add_argument("--img_local_gamma_stage3_value", type=float, default=0.0, help="effective gamma used in stage 3 when img_local_gamma_schedule_mode=three_stage")
     parser.add_argument("--img_local_score_temp", type=float, default=0.07, help="temperature for image-only patch relevance scores")
     parser.add_argument("--img_local_detach_global", default=True, action='store_true', help="detach baseline global feature when computing image-only patch relevance")
     parser.add_argument("--no_img_local_detach_global", dest='img_local_detach_global', action='store_false', help="keep baseline global feature trainable inside image-only patch relevance")

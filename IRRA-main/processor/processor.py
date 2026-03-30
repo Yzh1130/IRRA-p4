@@ -2,6 +2,7 @@ import logging
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from model import objectives
@@ -17,6 +18,316 @@ def _to_scalar(value):
             return value.item()
         return value.detach().mean().item()
     return float(value)
+
+
+def _safe_l2_normalize(feats, dim=1, eps=1e-12):
+    norm = feats.norm(p=2, dim=dim, keepdim=True).clamp_min(eps)
+    return feats / norm
+
+
+def _get_img_local_stage_config(args):
+    use_image_local_filter = bool(getattr(args, "use_image_local_filter", False))
+    stage_mode = str(getattr(args, "img_local_stage_mode", "always")).lower()
+    stage_start = int(getattr(args, "img_local_stage_start", 1))
+    stage_end = int(getattr(args, "img_local_stage_end", 9999))
+    return use_image_local_filter, stage_mode, stage_start, stage_end
+
+
+def _get_img_local_gamma_schedule_config(args):
+    gamma_schedule_mode = str(
+        getattr(args, "img_local_gamma_schedule_mode", "constant")
+    ).lower()
+    gamma_stage1_end = int(getattr(args, "img_local_gamma_stage1_end", 6))
+    gamma_stage2_end = int(getattr(args, "img_local_gamma_stage2_end", 12))
+    gamma_stage1_value = float(getattr(args, "img_local_gamma_stage1_value", 0.05))
+    gamma_stage2_value = float(getattr(args, "img_local_gamma_stage2_value", 0.02))
+    gamma_stage3_value = float(getattr(args, "img_local_gamma_stage3_value", 0.0))
+    return (
+        gamma_schedule_mode,
+        gamma_stage1_end,
+        gamma_stage2_end,
+        gamma_stage1_value,
+        gamma_stage2_value,
+        gamma_stage3_value,
+    )
+
+
+def resolve_img_local_filter_active(args, epoch):
+    use_image_local_filter, stage_mode, stage_start, stage_end = _get_img_local_stage_config(
+        args
+    )
+    if not use_image_local_filter:
+        return False
+    if stage_mode == "always":
+        return True
+    if stage_mode == "window":
+        return stage_start <= int(epoch) <= stage_end
+    raise ValueError(f"Unsupported img_local_stage_mode={stage_mode}.")
+
+
+def resolve_img_local_effective_fuse_gamma(args, epoch, active=None):
+    use_image_local_filter = bool(getattr(args, "use_image_local_filter", False))
+    if not use_image_local_filter:
+        return 0.0
+
+    if active is None:
+        active = resolve_img_local_filter_active(args, epoch)
+    if not active:
+        return 0.0
+
+    raw_fuse_gamma = float(getattr(args, "img_local_fuse_gamma", 0.1))
+    (
+        gamma_schedule_mode,
+        gamma_stage1_end,
+        gamma_stage2_end,
+        gamma_stage1_value,
+        gamma_stage2_value,
+        gamma_stage3_value,
+    ) = _get_img_local_gamma_schedule_config(args)
+
+    if gamma_schedule_mode == "constant":
+        return raw_fuse_gamma
+    if gamma_schedule_mode == "three_stage":
+        if gamma_stage1_end > gamma_stage2_end:
+            raise ValueError(
+                "img_local_gamma_stage1_end must be <= img_local_gamma_stage2_end, "
+                f"got {gamma_stage1_end} and {gamma_stage2_end}."
+            )
+        epoch = int(epoch)
+        if epoch <= gamma_stage1_end:
+            return gamma_stage1_value
+        if epoch <= gamma_stage2_end:
+            return gamma_stage2_value
+        return gamma_stage3_value
+    raise ValueError(
+        f"Unsupported img_local_gamma_schedule_mode={gamma_schedule_mode}."
+    )
+
+
+def resolve_img_local_runtime(args, epoch):
+    active = resolve_img_local_filter_active(args, epoch)
+    effective_fuse_gamma = resolve_img_local_effective_fuse_gamma(
+        args, epoch, active=active
+    )
+    return active, effective_fuse_gamma
+
+
+def _unwrap_runtime_model(model):
+    target_model = model
+    visited = set()
+    while hasattr(target_model, "module") and id(target_model) not in visited:
+        visited.add(id(target_model))
+        target_model = target_model.module
+    return target_model
+
+
+def set_model_proto_runtime_epoch(model, epoch):
+    target_model = _unwrap_runtime_model(model)
+    if hasattr(target_model, "set_proto_runtime_epoch"):
+        target_model.set_proto_runtime_epoch(epoch)
+    else:
+        target_model.proto_runtime_epoch = int(epoch)
+    applied_epoch = int(getattr(target_model, "proto_runtime_epoch", epoch))
+    if target_model is not model:
+        setattr(model, "proto_runtime_epoch", applied_epoch)
+    return applied_epoch
+
+
+def _get_proto_calib_runtime_state(args, model):
+    proto_enabled = bool(getattr(args, "use_proto_calib", False))
+    state = {
+        "proto_enabled": proto_enabled,
+        "proto_loss_active": False,
+        "proto_update_active": False,
+        "num_initialized_pids": 0,
+        "num_classes": 0,
+        "initialized_mask": None,
+    }
+    if not proto_enabled:
+        return state
+
+    target_model = _unwrap_runtime_model(model)
+    state["num_classes"] = int(getattr(target_model, "num_classes", 0))
+    if hasattr(target_model, "should_enable_proto_loss"):
+        state["proto_loss_active"] = bool(target_model.should_enable_proto_loss())
+    if hasattr(target_model, "should_update_proto_bank"):
+        state["proto_update_active"] = bool(target_model.should_update_proto_bank())
+    if hasattr(target_model, "get_visual_prototype_initialized_mask"):
+        initialized_mask = target_model.get_visual_prototype_initialized_mask()
+        if initialized_mask is not None:
+            state["initialized_mask"] = initialized_mask
+            state["num_initialized_pids"] = int(initialized_mask.sum().item())
+    return state
+
+
+def log_proto_calib_state(logger, args, model, epoch, prefix="Epoch"):
+    state = _get_proto_calib_runtime_state(args, model)
+    logger.info(
+        "%s proto calib state: "
+        "current_epoch=%d (1-based), "
+        "use_proto_calib=%s, "
+        "proto_loss_active=%s, "
+        "proto_update_active=%s, "
+        "proto_warmup_mode=%s, "
+        "proto_warmup_epochs=%d, "
+        "lambda_proto_v=%.6f, "
+        "lambda_proto_t=%.6f, "
+        "proto_temp=%.6f, "
+        "proto_momentum=%.6f, "
+        "proto_initialized_pids=%d/%d",
+        prefix,
+        int(epoch),
+        state["proto_enabled"],
+        state["proto_loss_active"],
+        state["proto_update_active"],
+        "disable_loss_only",
+        int(getattr(args, "proto_warmup_epochs", 0)),
+        float(getattr(args, "lambda_proto_v", 1.0)),
+        float(getattr(args, "lambda_proto_t", 1.0)),
+        float(getattr(args, "proto_temp", 0.07)),
+        float(getattr(args, "proto_momentum", 0.9)),
+        state["num_initialized_pids"],
+        state["num_classes"],
+    )
+
+
+def clear_model_img_local_runtime(model):
+    target_model = _unwrap_runtime_model(model)
+    target_model.img_local_filter_active = False
+    if hasattr(target_model, "effective_img_local_fuse_gamma"):
+        delattr(target_model, "effective_img_local_fuse_gamma")
+    if target_model is not model:
+        setattr(model, "img_local_filter_active", False)
+        if hasattr(model, "effective_img_local_fuse_gamma"):
+            delattr(model, "effective_img_local_fuse_gamma")
+    return False, 0.0
+
+
+def set_model_img_local_runtime(model, active, fuse_gamma):
+    target_model = _unwrap_runtime_model(model)
+    if hasattr(target_model, "set_img_local_runtime"):
+        target_model.set_img_local_runtime(active=active, fuse_gamma=fuse_gamma)
+    elif hasattr(target_model, "set_img_local_filter_active"):
+        target_model.set_img_local_filter_active(active)
+        target_model.effective_img_local_fuse_gamma = float(
+            fuse_gamma if getattr(target_model, "img_local_filter_active", False) else 0.0
+        )
+    else:
+        target_model.img_local_filter_active = bool(
+            getattr(target_model, "use_image_local_filter", False) and active
+        )
+        target_model.effective_img_local_fuse_gamma = float(
+            fuse_gamma if target_model.img_local_filter_active else 0.0
+        )
+    applied_active = bool(getattr(target_model, "img_local_filter_active", False))
+    applied_fuse_gamma = float(
+        getattr(target_model, "effective_img_local_fuse_gamma", 0.0)
+    )
+    if target_model is not model:
+        setattr(model, "img_local_filter_active", applied_active)
+        if hasattr(target_model, "effective_img_local_fuse_gamma"):
+            setattr(model, "effective_img_local_fuse_gamma", applied_fuse_gamma)
+        elif hasattr(model, "effective_img_local_fuse_gamma"):
+            delattr(model, "effective_img_local_fuse_gamma")
+    return applied_active, applied_fuse_gamma
+
+
+def set_model_img_local_filter_active(model, active):
+    target_model = _unwrap_runtime_model(model)
+    default_fuse_gamma = float(
+        getattr(target_model, "img_local_fuse_gamma", 0.0) if active else 0.0
+    )
+    applied_active, _ = set_model_img_local_runtime(
+        model, active=active, fuse_gamma=default_fuse_gamma
+    )
+    return applied_active
+
+
+def log_img_local_filter_state(
+    logger, args, epoch, active, effective_fuse_gamma, prefix="Epoch"
+):
+    (
+        use_image_local_filter,
+        img_local_stage_mode,
+        img_local_stage_start,
+        img_local_stage_end,
+    ) = _get_img_local_stage_config(args)
+    (
+        img_local_gamma_schedule_mode,
+        img_local_gamma_stage1_end,
+        img_local_gamma_stage2_end,
+        img_local_gamma_stage1_value,
+        img_local_gamma_stage2_value,
+        img_local_gamma_stage3_value,
+    ) = _get_img_local_gamma_schedule_config(args)
+    logger.info(
+        "%s img local filter state: "
+        "current_epoch=%d (1-based), "
+        "use_image_local_filter=%s, "
+        "img_local_stage_mode=%s, "
+        "img_local_stage_start=%d, "
+        "img_local_stage_end=%d, "
+        "img_local_filter_active=%s, "
+        "img_local_gamma_schedule_mode=%s, "
+        "img_local_fuse_gamma=%.6f, "
+        "effective_img_local_fuse_gamma=%.6f, "
+        "img_local_gamma_stage1_end=%d, "
+        "img_local_gamma_stage2_end=%d, "
+        "img_local_gamma_stage1_value=%.6f, "
+        "img_local_gamma_stage2_value=%.6f, "
+        "img_local_gamma_stage3_value=%.6f",
+        prefix,
+        epoch,
+        use_image_local_filter,
+        img_local_stage_mode,
+        img_local_stage_start,
+        img_local_stage_end,
+        active,
+        img_local_gamma_schedule_mode,
+        float(getattr(args, "img_local_fuse_gamma", 0.1)),
+        float(effective_fuse_gamma),
+        img_local_gamma_stage1_end,
+        img_local_gamma_stage2_end,
+        img_local_gamma_stage1_value,
+        img_local_gamma_stage2_value,
+        img_local_gamma_stage3_value,
+    )
+
+
+def apply_img_local_filter_stage(
+    model, args, epoch, logger=None, prefix="Epoch", runtime=None
+):
+    if runtime is None:
+        runtime = resolve_img_local_runtime(args, epoch)
+    requested_active, requested_fuse_gamma = runtime
+    if not bool(getattr(args, "use_image_local_filter", False)):
+        applied_active, applied_fuse_gamma = clear_model_img_local_runtime(model)
+        if logger is not None:
+            log_img_local_filter_state(
+                logger,
+                args,
+                epoch,
+                applied_active,
+                applied_fuse_gamma,
+                prefix=prefix,
+            )
+        return applied_active
+
+    applied_active, applied_fuse_gamma = set_model_img_local_runtime(
+        model,
+        active=requested_active,
+        fuse_gamma=requested_fuse_gamma,
+    )
+    if logger is not None:
+        log_img_local_filter_state(
+            logger,
+            args,
+            epoch,
+            applied_active,
+            applied_fuse_gamma,
+            prefix=prefix,
+        )
+    return applied_active
 
 
 def _build_total_loss(args, ret):
@@ -78,6 +389,119 @@ def _build_total_loss(args, ret):
         if "loss_dist_sdm_total" in ret:
             total_loss = total_loss + getattr(args, "lambda_dist_sdm", 1.0) * ret["loss_dist_sdm_total"]
     return total_loss
+
+
+def _compute_proto_calibration_terms(args, model, ret, batch):
+    if not bool(getattr(args, "use_proto_calib", False)):
+        return {}
+
+    target_model = _unwrap_runtime_model(model)
+    state = _get_proto_calib_runtime_state(args, model)
+    proto_out = {
+        "proto_loss_active": float(state["proto_loss_active"]),
+        "proto_num_valid_targets": 0.0,
+    }
+    if not hasattr(target_model, "get_visual_prototype_matrix"):
+        return proto_out
+
+    prototype_matrix = target_model.get_visual_prototype_matrix()
+    if prototype_matrix is None:
+        return proto_out
+
+    fused_feat = ret.get("fused_det_feat", None)
+    text_feat = ret.get("text_det_feat", None)
+    pids = batch.get("pids", None)
+    if fused_feat is None or text_feat is None or pids is None:
+        raise KeyError(
+            "Prototype calibration requires 'fused_det_feat', "
+            "'text_det_feat', and batch['pids']."
+        )
+
+    zero = fused_feat.new_zeros(())
+    if not state["proto_loss_active"]:
+        proto_out.update({"loss_proto_v": zero, "loss_proto_t": zero})
+        return proto_out
+
+    fused_feat = _safe_l2_normalize(fused_feat.float(), dim=1)
+    text_feat = _safe_l2_normalize(text_feat.float(), dim=1)
+    prototype_matrix = _safe_l2_normalize(prototype_matrix.float(), dim=1)
+    pids = pids.long()
+
+    proto_temp = float(getattr(args, "proto_temp", 0.07))
+    if proto_temp <= 0:
+        raise ValueError(f"proto_temp must be > 0, got {proto_temp}.")
+
+    initialized_mask = state["initialized_mask"]
+    if initialized_mask is None:
+        initialized_mask = torch.ones(
+            prototype_matrix.shape[0],
+            device=prototype_matrix.device,
+            dtype=torch.bool,
+        )
+    else:
+        initialized_mask = initialized_mask.to(
+            device=prototype_matrix.device, dtype=torch.bool
+        )
+
+    valid_target_mask = initialized_mask[pids]
+    proto_out["proto_num_valid_targets"] = float(valid_target_mask.sum().item())
+    if not valid_target_mask.any():
+        proto_out.update({"loss_proto_v": zero, "loss_proto_t": zero})
+        return proto_out
+
+    valid_fused_feat = fused_feat[valid_target_mask]
+    valid_text_feat = text_feat[valid_target_mask]
+    valid_pids = pids[valid_target_mask]
+
+    logits_v2p = valid_fused_feat @ prototype_matrix.t()
+    logits_t2p = valid_text_feat @ prototype_matrix.t()
+    logits_v2p = logits_v2p / proto_temp
+    logits_t2p = logits_t2p / proto_temp
+
+    # Mask still-uninitialized prototypes to avoid invalid competition / NaNs.
+    logits_v2p = logits_v2p.masked_fill(~initialized_mask.unsqueeze(0), -1e4)
+    logits_t2p = logits_t2p.masked_fill(~initialized_mask.unsqueeze(0), -1e4)
+
+    proto_out.update(
+        {
+            "loss_proto_v": F.cross_entropy(logits_v2p, valid_pids),
+            "loss_proto_t": F.cross_entropy(logits_t2p, valid_pids),
+        }
+    )
+    return proto_out
+
+
+def _add_proto_calibration_to_total_loss(args, total_loss, ret):
+    if not bool(getattr(args, "use_proto_calib", False)):
+        return total_loss
+    if "loss_proto_v" in ret:
+        total_loss = total_loss + float(getattr(args, "lambda_proto_v", 1.0)) * ret["loss_proto_v"]
+    if "loss_proto_t" in ret:
+        total_loss = total_loss + float(getattr(args, "lambda_proto_t", 1.0)) * ret["loss_proto_t"]
+    return total_loss
+
+
+def update_model_proto_bank_after_step(model, ret, batch):
+    target_model = _unwrap_runtime_model(model)
+    if not hasattr(target_model, "update_visual_prototype_bank"):
+        return {
+            "updated": False,
+            "num_updated_pids": 0,
+            "num_newly_initialized_pids": 0,
+            "num_initialized_pids": 0,
+        }
+    fused_feat = ret.get("fused_det_feat", None)
+    if fused_feat is None:
+        return {
+            "updated": False,
+            "num_updated_pids": 0,
+            "num_newly_initialized_pids": 0,
+            "num_initialized_pids": 0,
+        }
+    return target_model.update_visual_prototype_bank(
+        fused_feats=fused_feat,
+        pids=batch.get("pids", None),
+    )
 
 
 def _mean_positive_pairwise_distance(dist_matrix, pids=None):
@@ -294,6 +718,13 @@ def do_train(
         "loss_dist_sdm_total": AverageMeter(),
         "loss_dist_sdm_text_rgb": AverageMeter(),
         "loss_dist_sdm_rgb_thermal": AverageMeter(),
+        "loss_proto_v": AverageMeter(),
+        "loss_proto_t": AverageMeter(),
+        "proto_loss_active": AverageMeter(),
+        "proto_num_valid_targets": AverageMeter(),
+        "proto_num_updated_pids": AverageMeter(),
+        "proto_num_newly_initialized_pids": AverageMeter(),
+        "proto_num_initialized_pids": AverageMeter(),
         "loss_var_reg": AverageMeter(),
         "mean_text_logvar": AverageMeter(),
         "mean_rgb_logvar": AverageMeter(),
@@ -316,14 +747,29 @@ def do_train(
         start_time = time.time()
         for meter in meters.values():
             meter.reset()
+        epoch_img_local_runtime = resolve_img_local_runtime(args, epoch)
+        img_local_filter_active = apply_img_local_filter_stage(
+            model,
+            args,
+            epoch,
+            logger=logger,
+            prefix="Epoch",
+            runtime=epoch_img_local_runtime,
+        )
+        set_model_proto_runtime_epoch(model, epoch)
         model.train()
+        log_proto_calib_state(logger, args, model, epoch, prefix="Epoch")
 
         for n_iter, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             ret = model(batch)
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
-            total_loss = _build_total_loss(args, ret)
+            original_total_loss = _build_total_loss(args, ret)
+            ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
+            total_loss = _add_proto_calibration_to_total_loss(
+                args, original_total_loss, ret
+            )
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
@@ -362,6 +808,18 @@ def do_train(
             )
             meters["loss_dist_sdm_rgb_thermal"].update(
                 _to_scalar(ret.get("loss_dist_sdm_rgb_thermal", 0)), batch_size
+            )
+            meters["loss_proto_v"].update(
+                _to_scalar(ret.get("loss_proto_v", 0)), batch_size
+            )
+            meters["loss_proto_t"].update(
+                _to_scalar(ret.get("loss_proto_t", 0)), batch_size
+            )
+            meters["proto_loss_active"].update(
+                _to_scalar(ret.get("proto_loss_active", 0)), 1
+            )
+            meters["proto_num_valid_targets"].update(
+                _to_scalar(ret.get("proto_num_valid_targets", 0)), 1
             )
             meters["loss_var_reg"].update(
                 _to_scalar(ret.get("loss_var_reg", 0)), batch_size
@@ -407,6 +865,16 @@ def do_train(
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            proto_update_info = update_model_proto_bank_after_step(model, ret, batch)
+            meters["proto_num_updated_pids"].update(
+                float(proto_update_info.get("num_updated_pids", 0)), 1
+            )
+            meters["proto_num_newly_initialized_pids"].update(
+                float(proto_update_info.get("num_newly_initialized_pids", 0)), 1
+            )
+            meters["proto_num_initialized_pids"].update(
+                float(proto_update_info.get("num_initialized_pids", 0)), 1
+            )
             synchronize()
 
             if (n_iter + 1) % log_period == 0:
@@ -434,6 +902,14 @@ def do_train(
             )
 
         if epoch % eval_period == 0 and get_rank() == 0:
+            img_local_filter_active = apply_img_local_filter_stage(
+                model,
+                args,
+                epoch,
+                logger=logger,
+                prefix="Validation",
+                runtime=epoch_img_local_runtime,
+            )
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
                 top1 = evaluator.eval(model.module.eval())

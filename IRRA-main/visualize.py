@@ -5,6 +5,7 @@ import numpy as np
 import os.path as op
 import torch.nn.functional as F
 from datasets import build_dataloader
+from processor.processor import apply_img_local_filter_stage
 from utils.checkpoint import Checkpointer
 from model import build_model
 from utils.metrics import Evaluator
@@ -25,7 +26,9 @@ device = "cuda"
 test_img_loader, test_txt_loader = build_dataloader(args)
 model = build_model(args)
 checkpointer = Checkpointer(model)
-checkpointer.load(f=op.join(args.output_dir, 'best.pth'))
+checkpoint = checkpointer.load(f=op.join(args.output_dir, 'best.pth'))
+best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
+apply_img_local_filter_stage(model, args, best_epoch)
 model.to(device)
 
 evaluator = Evaluator(test_img_loader, test_txt_loader)

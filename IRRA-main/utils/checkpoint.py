@@ -58,6 +58,7 @@ class Checkpointer:
         self.logger.info("Loading checkpoint from {}".format(f))
         checkpoint = self._load_file(f)
         self._load_model(checkpoint)
+        return checkpoint
 
     def resume(self, f=None):
         # Resume full training states (model + optimizer + scheduler).
