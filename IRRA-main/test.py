@@ -16,6 +16,8 @@ def _apply_qalr_test_overrides(args, cli_args):
         "rerank_alpha": 0.2,
         "rerank_token_topm": 8,
         "rerank_patch_topr": 4,
+        "use_qalr_score_norm": False,
+        "qalr_score_norm_type": "zscore",
     }
     for key, value in qalr_defaults.items():
         if not hasattr(args, key):
@@ -31,6 +33,10 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.rerank_token_topm = cli_args.rerank_token_topm
     if cli_args.rerank_patch_topr is not None:
         args.rerank_patch_topr = cli_args.rerank_patch_topr
+    if cli_args.use_qalr_score_norm is not None:
+        args.use_qalr_score_norm = cli_args.use_qalr_score_norm
+    if cli_args.qalr_score_norm_type is not None:
+        args.qalr_score_norm_type = cli_args.qalr_score_norm_type
     return args
 
 
@@ -68,6 +74,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="number of top-matching RGB/T patches averaged per selected text token",
+    )
+    parser.add_argument(
+        "--use_qalr_score_norm",
+        default=None,
+        action="store_true",
+        help="enable query-wise local score normalization inside QALR",
+    )
+    parser.add_argument(
+        "--qalr_score_norm_type",
+        type=str,
+        default=None,
+        help="QALR local score normalization type",
     )
     cli_args = parser.parse_args()
 

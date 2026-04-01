@@ -117,6 +117,8 @@ def get_args():
     parser.add_argument("--rerank_alpha", type=float, default=0.2, help="fusion weight for local rerank score: final = global + alpha * local")
     parser.add_argument("--rerank_token_topm", type=int, default=8, help="number of salient text tokens kept for local reranking")
     parser.add_argument("--rerank_patch_topr", type=int, default=4, help="number of top-matching RGB/T patches averaged per selected text token")
+    parser.add_argument("--use_qalr_score_norm", default=False, action='store_true', help="enable query-wise local score normalization inside QALR")
+    parser.add_argument("--qalr_score_norm_type", type=str, default="zscore", help="QALR local score normalization type")
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

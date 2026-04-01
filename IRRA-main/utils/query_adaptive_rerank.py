@@ -21,19 +21,25 @@ class QueryAdaptiveLocalReranker(object):
         alpha=0.2,
         token_topm=8,
         patch_topr=4,
+        use_score_norm=False,
+        score_norm_type="zscore",
         vocab_size=49408,
         num_special_tokens=3,
         query_chunk_size=64,
         candidate_chunk_size=16,
+        score_norm_eps=1e-6,
     ):
         self.topk = int(topk)
         self.alpha = float(alpha)
         self.token_topm = int(token_topm)
         self.patch_topr = int(patch_topr)
+        self.use_score_norm = bool(use_score_norm)
+        self.score_norm_type = str(score_norm_type).lower()
         self.vocab_size = int(vocab_size)
         self.num_special_tokens = int(num_special_tokens)
         self.query_chunk_size = int(query_chunk_size)
         self.candidate_chunk_size = int(candidate_chunk_size)
+        self.score_norm_eps = float(score_norm_eps)
 
         if self.topk <= 0:
             raise ValueError(f"rerank_topk must be > 0, got {self.topk}.")
@@ -50,6 +56,15 @@ class QueryAdaptiveLocalReranker(object):
                 "vocab_size must be larger than num_special_tokens, "
                 f"got vocab_size={self.vocab_size}, "
                 f"num_special_tokens={self.num_special_tokens}."
+            )
+        if self.score_norm_eps <= 0:
+            raise ValueError(
+                f"score_norm_eps must be > 0, got {self.score_norm_eps}."
+            )
+        if self.use_score_norm and self.score_norm_type != "zscore":
+            raise ValueError(
+                "Unsupported qalr_score_norm_type="
+                f"{self.score_norm_type}. Only 'zscore' is currently supported."
             )
 
     def _masked_softmax(self, values, valid_mask, dim):
@@ -117,6 +132,35 @@ class QueryAdaptiveLocalReranker(object):
         )
         return gathered_tokens, topm_weights
 
+    def _normalize_local_scores(self, local_scores):
+        if not self.use_score_norm:
+            return local_scores, None
+
+        if self.score_norm_type != "zscore":
+            raise ValueError(
+                "Unsupported qalr_score_norm_type="
+                f"{self.score_norm_type}. Only 'zscore' is currently supported."
+            )
+
+        local_mean = local_scores.mean(dim=1, keepdim=True)
+        local_std = local_scores.std(dim=1, unbiased=False, keepdim=True)
+        safe_local_std = local_std.clamp_min(self.score_norm_eps)
+        local_scores = (local_scores - local_mean) / safe_local_std
+        return local_scores, safe_local_std
+
+    def _summarize_querywise_tensor(self, values):
+        if values.numel() == 0:
+            return {
+                "avg": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+            }
+        return {
+            "avg": values.mean().item(),
+            "min": values.min().item(),
+            "max": values.max().item(),
+        }
+
     def rerank(
         self,
         query_token_embeddings,
@@ -125,15 +169,20 @@ class QueryAdaptiveLocalReranker(object):
         gallery_rgb_patch_tokens,
         gallery_thermal_patch_tokens,
         global_similarity,
+        return_stats=False,
     ):
         num_query, num_gallery = global_similarity.shape
         if num_query == 0 or num_gallery == 0:
+            if return_stats:
+                return global_similarity, {}
             return global_similarity
 
         patch_pool = self._build_patch_pool(
             gallery_rgb_patch_tokens, gallery_thermal_patch_tokens
         )
         if patch_pool.shape[1] == 0:
+            if return_stats:
+                return global_similarity, {}
             return global_similarity
 
         patch_pool = F.normalize(patch_pool.float(), p=2, dim=-1)
@@ -153,6 +202,11 @@ class QueryAdaptiveLocalReranker(object):
             sorted=False,
         )
         reranked_similarity = global_similarity.clone()
+        raw_local_means = []
+        raw_local_stds = []
+        used_local_means = []
+        used_local_stds = []
+        safe_local_std_mins = []
 
         for q_start in range(0, num_query, self.query_chunk_size):
             q_end = min(q_start + self.query_chunk_size, num_query)
@@ -184,11 +238,52 @@ class QueryAdaptiveLocalReranker(object):
                     dim=-1,
                 )
 
-            final_topk_scores = topk_scores[q_start:q_end] + self.alpha * local_scores_chunk
+            raw_local_means.append(local_scores_chunk.mean(dim=1).detach().cpu())
+            raw_local_stds.append(
+                local_scores_chunk.std(dim=1, unbiased=False).detach().cpu()
+            )
+            fused_local_scores_chunk, safe_local_std = self._normalize_local_scores(
+                local_scores_chunk
+            )
+            if self.use_score_norm:
+                used_local_means.append(
+                    fused_local_scores_chunk.mean(dim=1).detach().cpu()
+                )
+                used_local_stds.append(
+                    fused_local_scores_chunk.std(dim=1, unbiased=False).detach().cpu()
+                )
+                safe_local_std_mins.append(safe_local_std.min().detach().cpu())
+
+            final_topk_scores = topk_scores[q_start:q_end] + self.alpha * fused_local_scores_chunk
             reranked_similarity[q_start:q_end].scatter_(
                 dim=1,
                 index=topk_indices_chunk,
                 src=final_topk_scores,
             )
 
-        return reranked_similarity
+        if not return_stats:
+            return reranked_similarity
+
+        raw_local_means = torch.cat(raw_local_means, dim=0)
+        raw_local_stds = torch.cat(raw_local_stds, dim=0)
+        stats = {
+            "raw_local_mean": self._summarize_querywise_tensor(raw_local_means),
+            "raw_local_std": self._summarize_querywise_tensor(raw_local_stds),
+        }
+        if self.use_score_norm:
+            used_local_means = torch.cat(used_local_means, dim=0)
+            used_local_stds = torch.cat(used_local_stds, dim=0)
+            safe_local_std_mins = torch.stack(safe_local_std_mins, dim=0)
+            stats.update(
+                {
+                    "used_local_mean": self._summarize_querywise_tensor(
+                        used_local_means
+                    ),
+                    "used_local_std": self._summarize_querywise_tensor(
+                        used_local_stds
+                    ),
+                    "safe_local_std_min": safe_local_std_mins.min().item(),
+                }
+            )
+
+        return reranked_similarity, stats

@@ -202,28 +202,64 @@ class Evaluator():
         # 3) Text-to-image similarity matrix.
         similarity = qfeats @ gfeats.t()
         if use_qalr:
+            use_qalr_score_norm = bool(
+                getattr(model.args, "use_qalr_score_norm", False)
+            )
+            qalr_score_norm_type = str(
+                getattr(model.args, "qalr_score_norm_type", "zscore")
+            )
             reranker = QueryAdaptiveLocalReranker(
                 topk=int(getattr(model.args, "rerank_topk", 128)),
                 alpha=float(getattr(model.args, "rerank_alpha", 0.2)),
                 token_topm=int(getattr(model.args, "rerank_token_topm", 8)),
                 patch_topr=int(getattr(model.args, "rerank_patch_topr", 4)),
+                use_score_norm=use_qalr_score_norm,
+                score_norm_type=qalr_score_norm_type,
                 vocab_size=int(getattr(model.args, "vocab_size", 49408)),
             )
-            similarity = reranker.rerank(
+            similarity, rerank_stats = reranker.rerank(
                 query_token_embeddings=embedding_outputs["query_token_embeddings"],
                 query_token_ids=embedding_outputs["query_token_ids"],
                 query_global_embeddings=embedding_outputs["query_global_embeddings"],
                 gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
                 gallery_thermal_patch_tokens=embedding_outputs["gallery_thermal_patch_tokens"],
                 global_similarity=similarity,
+                return_stats=True,
             )
             self.logger.info(
-                "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d",
+                "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d, use_qalr_score_norm=%s, qalr_score_norm_type=%s",
                 getattr(model.args, "rerank_topk", 128),
                 getattr(model.args, "rerank_alpha", 0.2),
                 getattr(model.args, "rerank_token_topm", 8),
                 getattr(model.args, "rerank_patch_topr", 4),
+                use_qalr_score_norm,
+                qalr_score_norm_type,
             )
+            raw_local_mean = rerank_stats.get("raw_local_mean", {})
+            raw_local_std = rerank_stats.get("raw_local_std", {})
+            log_msg = (
+                "QALR local score summary: raw_mean_avg=%.4f, raw_std_avg=%.4f, "
+                "raw_std_min=%.6f"
+            )
+            log_args = [
+                raw_local_mean.get("avg", 0.0),
+                raw_local_std.get("avg", 0.0),
+                raw_local_std.get("min", 0.0),
+            ]
+            if use_qalr_score_norm:
+                used_local_mean = rerank_stats.get("used_local_mean", {})
+                used_local_std = rerank_stats.get("used_local_std", {})
+                log_msg += (
+                    ", used_mean_avg=%.4f, used_std_avg=%.4f, safe_std_min=%.6f"
+                )
+                log_args.extend(
+                    [
+                        used_local_mean.get("avg", 0.0),
+                        used_local_std.get("avg", 0.0),
+                        rerank_stats.get("safe_local_std_min", 0.0),
+                    ]
+                )
+            self.logger.info(log_msg, *log_args)
 
         # 4) Compute retrieval metrics.
         t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)
