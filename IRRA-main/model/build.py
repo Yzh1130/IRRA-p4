@@ -573,6 +573,84 @@ class IRRA(nn.Module):
         feats = self.encode_rgbt_deterministic(rgb_image, thermal_image)
         return self._maybe_eval_sampling(feats)
 
+    def encode_text_eval_with_tokens(self, text):
+        """
+        Eval-only helper for query-adaptive local reranking.
+
+        Returns:
+            {
+                "global_feat": [B, C], deterministic retrieval embedding
+                "token_embeddings": [B, L_t, C], projected text token embeddings
+                "global_token_embedding": [B, C], raw EOT token embedding for saliency
+            }
+        """
+        text_tokens = self.base_model.encode_text(text)  # [B, L_t, C]
+        batch_index = torch.arange(text_tokens.shape[0], device=text_tokens.device)
+        text_global_raw = text_tokens[batch_index, text.argmax(dim=-1)].float()  # [B, C]
+        text_feat, _ = self._encode_text_global_gaussian(text_global_raw)
+        return {
+            "global_feat": self._maybe_eval_sampling(text_feat),
+            "token_embeddings": text_tokens.float(),
+            "global_token_embedding": text_global_raw,
+        }
+
+    def encode_rgbt_eval_with_patches(self, rgb_image, thermal_image=None):
+        """
+        Eval-only helper for query-adaptive local reranking.
+
+        Returns:
+            {
+                "global_feat": [B, C], deterministic retrieval embedding
+                "rgb_patch_tokens": [B, Np, C]
+                "thermal_patch_tokens": [B, Np, C] or [B, 0, C] when thermal is absent
+            }
+        """
+        rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
+        rgb_global_feat, _ = self._apply_image_local_filter(rgb_tokens)  # [B, C]
+        rgb_patch_tokens = rgb_tokens[:, 1:, :].float()  # [B, Np, C]
+
+        if thermal_image is not None:
+            thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
+            thermal_global_feat, _ = self._apply_image_local_filter(
+                thermal_tokens
+            )  # [B, C]
+            thermal_patch_tokens = thermal_tokens[:, 1:, :].float()  # [B, Np, C]
+        else:
+            thermal_global_feat = torch.zeros_like(rgb_global_feat)
+            thermal_patch_tokens = rgb_patch_tokens.new_zeros(
+                rgb_patch_tokens.shape[0],
+                0,
+                rgb_patch_tokens.shape[-1],
+            )
+
+        rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
+            rgb_global_feat,
+            thermal_global_feat,
+            thermal_available=thermal_image is not None,
+        )
+        fused_feat, _ = self._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=thermal_image is not None,
+        )
+
+        if self.eval_use_mu_only:
+            global_feat = rgb_mu
+        elif self.eval_use_fused_mu:
+            global_feat = fused_feat
+        elif self.use_rgbt_add_fusion:
+            global_feat = rgb_mu + thermal_mu
+        else:
+            global_feat = rgb_mu
+
+        return {
+            "global_feat": self._maybe_eval_sampling(global_feat),
+            "rgb_patch_tokens": rgb_patch_tokens,
+            "thermal_patch_tokens": thermal_patch_tokens,
+        }
+
     def encode_rgbt_global(self, rgb_image, thermal_image=None):
         """
         Args:

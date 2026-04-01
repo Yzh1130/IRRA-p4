@@ -109,6 +109,14 @@ def get_args():
     parser.add_argument("--img_local_score_temp", type=float, default=0.07, help="temperature for image-only patch relevance scores")
     parser.add_argument("--img_local_detach_global", default=True, action='store_true', help="detach baseline global feature when computing image-only patch relevance")
     parser.add_argument("--no_img_local_detach_global", dest='img_local_detach_global', action='store_false', help="keep baseline global feature trainable inside image-only patch relevance")
+
+    ######################## inference-only query-adaptive local rerank ########################
+    # Only active during evaluation; training and baseline inference stay unchanged when disabled.
+    parser.add_argument("--use_qalr", default=False, action='store_true', help="enable inference-only query-adaptive local reranking on top-K gallery candidates")
+    parser.add_argument("--rerank_topk", type=int, default=128, help="number of top-ranked gallery candidates per query used for local reranking")
+    parser.add_argument("--rerank_alpha", type=float, default=0.2, help="fusion weight for local rerank score: final = global + alpha * local")
+    parser.add_argument("--rerank_token_topm", type=int, default=8, help="number of salient text tokens kept for local reranking")
+    parser.add_argument("--rerank_patch_topr", type=int, default=4, help="number of top-matching RGB/T patches averaged per selected text token")
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

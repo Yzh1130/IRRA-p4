@@ -5,6 +5,8 @@ import os
 import torch.nn.functional as F
 import logging
 
+from utils.query_adaptive_rerank import QueryAdaptiveLocalReranker
+
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     # similarity: [num_query, num_gallery], larger means more similar.
@@ -110,11 +112,88 @@ class Evaluator():
         gfeats = torch.cat(gfeats, 0)
 
         return qfeats, gfeats, qids, gids
+
+    def _compute_embedding_with_local(self, model):
+        # Eval-only path that also collects token/patch features for local reranking.
+        model = model.eval()
+        device = next(model.parameters()).device
+
+        if not hasattr(model, "encode_text_eval_with_tokens"):
+            raise AttributeError(
+                "Model must implement encode_text_eval_with_tokens() when use_qalr=True."
+            )
+        if not hasattr(model, "encode_rgbt_eval_with_patches"):
+            raise AttributeError(
+                "Model must implement encode_rgbt_eval_with_patches() when use_qalr=True."
+            )
+
+        qids, gids = [], []
+        qfeats, gfeats = [], []
+        query_token_embeddings, query_token_ids, query_global_embeddings = [], [], []
+        gallery_rgb_patch_tokens, gallery_thermal_patch_tokens = [], []
+
+        for pid, caption in self.txt_loader:
+            caption = caption.to(device)
+            with torch.no_grad():
+                text_outputs = model.encode_text_eval_with_tokens(caption)
+            qids.append(pid.view(-1))
+            qfeats.append(text_outputs["global_feat"])
+            query_token_embeddings.append(text_outputs["token_embeddings"])
+            query_token_ids.append(caption)
+            query_global_embeddings.append(text_outputs["global_token_embedding"])
+
+        qids = torch.cat(qids, 0)
+        qfeats = torch.cat(qfeats, 0)
+        query_token_embeddings = torch.cat(query_token_embeddings, 0)
+        query_token_ids = torch.cat(query_token_ids, 0)
+        query_global_embeddings = torch.cat(query_global_embeddings, 0)
+
+        for data in self.img_loader:
+            if len(data) == 3:
+                pid, img, thermal_img = data
+                img = img.to(device)
+                thermal_img = thermal_img.to(device)
+            else:
+                pid, img = data
+                img = img.to(device)
+                thermal_img = None
+
+            with torch.no_grad():
+                image_outputs = model.encode_rgbt_eval_with_patches(img, thermal_img)
+            gids.append(pid.view(-1))
+            gfeats.append(image_outputs["global_feat"])
+            gallery_rgb_patch_tokens.append(image_outputs["rgb_patch_tokens"])
+            gallery_thermal_patch_tokens.append(image_outputs["thermal_patch_tokens"])
+
+        gids = torch.cat(gids, 0)
+        gfeats = torch.cat(gfeats, 0)
+        gallery_rgb_patch_tokens = torch.cat(gallery_rgb_patch_tokens, 0)
+        gallery_thermal_patch_tokens = torch.cat(gallery_thermal_patch_tokens, 0)
+
+        return {
+            "qfeats": qfeats,
+            "gfeats": gfeats,
+            "qids": qids,
+            "gids": gids,
+            "query_token_embeddings": query_token_embeddings,
+            "query_token_ids": query_token_ids,
+            "query_global_embeddings": query_global_embeddings,
+            "gallery_rgb_patch_tokens": gallery_rgb_patch_tokens,
+            "gallery_thermal_patch_tokens": gallery_thermal_patch_tokens,
+        }
     
     def eval(self, model, i2t_metric=False):
+        use_qalr = bool(getattr(getattr(model, "args", None), "use_qalr", False))
 
         # 1) Get embeddings.
-        qfeats, gfeats, qids, gids = self._compute_embedding(model)
+        if use_qalr:
+            embedding_outputs = self._compute_embedding_with_local(model)
+            qfeats = embedding_outputs["qfeats"]
+            gfeats = embedding_outputs["gfeats"]
+            qids = embedding_outputs["qids"]
+            gids = embedding_outputs["gids"]
+        else:
+            qfeats, gfeats, qids, gids = self._compute_embedding(model)
 
         # 2) L2 normalize before cosine similarity.
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
@@ -122,6 +201,29 @@ class Evaluator():
 
         # 3) Text-to-image similarity matrix.
         similarity = qfeats @ gfeats.t()
+        if use_qalr:
+            reranker = QueryAdaptiveLocalReranker(
+                topk=int(getattr(model.args, "rerank_topk", 128)),
+                alpha=float(getattr(model.args, "rerank_alpha", 0.2)),
+                token_topm=int(getattr(model.args, "rerank_token_topm", 8)),
+                patch_topr=int(getattr(model.args, "rerank_patch_topr", 4)),
+                vocab_size=int(getattr(model.args, "vocab_size", 49408)),
+            )
+            similarity = reranker.rerank(
+                query_token_embeddings=embedding_outputs["query_token_embeddings"],
+                query_token_ids=embedding_outputs["query_token_ids"],
+                query_global_embeddings=embedding_outputs["query_global_embeddings"],
+                gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
+                gallery_thermal_patch_tokens=embedding_outputs["gallery_thermal_patch_tokens"],
+                global_similarity=similarity,
+            )
+            self.logger.info(
+                "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d",
+                getattr(model.args, "rerank_topk", 128),
+                getattr(model.args, "rerank_alpha", 0.2),
+                getattr(model.args, "rerank_token_topm", 8),
+                getattr(model.args, "rerank_patch_topr", 4),
+            )
 
         # 4) Compute retrieval metrics.
         t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)
