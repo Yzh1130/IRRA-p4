@@ -23,6 +23,9 @@ class QueryAdaptiveLocalReranker(object):
         patch_topr=4,
         use_score_norm=False,
         score_norm_type="zscore",
+        use_query_gate=False,
+        query_gate_type="top12_margin",
+        query_gate_margin=0.05,
         vocab_size=49408,
         num_special_tokens=3,
         query_chunk_size=64,
@@ -35,6 +38,9 @@ class QueryAdaptiveLocalReranker(object):
         self.patch_topr = int(patch_topr)
         self.use_score_norm = bool(use_score_norm)
         self.score_norm_type = str(score_norm_type).lower()
+        self.use_query_gate = bool(use_query_gate)
+        self.query_gate_type = str(query_gate_type).lower()
+        self.query_gate_margin = float(query_gate_margin)
         self.vocab_size = int(vocab_size)
         self.num_special_tokens = int(num_special_tokens)
         self.query_chunk_size = int(query_chunk_size)
@@ -65,6 +71,11 @@ class QueryAdaptiveLocalReranker(object):
             raise ValueError(
                 "Unsupported qalr_score_norm_type="
                 f"{self.score_norm_type}. Only 'zscore' is currently supported."
+            )
+        if self.use_query_gate and self.query_gate_type != "top12_margin":
+            raise ValueError(
+                "Unsupported qalr_query_gate_type="
+                f"{self.query_gate_type}. Only 'top12_margin' is currently supported."
             )
 
     def _masked_softmax(self, values, valid_mask, dim):
@@ -148,6 +159,36 @@ class QueryAdaptiveLocalReranker(object):
         local_scores = (local_scores - local_mean) / safe_local_std
         return local_scores, safe_local_std
 
+    def _build_query_gate_mask(self, global_similarity):
+        num_query, num_gallery = global_similarity.shape
+        if not self.use_query_gate:
+            return torch.ones(
+                num_query, dtype=torch.bool, device=global_similarity.device
+            ), None
+
+        if self.query_gate_type != "top12_margin":
+            raise ValueError(
+                "Unsupported qalr_query_gate_type="
+                f"{self.query_gate_type}. Only 'top12_margin' is currently supported."
+            )
+
+        if num_gallery < 2:
+            return torch.zeros(
+                num_query, dtype=torch.bool, device=global_similarity.device
+            ), torch.full(
+                (num_query,),
+                float("inf"),
+                dtype=global_similarity.dtype,
+                device=global_similarity.device,
+            )
+
+        top2_scores = torch.topk(
+            global_similarity, k=2, dim=1, largest=True, sorted=True
+        ).values
+        top12_margin = top2_scores[:, 0] - top2_scores[:, 1]
+        query_gate_mask = top12_margin < self.query_gate_margin
+        return query_gate_mask, top12_margin
+
     def _summarize_querywise_tensor(self, values):
         if values.numel() == 0:
             return {
@@ -201,6 +242,7 @@ class QueryAdaptiveLocalReranker(object):
             largest=True,
             sorted=False,
         )
+        query_gate_mask, top12_margin = self._build_query_gate_mask(global_similarity)
         reranked_similarity = global_similarity.clone()
         raw_local_means = []
         raw_local_stds = []
@@ -213,6 +255,7 @@ class QueryAdaptiveLocalReranker(object):
             query_tokens_chunk = salient_query_tokens[q_start:q_end]
             token_weights_chunk = salient_token_weights[q_start:q_end]
             topk_indices_chunk = topk_indices[q_start:q_end]
+            query_gate_mask_chunk = query_gate_mask[q_start:q_end]
             local_scores_chunk = torch.zeros_like(topk_scores[q_start:q_end])
 
             for c_start in range(0, effective_topk, self.candidate_chunk_size):
@@ -255,6 +298,12 @@ class QueryAdaptiveLocalReranker(object):
                 safe_local_std_mins.append(safe_local_std.min().detach().cpu())
 
             final_topk_scores = topk_scores[q_start:q_end] + self.alpha * fused_local_scores_chunk
+            if self.use_query_gate:
+                final_topk_scores = torch.where(
+                    query_gate_mask_chunk.unsqueeze(1),
+                    final_topk_scores,
+                    topk_scores[q_start:q_end],
+                )
             reranked_similarity[q_start:q_end].scatter_(
                 dim=1,
                 index=topk_indices_chunk,
@@ -285,5 +334,10 @@ class QueryAdaptiveLocalReranker(object):
                     "safe_local_std_min": safe_local_std_mins.min().item(),
                 }
             )
+        if top12_margin is not None:
+            stats["query_gate_margin"] = self._summarize_querywise_tensor(
+                top12_margin.detach().cpu()
+            )
+        stats["gated_query_ratio"] = query_gate_mask.float().mean().item()
 
         return reranked_similarity, stats

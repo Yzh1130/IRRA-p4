@@ -18,6 +18,9 @@ def _apply_qalr_test_overrides(args, cli_args):
         "rerank_patch_topr": 4,
         "use_qalr_score_norm": False,
         "qalr_score_norm_type": "zscore",
+        "use_qalr_query_gate": False,
+        "qalr_query_gate_type": "top12_margin",
+        "qalr_query_gate_margin": 0.05,
     }
     for key, value in qalr_defaults.items():
         if not hasattr(args, key):
@@ -37,6 +40,12 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.use_qalr_score_norm = cli_args.use_qalr_score_norm
     if cli_args.qalr_score_norm_type is not None:
         args.qalr_score_norm_type = cli_args.qalr_score_norm_type
+    if cli_args.use_qalr_query_gate is not None:
+        args.use_qalr_query_gate = cli_args.use_qalr_query_gate
+    if cli_args.qalr_query_gate_type is not None:
+        args.qalr_query_gate_type = cli_args.qalr_query_gate_type
+    if cli_args.qalr_query_gate_margin is not None:
+        args.qalr_query_gate_margin = cli_args.qalr_query_gate_margin
     return args
 
 
@@ -86,6 +95,24 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="QALR local score normalization type",
+    )
+    parser.add_argument(
+        "--use_qalr_query_gate",
+        default=None,
+        action="store_true",
+        help="enable hard-query gating that decides whether each query uses QALR",
+    )
+    parser.add_argument(
+        "--qalr_query_gate_type",
+        type=str,
+        default=None,
+        help="QALR query gating type",
+    )
+    parser.add_argument(
+        "--qalr_query_gate_margin",
+        type=float,
+        default=None,
+        help="margin threshold on global top1-top2 score gap for enabling QALR on a query",
     )
     cli_args = parser.parse_args()
 

@@ -208,6 +208,15 @@ class Evaluator():
             qalr_score_norm_type = str(
                 getattr(model.args, "qalr_score_norm_type", "zscore")
             )
+            use_qalr_query_gate = bool(
+                getattr(model.args, "use_qalr_query_gate", False)
+            )
+            qalr_query_gate_type = str(
+                getattr(model.args, "qalr_query_gate_type", "top12_margin")
+            )
+            qalr_query_gate_margin = float(
+                getattr(model.args, "qalr_query_gate_margin", 0.05)
+            )
             reranker = QueryAdaptiveLocalReranker(
                 topk=int(getattr(model.args, "rerank_topk", 128)),
                 alpha=float(getattr(model.args, "rerank_alpha", 0.2)),
@@ -215,6 +224,9 @@ class Evaluator():
                 patch_topr=int(getattr(model.args, "rerank_patch_topr", 4)),
                 use_score_norm=use_qalr_score_norm,
                 score_norm_type=qalr_score_norm_type,
+                use_query_gate=use_qalr_query_gate,
+                query_gate_type=qalr_query_gate_type,
+                query_gate_margin=qalr_query_gate_margin,
                 vocab_size=int(getattr(model.args, "vocab_size", 49408)),
             )
             similarity, rerank_stats = reranker.rerank(
@@ -227,13 +239,16 @@ class Evaluator():
                 return_stats=True,
             )
             self.logger.info(
-                "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d, use_qalr_score_norm=%s, qalr_score_norm_type=%s",
+                "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d, use_qalr_score_norm=%s, qalr_score_norm_type=%s, use_qalr_query_gate=%s, qalr_query_gate_type=%s, qalr_query_gate_margin=%.6f",
                 getattr(model.args, "rerank_topk", 128),
                 getattr(model.args, "rerank_alpha", 0.2),
                 getattr(model.args, "rerank_token_topm", 8),
                 getattr(model.args, "rerank_patch_topr", 4),
                 use_qalr_score_norm,
                 qalr_score_norm_type,
+                use_qalr_query_gate,
+                qalr_query_gate_type,
+                qalr_query_gate_margin,
             )
             raw_local_mean = rerank_stats.get("raw_local_mean", {})
             raw_local_std = rerank_stats.get("raw_local_std", {})
@@ -257,6 +272,16 @@ class Evaluator():
                         used_local_mean.get("avg", 0.0),
                         used_local_std.get("avg", 0.0),
                         rerank_stats.get("safe_local_std_min", 0.0),
+                    ]
+                )
+            log_msg += ", gated_query_ratio=%.4f"
+            log_args.append(rerank_stats.get("gated_query_ratio", 0.0))
+            if use_qalr_query_gate:
+                query_gate_margin = rerank_stats.get("query_gate_margin", {})
+                log_msg += ", top12_margin_avg=%.4f"
+                log_args.extend(
+                    [
+                        query_gate_margin.get("avg", 0.0),
                     ]
                 )
             self.logger.info(log_msg, *log_args)
