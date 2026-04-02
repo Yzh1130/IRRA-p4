@@ -391,6 +391,58 @@ def _build_total_loss(args, ret):
     return total_loss
 
 
+def _compute_hardneg_aux_terms(args, ret, batch, epoch):
+    if not bool(getattr(args, "use_hardneg_aux", False)):
+        return {}
+
+    zero = batch["images"].new_zeros(())
+    if int(epoch) < int(getattr(args, "hn_start_epoch", 1)):
+        return {
+            "loss_hn": zero,
+            "hn_active": False,
+            "hn_num_valid_queries": 0.0,
+            "hn_avg_pos_sim": zero,
+            "hn_avg_neg_sim": zero,
+            "hn_avg_margin_gap": zero,
+        }
+
+    fused_feat = ret.get("fused_det_feat", ret.get("fused_prob_feat", None))
+    text_feat = ret.get("text_det_feat", ret.get("text_prob_feat", None))
+    pids = batch.get("pids", None)
+    if fused_feat is None or text_feat is None or pids is None:
+        raise KeyError(
+            "Hard-negative auxiliary loss requires fused/text global features "
+            "and batch['pids']."
+        )
+
+    hn_out = objectives.compute_hard_negative_aux_loss(
+        query_features=text_feat,
+        gallery_features=fused_feat,
+        query_pid=pids,
+        gallery_pid=pids,
+        margin=float(getattr(args, "hn_margin", 0.05)),
+        topn=int(getattr(args, "hn_topn", 3)),
+    )
+    return {
+        "loss_hn": hn_out["loss"],
+        "hn_active": True,
+        "hn_num_valid_queries": hn_out["num_valid_queries"],
+        "hn_avg_pos_sim": hn_out["avg_pos_sim"],
+        "hn_avg_neg_sim": hn_out["avg_neg_sim"],
+        "hn_avg_margin_gap": hn_out["avg_margin_gap"],
+    }
+
+
+def _add_hardneg_aux_to_total_loss(args, total_loss, ret, epoch):
+    if not bool(getattr(args, "use_hardneg_aux", False)):
+        return total_loss
+    if int(epoch) < int(getattr(args, "hn_start_epoch", 5)):
+        return total_loss
+    if "loss_hn" in ret:
+        total_loss = total_loss + float(getattr(args, "lambda_hn", 0.05)) * ret["loss_hn"]
+    return total_loss
+
+
 def _compute_proto_calibration_terms(args, model, ret, batch):
     if not bool(getattr(args, "use_proto_calib", False)):
         return {}
@@ -718,6 +770,12 @@ def do_train(
         "loss_dist_sdm_total": AverageMeter(),
         "loss_dist_sdm_text_rgb": AverageMeter(),
         "loss_dist_sdm_rgb_thermal": AverageMeter(),
+        "loss_hn": AverageMeter(),
+        "hn_active": AverageMeter(),
+        "hn_num_valid_queries": AverageMeter(),
+        "hn_avg_pos_sim": AverageMeter(),
+        "hn_avg_neg_sim": AverageMeter(),
+        "hn_avg_margin_gap": AverageMeter(),
         "loss_proto_v": AverageMeter(),
         "loss_proto_t": AverageMeter(),
         "proto_loss_active": AverageMeter(),
@@ -766,10 +824,16 @@ def do_train(
             ret = model(batch)
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
+            if getattr(args, "use_hardneg_aux", False):
+                ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
             ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
             total_loss = _add_proto_calibration_to_total_loss(
                 args, original_total_loss, ret
             )
+            if getattr(args, "use_hardneg_aux", False):
+                total_loss = _add_hardneg_aux_to_total_loss(
+                    args, total_loss, ret, epoch
+                )
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
@@ -809,6 +873,21 @@ def do_train(
             meters["loss_dist_sdm_rgb_thermal"].update(
                 _to_scalar(ret.get("loss_dist_sdm_rgb_thermal", 0)), batch_size
             )
+            if getattr(args, "use_hardneg_aux", False):
+                meters["loss_hn"].update(_to_scalar(ret.get("loss_hn", 0)), batch_size)
+                meters["hn_active"].update(_to_scalar(ret.get("hn_active", 0)), 1)
+                meters["hn_num_valid_queries"].update(
+                    _to_scalar(ret.get("hn_num_valid_queries", 0)), 1
+                )
+                meters["hn_avg_pos_sim"].update(
+                    _to_scalar(ret.get("hn_avg_pos_sim", 0)), batch_size
+                )
+                meters["hn_avg_neg_sim"].update(
+                    _to_scalar(ret.get("hn_avg_neg_sim", 0)), batch_size
+                )
+                meters["hn_avg_margin_gap"].update(
+                    _to_scalar(ret.get("hn_avg_margin_gap", 0)), batch_size
+                )
             meters["loss_proto_v"].update(
                 _to_scalar(ret.get("loss_proto_v", 0)), batch_size
             )

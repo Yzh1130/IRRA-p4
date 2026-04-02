@@ -184,6 +184,136 @@ def compute_cmpm(image_embeddings, text_embeddings, labels, epsilon=1e-8):
     return cmpm_loss
 
 
+def compute_hard_negative_aux_loss(
+    query_features,
+    gallery_features,
+    query_pid,
+    gallery_pid=None,
+    margin=0.2,
+    topn=1,
+    epsilon=1e-8,
+):
+    """
+    Batch-internal hard-negative auxiliary hinge loss over a cross-modal similarity matrix.
+
+    Positives are defined by pid equality. All same-pid samples are excluded from the
+    negative pool by default. When multiple positives exist in-batch, their
+    similarities are averaged to form pos_sim. For hard negatives, the top-n
+    highest-similarity valid negatives are averaged per query.
+
+    Loss per valid query:
+        max(0, margin - pos_sim + hardneg_sim)
+    """
+    if topn <= 0:
+        raise ValueError(f"hn_topn must be > 0, got {topn}.")
+    if query_features.dim() != 2 or gallery_features.dim() != 2:
+        raise ValueError(
+            "Hard-negative auxiliary expects 2D features, "
+            f"got {tuple(query_features.shape)} and {tuple(gallery_features.shape)}."
+        )
+
+    if gallery_pid is None:
+        gallery_pid = query_pid
+
+    query_pid = query_pid.reshape(-1)
+    gallery_pid = gallery_pid.reshape(-1)
+    if query_features.shape[0] != query_pid.shape[0]:
+        raise ValueError(
+            "query_features and query_pid must share the same batch dimension, "
+            f"got {query_features.shape[0]} and {query_pid.shape[0]}."
+        )
+    if gallery_features.shape[0] != gallery_pid.shape[0]:
+        raise ValueError(
+            "gallery_features and gallery_pid must share the same batch dimension, "
+            f"got {gallery_features.shape[0]} and {gallery_pid.shape[0]}."
+        )
+
+    zero = query_features.new_zeros(())
+    if query_features.shape[0] == 0 or gallery_features.shape[0] == 0:
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    # Zero-fill invalid feature entries first so later cosine similarity stays finite.
+    query_features = torch.nan_to_num(
+        query_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    gallery_features = torch.nan_to_num(
+        gallery_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    query_norm = query_features / query_features.norm(dim=1, keepdim=True).clamp_min(
+        epsilon
+    )
+    gallery_norm = gallery_features / gallery_features.norm(
+        dim=1, keepdim=True
+    ).clamp_min(epsilon)
+    sim_matrix = query_norm @ gallery_norm.t()
+    finite_sim_mask = torch.isfinite(sim_matrix)
+    sim_matrix = torch.nan_to_num(
+        sim_matrix, nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp_(min=-1.0, max=1.0)
+
+    pos_mask = query_pid.unsqueeze(1).eq(gallery_pid.unsqueeze(0))
+    neg_mask = ~pos_mask
+    valid_pos_mask = pos_mask & finite_sim_mask
+    valid_neg_mask = neg_mask & finite_sim_mask
+
+    pos_count = valid_pos_mask.sum(dim=1)
+    neg_count = valid_neg_mask.sum(dim=1)
+    valid_query_mask = (pos_count > 0) & (neg_count > 0)
+
+    if not valid_query_mask.any():
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    pos_sim = (sim_matrix * valid_pos_mask.float()).sum(dim=1) / pos_count.clamp_min(
+        1
+    ).float()
+
+    masked_neg_sim = sim_matrix.masked_fill(~valid_neg_mask, float("-inf"))
+    topk = min(int(topn), masked_neg_sim.shape[1])
+    topk_neg_sim = torch.topk(
+        masked_neg_sim, k=topk, dim=1, largest=True, sorted=False
+    ).values
+    valid_topk_mask = torch.isfinite(topk_neg_sim)
+    hardneg_count = valid_topk_mask.sum(dim=1)
+    valid_query_mask = valid_query_mask & (hardneg_count > 0)
+    if not valid_query_mask.any():
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    hardneg_sim = topk_neg_sim.masked_fill(~valid_topk_mask, 0.0).sum(dim=1) / (
+        hardneg_count.clamp_min(1).float()
+    )
+
+    margin_gap = margin - pos_sim + hardneg_sim
+    per_query_loss = F.relu(margin_gap)
+    loss = per_query_loss[valid_query_mask].mean()
+
+    return {
+        "loss": loss,
+        "avg_pos_sim": pos_sim[valid_query_mask].mean(),
+        "avg_neg_sim": hardneg_sim[valid_query_mask].mean(),
+        "avg_margin_gap": margin_gap[valid_query_mask].mean(),
+        "num_valid_queries": float(valid_query_mask.sum().item()),
+    }
+
+
 def _diag_gaussian_sigma_from_logvar(
     logvar,
     eps=1e-6,

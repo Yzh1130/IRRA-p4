@@ -40,6 +40,11 @@ def get_args():
     parser.add_argument("--proto_temp", type=float, default=0.07, help="reserved temperature for prototype calibration logits")
     parser.add_argument("--proto_momentum", type=float, default=0.9, help="EMA momentum for identity prototype bank updates")
     parser.add_argument("--proto_warmup_epochs", type=int, default=0, help="number of warmup epochs before prototype losses are enabled")
+    parser.add_argument("--use_hardneg_aux", default=False, action='store_true', help="enable batch-internal hard-negative-aware auxiliary loss")
+    parser.add_argument("--lambda_hn", type=float, default=0.05, help="weight for hard-negative auxiliary loss")
+    parser.add_argument("--hn_margin", type=float, default=0.05, help="margin used by hard-negative auxiliary hinge loss")
+    parser.add_argument("--hn_topn", type=int, default=3, help="average the top-n hardest in-batch negatives per query")
+    parser.add_argument("--hn_start_epoch", type=int, default=5, help="1-based epoch index to start hard-negative auxiliary loss")
 
     ######################## global uncertainty feature settings ########################
     # Feature-level uncertainty modeling over global embeddings only.
