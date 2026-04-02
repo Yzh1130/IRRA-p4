@@ -26,6 +26,8 @@ class QueryAdaptiveLocalReranker(object):
         use_query_gate=False,
         query_gate_type="top12_margin",
         query_gate_margin=0.05,
+        use_focus_topn=False,
+        focus_topn=16,
         vocab_size=49408,
         num_special_tokens=3,
         query_chunk_size=64,
@@ -41,6 +43,8 @@ class QueryAdaptiveLocalReranker(object):
         self.use_query_gate = bool(use_query_gate)
         self.query_gate_type = str(query_gate_type).lower()
         self.query_gate_margin = float(query_gate_margin)
+        self.use_focus_topn = bool(use_focus_topn)
+        self.focus_topn = int(focus_topn)
         self.vocab_size = int(vocab_size)
         self.num_special_tokens = int(num_special_tokens)
         self.query_chunk_size = int(query_chunk_size)
@@ -77,6 +81,8 @@ class QueryAdaptiveLocalReranker(object):
                 "Unsupported qalr_query_gate_type="
                 f"{self.query_gate_type}. Only 'top12_margin' is currently supported."
             )
+        if self.use_focus_topn and self.focus_topn <= 0:
+            raise ValueError(f"qalr_focus_topn must be > 0, got {self.focus_topn}.")
 
     def _masked_softmax(self, values, valid_mask, dim):
         safe_values = values.masked_fill(~valid_mask, float("-inf"))
@@ -189,6 +195,26 @@ class QueryAdaptiveLocalReranker(object):
         query_gate_mask = top12_margin < self.query_gate_margin
         return query_gate_mask, top12_margin
 
+    def _build_focus_candidate_mask(self, global_similarity, topk_indices, effective_topk):
+        num_query = global_similarity.shape[0]
+        if not self.use_focus_topn:
+            return torch.ones_like(topk_indices, dtype=torch.bool), effective_topk
+
+        effective_focus_topn = min(self.focus_topn, effective_topk)
+        focus_indices = torch.topk(
+            global_similarity,
+            k=effective_focus_topn,
+            dim=1,
+            largest=True,
+            sorted=True,
+        ).indices
+        focus_candidate_mask = (
+            topk_indices.unsqueeze(-1) == focus_indices.unsqueeze(1)
+        ).any(dim=-1)
+        if num_query == 0:
+            return focus_candidate_mask, effective_focus_topn
+        return focus_candidate_mask, effective_focus_topn
+
     def _summarize_querywise_tensor(self, values):
         if values.numel() == 0:
             return {
@@ -243,6 +269,11 @@ class QueryAdaptiveLocalReranker(object):
             sorted=False,
         )
         query_gate_mask, top12_margin = self._build_query_gate_mask(global_similarity)
+        focus_candidate_mask, effective_focus_topn = self._build_focus_candidate_mask(
+            global_similarity=global_similarity,
+            topk_indices=topk_indices,
+            effective_topk=effective_topk,
+        )
         reranked_similarity = global_similarity.clone()
         raw_local_means = []
         raw_local_stds = []
@@ -256,6 +287,7 @@ class QueryAdaptiveLocalReranker(object):
             token_weights_chunk = salient_token_weights[q_start:q_end]
             topk_indices_chunk = topk_indices[q_start:q_end]
             query_gate_mask_chunk = query_gate_mask[q_start:q_end]
+            focus_candidate_mask_chunk = focus_candidate_mask[q_start:q_end]
             local_scores_chunk = torch.zeros_like(topk_scores[q_start:q_end])
 
             for c_start in range(0, effective_topk, self.candidate_chunk_size):
@@ -298,6 +330,12 @@ class QueryAdaptiveLocalReranker(object):
                 safe_local_std_mins.append(safe_local_std.min().detach().cpu())
 
             final_topk_scores = topk_scores[q_start:q_end] + self.alpha * fused_local_scores_chunk
+            if self.use_focus_topn:
+                final_topk_scores = torch.where(
+                    focus_candidate_mask_chunk,
+                    final_topk_scores,
+                    topk_scores[q_start:q_end],
+                )
             if self.use_query_gate:
                 final_topk_scores = torch.where(
                     query_gate_mask_chunk.unsqueeze(1),
@@ -339,5 +377,8 @@ class QueryAdaptiveLocalReranker(object):
                 top12_margin.detach().cpu()
             )
         stats["gated_query_ratio"] = query_gate_mask.float().mean().item()
+        stats["focused_candidate_ratio"] = focus_candidate_mask.float().mean().item()
+        stats["effective_focus_topn"] = float(effective_focus_topn)
+        stats["effective_topk"] = float(effective_topk)
 
         return reranked_similarity, stats

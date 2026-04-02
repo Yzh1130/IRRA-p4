@@ -21,6 +21,8 @@ def _apply_qalr_test_overrides(args, cli_args):
         "use_qalr_query_gate": False,
         "qalr_query_gate_type": "top12_margin",
         "qalr_query_gate_margin": 0.05,
+        "use_qalr_focus_topn": False,
+        "qalr_focus_topn": 16,
     }
     for key, value in qalr_defaults.items():
         if not hasattr(args, key):
@@ -46,6 +48,10 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.qalr_query_gate_type = cli_args.qalr_query_gate_type
     if cli_args.qalr_query_gate_margin is not None:
         args.qalr_query_gate_margin = cli_args.qalr_query_gate_margin
+    if cli_args.use_qalr_focus_topn is not None:
+        args.use_qalr_focus_topn = cli_args.use_qalr_focus_topn
+    if cli_args.qalr_focus_topn is not None:
+        args.qalr_focus_topn = cli_args.qalr_focus_topn
     return args
 
 
@@ -113,6 +119,18 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="margin threshold on global top1-top2 score gap for enabling QALR on a query",
+    )
+    parser.add_argument(
+        "--use_qalr_focus_topn",
+        default=None,
+        action="store_true",
+        help="enable focus top-n rerank inside the selected global top-K candidates",
+    )
+    parser.add_argument(
+        "--qalr_focus_topn",
+        type=int,
+        default=None,
+        help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk",
     )
     cli_args = parser.parse_args()
 

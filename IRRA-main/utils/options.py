@@ -122,6 +122,8 @@ def get_args():
     parser.add_argument("--use_qalr_query_gate", default=False, action='store_true', help="enable hard-query gating that decides whether each query uses QALR")
     parser.add_argument("--qalr_query_gate_type", type=str, default="top12_margin", help="QALR query gating type")
     parser.add_argument("--qalr_query_gate_margin", type=float, default=0.05, help="margin threshold on global top1-top2 score gap for enabling QALR on a query")
+    parser.add_argument("--use_qalr_focus_topn", default=False, action='store_true', help="enable focus top-n rerank inside the selected global top-K candidates")
+    parser.add_argument("--qalr_focus_topn", type=int, default=16, help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk")
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
