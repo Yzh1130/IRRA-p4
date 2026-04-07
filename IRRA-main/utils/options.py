@@ -96,6 +96,13 @@ def get_args():
     # 5) deterministic training: --use_mum --no_use_prob_sampling (default)
     # 6) probabilistic training: --use_mum --use_prob_sampling
 
+    ######################## image-only local filtering v1 settings ########################
+    # Lightweight patch selection/refinement over visual global features only.
+    parser.add_argument("--use_img_local_filter", default=False, action='store_true', help="enable image-only local filtering v1 on visual global features")
+    parser.add_argument("--img_local_topr", type=int, default=4, help="top-r patch count for image-only local filtering v1")
+    parser.add_argument("--img_local_gamma", type=float, default=0.1, help="fusion weight gamma for image-only local filtering v1")
+    parser.add_argument("--img_local_temp", type=float, default=0.07, help="temperature for image-only local filtering v1 softmax weighting")
+
     ######################## image-only local filtering settings ########################
     # Optional patch-token filtering over image features only.
     parser.add_argument("--use_image_local_filter", default=False, action='store_true', help="enable image-only local filtering before visual global alignment")
@@ -112,8 +119,8 @@ def get_args():
     parser.add_argument("--img_local_gamma_stage2_value", type=float, default=0.02, help="effective gamma used in stage 2 when img_local_gamma_schedule_mode=three_stage")
     parser.add_argument("--img_local_gamma_stage3_value", type=float, default=0.0, help="effective gamma used in stage 3 when img_local_gamma_schedule_mode=three_stage")
     parser.add_argument("--img_local_score_temp", type=float, default=0.07, help="temperature for image-only patch relevance scores")
-    parser.add_argument("--img_local_detach_global", default=True, action='store_true', help="detach baseline global feature when computing image-only patch relevance")
-    parser.add_argument("--no_img_local_detach_global", dest='img_local_detach_global', action='store_false', help="keep baseline global feature trainable inside image-only patch relevance")
+    parser.add_argument("--img_local_detach_global", default=True, action='store_true', help="detach global feature when computing image-only patch relevance (shared by legacy path and v1 helper)")
+    parser.add_argument("--no_img_local_detach_global", dest='img_local_detach_global', action='store_false', help="keep global feature trainable inside image-only patch relevance")
 
     ######################## inference-only query-adaptive local rerank ########################
     # Only active during evaluation; training and baseline inference stay unchanged when disabled.

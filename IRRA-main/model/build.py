@@ -16,6 +16,67 @@ from .prototype_bank import IdentityPrototypeBank
 from .uncertainty import GlobalUncertaintyModeler
 
 
+def apply_image_local_filter(
+    global_feat, patch_tokens, top_r, gamma, temp, detach_global
+):
+    """
+    Stateless image-only local filtering v1 helper.
+
+    Args:
+        global_feat: [B, C]
+        patch_tokens: [B, N, C]
+    Returns:
+        refined_global: [B, C]
+    """
+    if global_feat.dim() != 2:
+        raise ValueError(
+            f"global_feat must have shape [B, C], got {tuple(global_feat.shape)}."
+        )
+    if patch_tokens.dim() != 3:
+        raise ValueError(
+            f"patch_tokens must have shape [B, N, C], got {tuple(patch_tokens.shape)}."
+        )
+    if patch_tokens.shape[0] != global_feat.shape[0]:
+        raise ValueError(
+            "global_feat and patch_tokens must share the same batch size, got "
+            f"{global_feat.shape[0]} and {patch_tokens.shape[0]}."
+        )
+    if patch_tokens.shape[-1] != global_feat.shape[-1]:
+        raise ValueError(
+            "global_feat and patch_tokens must share the same feature dim, got "
+            f"{global_feat.shape[-1]} and {patch_tokens.shape[-1]}."
+        )
+    if temp <= 0:
+        raise ValueError(f"temp must be > 0, got {temp}.")
+
+    global_feat = global_feat.float()
+    patch_tokens = patch_tokens.float()
+    if gamma <= 0:
+        return global_feat
+    if patch_tokens.shape[1] == 0:
+        return global_feat
+
+    score_global = global_feat.detach() if detach_global else global_feat
+    relevance = F.cosine_similarity(
+        patch_tokens, score_global.unsqueeze(1), dim=-1
+    )  # [B, N]
+
+    # Clamp requested top-r to the available patch count for safe fallback.
+    top_r = max(1, min(int(top_r), patch_tokens.shape[1]))
+    top_scores, top_indices = torch.topk(
+        relevance, k=top_r, dim=1, largest=True, sorted=False
+    )  # [B, top_r]
+    gather_index = top_indices.unsqueeze(-1).expand(-1, -1, patch_tokens.shape[-1])
+    top_patches = torch.gather(patch_tokens, dim=1, index=gather_index)  # [B, top_r, C]
+
+    weights = torch.softmax(top_scores / float(temp), dim=1)  # [B, top_r]
+    local_feat = torch.sum(weights.unsqueeze(-1) * top_patches, dim=1)  # [B, C]
+    refined_global = F.normalize(
+        global_feat + float(gamma) * local_feat, p=2, dim=-1
+    )
+    return refined_global
+
+
 class IRRA(nn.Module):
     def __init__(self, args, num_classes=11003):
         super().__init__()
@@ -149,6 +210,12 @@ class IRRA(nn.Module):
         self.img_local_detach_global = bool(
             getattr(args, "img_local_detach_global", True)
         )
+        self.use_img_local_filter = bool(
+            getattr(args, "use_img_local_filter", False)
+        )
+        self.img_local_topr = int(getattr(args, "img_local_topr", 4))
+        self.img_local_gamma = float(getattr(args, "img_local_gamma", 0.1))
+        self.img_local_temp = float(getattr(args, "img_local_temp", 0.07))
         if self.img_local_topk <= 0:
             raise ValueError(
                 f"img_local_topk must be > 0, got {self.img_local_topk}."
@@ -157,6 +224,14 @@ class IRRA(nn.Module):
             raise ValueError(
                 "img_local_score_temp must be > 0, "
                 f"got {self.img_local_score_temp}."
+            )
+        if self.img_local_topr <= 0:
+            raise ValueError(
+                f"img_local_topr must be > 0, got {self.img_local_topr}."
+            )
+        if self.img_local_temp <= 0:
+            raise ValueError(
+                f"img_local_temp must be > 0, got {self.img_local_temp}."
             )
         self.img_local_unc_head = None
 
@@ -493,6 +568,49 @@ class IRRA(nn.Module):
         x = self.ln_post(x)
         return x
 
+    def _extract_patch_tokens(self, image_tokens, reference_feat=None):
+        """
+        Safely extract patch tokens from image backbone outputs.
+
+        Returns:
+            [B, N, C] when patch tokens exist
+            [B, 0, C] when the current path has no patch tokens
+            None when a safe shape cannot be inferred
+        """
+        if image_tokens is None:
+            return None
+        if image_tokens.dim() == 3:
+            return image_tokens[:, 1:, :].float()
+        if reference_feat is not None:
+            return reference_feat.new_zeros(
+                reference_feat.shape[0],
+                0,
+                reference_feat.shape[-1],
+            )
+        return None
+
+    def _maybe_apply_img_local_filter_v1(self, global_feat, patch_tokens):
+        if not self.use_img_local_filter:
+            return global_feat
+        if global_feat is None or patch_tokens is None:
+            return global_feat
+        if patch_tokens.dim() != 3:
+            return global_feat
+        if patch_tokens.shape[0] != global_feat.shape[0]:
+            return global_feat
+        if patch_tokens.shape[-1] != global_feat.shape[-1]:
+            return global_feat
+        if patch_tokens.shape[1] == 0:
+            return global_feat
+        return apply_image_local_filter(
+            global_feat=global_feat,
+            patch_tokens=patch_tokens,
+            top_r=self.img_local_topr,
+            gamma=self.img_local_gamma,
+            temp=self.img_local_temp,
+            detach_global=self.img_local_detach_global,
+        )
+
     def _apply_image_local_filter(self, image_tokens):
         """
         Build the visual global feature from CLIP image tokens.
@@ -507,6 +625,10 @@ class IRRA(nn.Module):
             local_stats: dict[str, torch.Tensor]
                 Small scalar statistics for training-time observability.
         """
+        if image_tokens.dim() == 2:
+            # Safe fallback for backbones/paths that only expose a single global feature.
+            return image_tokens.float(), None
+
         # Keep the baseline global definition unchanged: raw CLS token.
         g_global = image_tokens[:, 0, :].float()  # [B, C]
         if not self.img_local_filter_active:
@@ -667,14 +789,24 @@ class IRRA(nn.Module):
         """
         rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
         rgb_global_feat, _ = self._apply_image_local_filter(rgb_tokens)  # [B, C]
-        rgb_patch_tokens = rgb_tokens[:, 1:, :].float()  # [B, Np, C]
+        rgb_patch_tokens = self._extract_patch_tokens(
+            rgb_tokens, reference_feat=rgb_global_feat
+        )
+        rgb_global_feat = self._maybe_apply_img_local_filter_v1(
+            rgb_global_feat, rgb_patch_tokens
+        )
 
         if thermal_image is not None:
             thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
             thermal_global_feat, _ = self._apply_image_local_filter(
                 thermal_tokens
             )  # [B, C]
-            thermal_patch_tokens = thermal_tokens[:, 1:, :].float()  # [B, Np, C]
+            thermal_patch_tokens = self._extract_patch_tokens(
+                thermal_tokens, reference_feat=thermal_global_feat
+            )
+            thermal_global_feat = self._maybe_apply_img_local_filter_v1(
+                thermal_global_feat, thermal_patch_tokens
+            )
         else:
             thermal_global_feat = torch.zeros_like(rgb_global_feat)
             thermal_patch_tokens = rgb_patch_tokens.new_zeros(
@@ -766,12 +898,22 @@ class IRRA(nn.Module):
         """
         rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
         v_rgb_c, rgb_local_stats = self._apply_image_local_filter(rgb_tokens)  # [B, C]
+        rgb_patch_tokens = self._extract_patch_tokens(
+            rgb_tokens, reference_feat=v_rgb_c
+        )
+        v_rgb_c = self._maybe_apply_img_local_filter_v1(v_rgb_c, rgb_patch_tokens)
 
         if thermal_image is not None:
             thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
             v_t_c, thermal_local_stats = self._apply_image_local_filter(
                 thermal_tokens
             )  # [B, C]
+            thermal_patch_tokens = self._extract_patch_tokens(
+                thermal_tokens, reference_feat=v_t_c
+            )
+            v_t_c = self._maybe_apply_img_local_filter_v1(
+                v_t_c, thermal_patch_tokens
+            )
         else:
             # Backward compatibility for old single-image datasets.
             v_t_c = torch.zeros_like(v_rgb_c)  # [B, C]

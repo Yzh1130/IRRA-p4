@@ -243,6 +243,81 @@ def set_model_img_local_filter_active(model, active):
     return applied_active
 
 
+def log_img_local_filter_v1_train_config(logger, args):
+    if not bool(getattr(args, "use_img_local_filter", False)):
+        return
+    logger.info("[LOCAL] image-only local filter enabled")
+    logger.info("topr=%d", int(getattr(args, "img_local_topr", 4)))
+    logger.info("gamma=%.6f", float(getattr(args, "img_local_gamma", 0.1)))
+    logger.info("temp=%.6f", float(getattr(args, "img_local_temp", 0.07)))
+    logger.info(
+        "detach_global=%s",
+        bool(getattr(args, "img_local_detach_global", True)),
+    )
+    if float(getattr(args, "img_local_gamma", 0.1)) <= 0.0:
+        logger.info("[LOCAL] gamma<=0, fallback to original global feature")
+
+
+def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
+    target_model = _unwrap_runtime_model(model)
+    enabled = bool(
+        getattr(
+            target_model,
+            "use_img_local_filter",
+            getattr(getattr(target_model, "args", None), "use_img_local_filter", False),
+        )
+    )
+    if not enabled:
+        logger.info(
+            "[LOCAL][%s] image-only local filter enabled=False",
+            str(prefix).upper(),
+        )
+        return
+    gamma = float(
+        getattr(
+            target_model,
+            "img_local_gamma",
+            getattr(getattr(target_model, "args", None), "img_local_gamma", 0.1),
+        )
+    )
+    logger.info(
+        "[LOCAL][%s] image-only local filter enabled=%s, topr=%d, gamma=%.6f, temp=%.6f, detach_global=%s",
+        str(prefix).upper(),
+        enabled,
+        int(
+            getattr(
+                target_model,
+                "img_local_topr",
+                getattr(getattr(target_model, "args", None), "img_local_topr", 4),
+            )
+        ),
+        gamma,
+        float(
+            getattr(
+                target_model,
+                "img_local_temp",
+                getattr(getattr(target_model, "args", None), "img_local_temp", 0.07),
+            )
+        ),
+        bool(
+            getattr(
+                target_model,
+                "img_local_detach_global",
+                getattr(
+                    getattr(target_model, "args", None),
+                    "img_local_detach_global",
+                    True,
+                ),
+            )
+        ),
+    )
+    if enabled and gamma <= 0.0:
+        logger.info(
+            "[LOCAL][%s] gamma<=0, current runtime falls back to original global feature",
+            str(prefix).upper(),
+        )
+
+
 def log_img_local_filter_state(
     logger, args, epoch, active, effective_fuse_gamma, prefix="Epoch"
 ):
@@ -753,6 +828,7 @@ def do_train(
 
     logger = logging.getLogger("IRRA.train")
     logger.info("start training")
+    log_img_local_filter_v1_train_config(logger, args)
 
     meters = {
         "loss": AverageMeter(),
@@ -989,6 +1065,7 @@ def do_train(
                 prefix="Validation",
                 runtime=epoch_img_local_runtime,
             )
+            log_img_local_filter_v1_eval_state(logger, model, prefix="VALIDATION")
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
                 top1 = evaluator.eval(model.module.eval())
@@ -1008,5 +1085,6 @@ def do_train(
 def do_inference(model, test_img_loader, test_txt_loader):
     logger = logging.getLogger("IRRA.test")
     logger.info("Enter inferencing")
+    log_img_local_filter_v1_eval_state(logger, model, prefix="INFERENCE")
     evaluator = Evaluator(test_img_loader, test_txt_loader)
     evaluator.eval(model.eval())
