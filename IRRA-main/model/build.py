@@ -340,6 +340,65 @@ class IRRA(nn.Module):
         logvar = torch.log(safe_var + self.uncertainty_eps)
         return torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
 
+    def _build_eval_precision_weights(
+        self, rgb_logvar, thermal_logvar, thermal_available
+    ):
+        """
+        Build scalar RGB / Thermal precision weights for eval-time local reranking.
+
+        Source:
+            The weights come from the same diagonal-Gaussian log-variance heads used
+            by the model's global uncertainty branch.
+
+        Normalization:
+            precision = 1 / (var + eps), var = exp(logvar)
+            modality scalar precision = mean over feature dimension
+            weight_rgb = precision_rgb / (precision_rgb + precision_th + eps)
+            weight_th = precision_th / (precision_rgb + precision_th + eps)
+
+        When uncertainty information is unavailable, return 0.5 / 0.5 and mark the
+        weights invalid so downstream code can safely fall back to avg fusion.
+        """
+        reference = None
+        if rgb_logvar is not None:
+            reference = rgb_logvar
+        elif thermal_logvar is not None:
+            reference = thermal_logvar
+        else:
+            return None, None, None
+
+        batch_size = reference.shape[0]
+        default_half = reference.new_full((batch_size,), 0.5).float()
+        invalid_mask = torch.zeros(
+            batch_size, device=reference.device, dtype=torch.bool
+        )
+
+        if (
+            (not thermal_available)
+            or (rgb_logvar is None)
+            or (thermal_logvar is None)
+            or (not self._use_diag_gaussian_global())
+        ):
+            return default_half, default_half, invalid_mask
+
+        rgb_precision = 1.0 / (
+            self._safe_var_from_logvar(rgb_logvar) + self.uncertainty_eps
+        )
+        thermal_precision = 1.0 / (
+            self._safe_var_from_logvar(thermal_logvar) + self.uncertainty_eps
+        )
+        rgb_precision_scalar = rgb_precision.mean(dim=1)
+        thermal_precision_scalar = thermal_precision.mean(dim=1)
+        precision_sum = (
+            rgb_precision_scalar + thermal_precision_scalar
+        ).clamp_min(self.uncertainty_eps)
+        rgb_weight = (rgb_precision_scalar / precision_sum).float()
+        thermal_weight = (thermal_precision_scalar / precision_sum).float()
+        valid_mask = torch.isfinite(rgb_weight) & torch.isfinite(thermal_weight)
+        rgb_weight = torch.where(valid_mask, rgb_weight, default_half)
+        thermal_weight = torch.where(valid_mask, thermal_weight, default_half)
+        return rgb_weight, thermal_weight, valid_mask
+
     def _fuse_rgbt_global(
         self,
         rgb_mu,
@@ -565,23 +624,15 @@ class IRRA(nn.Module):
         sigma = sigma * getattr(self.args, "uncertainty_scale", 1.0)
         return feats + torch.randn_like(feats) * sigma
 
-    def encode_text_eval(self, text):
-        feats = self.encode_text_deterministic(text)
-        return self._maybe_eval_sampling(feats)
-
-    def encode_rgbt_eval(self, rgb_image, thermal_image=None):
-        feats = self.encode_rgbt_deterministic(rgb_image, thermal_image)
-        return self._maybe_eval_sampling(feats)
-
-    def encode_text_eval_with_tokens(self, text):
+    def _encode_text_eval_outputs(self, text):
         """
-        Eval-only helper for query-adaptive local reranking.
+        Shared eval-only text encoder that reuses the existing token activations.
 
         Returns:
             {
                 "global_feat": [B, C], deterministic retrieval embedding
-                "token_embeddings": [B, L_t, C], projected text token embeddings
-                "global_token_embedding": [B, C], raw EOT token embedding for saliency
+                "token_embeddings": [B, L_t, C], text token embeddings
+                "global_token_embedding": [B, C], raw EOT token embedding
             }
         """
         text_tokens = self.base_model.encode_text(text)  # [B, L_t, C]
@@ -594,15 +645,24 @@ class IRRA(nn.Module):
             "global_token_embedding": text_global_raw,
         }
 
-    def encode_rgbt_eval_with_patches(self, rgb_image, thermal_image=None):
+    def encode_text_eval(self, text, return_local_tokens=False):
+        if not return_local_tokens:
+            feats = self.encode_text_deterministic(text)
+            return self._maybe_eval_sampling(feats)
+        return self._encode_text_eval_outputs(text)
+
+    def _encode_rgbt_eval_outputs(self, rgb_image, thermal_image=None):
         """
-        Eval-only helper for query-adaptive local reranking.
+        Shared eval-only visual encoder that reuses the existing image token activations.
 
         Returns:
             {
                 "global_feat": [B, C], deterministic retrieval embedding
                 "rgb_patch_tokens": [B, Np, C]
                 "thermal_patch_tokens": [B, Np, C] or [B, 0, C] when thermal is absent
+                "rgb_precision_weight": [B], scalar modality weight for local rerank
+                "thermal_precision_weight": [B], scalar modality weight for local rerank
+                "precision_weight_valid": [B], whether precision weights are valid
             }
         """
         rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
@@ -628,6 +688,13 @@ class IRRA(nn.Module):
             thermal_global_feat,
             thermal_available=thermal_image is not None,
         )
+        rgb_precision_weight, thermal_precision_weight, precision_weight_valid = (
+            self._build_eval_precision_weights(
+                rgb_logvar=rgb_logvar,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_image is not None,
+            )
+        )
         fused_feat, _ = self._fuse_rgbt_global(
             rgb_mu=rgb_mu,
             rgb_logvar=rgb_logvar,
@@ -649,7 +716,42 @@ class IRRA(nn.Module):
             "global_feat": self._maybe_eval_sampling(global_feat),
             "rgb_patch_tokens": rgb_patch_tokens,
             "thermal_patch_tokens": thermal_patch_tokens,
+            "rgb_precision_weight": rgb_precision_weight,
+            "thermal_precision_weight": thermal_precision_weight,
+            "precision_weight_valid": precision_weight_valid,
         }
+
+    def encode_rgbt_eval(self, rgb_image, thermal_image=None, return_local_tokens=False):
+        if not return_local_tokens:
+            feats = self.encode_rgbt_deterministic(rgb_image, thermal_image)
+            return self._maybe_eval_sampling(feats)
+        return self._encode_rgbt_eval_outputs(rgb_image, thermal_image)
+
+    def encode_text_eval_with_tokens(self, text):
+        """
+        Backward-compatible eval helper for local rerank modules.
+
+        Returns:
+            {
+                "global_feat": [B, C], deterministic retrieval embedding
+                "token_embeddings": [B, L_t, C], text token embeddings
+                "global_token_embedding": [B, C], raw EOT token embedding for saliency
+            }
+        """
+        return self._encode_text_eval_outputs(text)
+
+    def encode_rgbt_eval_with_patches(self, rgb_image, thermal_image=None):
+        """
+        Backward-compatible eval helper for local rerank modules.
+
+        Returns:
+            {
+                "global_feat": [B, C], deterministic retrieval embedding
+                "rgb_patch_tokens": [B, Np, C]
+                "thermal_patch_tokens": [B, Np, C] or [B, 0, C] when thermal is absent
+            }
+        """
+        return self._encode_rgbt_eval_outputs(rgb_image, thermal_image)
 
     def encode_rgbt_global(self, rgb_image, thermal_image=None):
         """

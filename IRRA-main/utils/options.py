@@ -129,6 +129,20 @@ def get_args():
     parser.add_argument("--qalr_query_gate_margin", type=float, default=0.05, help="margin threshold on global top1-top2 score gap for enabling QALR on a query")
     parser.add_argument("--use_qalr_focus_topn", default=False, action='store_true', help="enable focus top-n rerank inside the selected global top-K candidates")
     parser.add_argument("--qalr_focus_topn", type=int, default=16, help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk")
+
+    ######################## inference-only transport rerank ########################
+    # Placeholder CLI surface only. No training/evaluation path uses it until explicitly wired in.
+    parser.add_argument("--use_transport_rerank", default=False, action='store_true', help="enable evaluation-only transport rerank placeholder")
+    parser.add_argument("--transport_topk", type=int, default=128, help="number of top-ranked gallery candidates reserved for transport rerank")
+    parser.add_argument("--transport_lambda", type=float, default=0.1, help="reserved fusion weight for transport rerank score")
+    parser.add_argument("--transport_patch_topr", type=int, default=4, help="reserved number of top patches kept per transport matching step")
+    parser.add_argument("--transport_token_topm", type=int, default=8, help="reserved number of salient text tokens kept for transport rerank")
+    parser.add_argument("--transport_eps", type=float, default=1e-6, help="reserved numeric epsilon for transport rerank stability")
+    parser.add_argument("--transport_iters", type=int, default=20, help="reserved number of transport solver iterations")
+    parser.add_argument("--transport_fuse_mode", type=str, default="avg", help="reserved transport/global score fusion mode")
+    parser.add_argument("--transport_score_norm", type=str, default="none", help="reserved transport score normalization mode")
+    parser.add_argument("--transport_use_patch_filter", default=False, action='store_true', help="enable reserved patch pre-filtering inside transport rerank")
+    parser.add_argument("--transport_use_token_filter", default=False, action='store_true', help="enable reserved token pre-filtering inside transport rerank")
     
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
