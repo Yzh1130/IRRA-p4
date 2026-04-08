@@ -104,6 +104,22 @@ def get_args():
     parser.add_argument("--moe_router_temp", type=float, default=1.0, help="router temperature of the RGBT MoE adapter")
     parser.add_argument("--lambda_router_balance", type=float, default=0.01, help="reserved router balance loss weight for the RGBT MoE adapter")
     parser.add_argument("--lambda_shared_consistency", type=float, default=0.05, help="reserved shared consistency loss weight for the RGBT MoE adapter")
+    parser.add_argument("--moe_aux_schedule_mode", type=str, default="constant", choices=["constant", "three_stage"], help="schedule mode for MoE auxiliary loss weights")
+    parser.add_argument("--moe_aux_stage1_end", type=int, default=10, help="inclusive end epoch of MoE auxiliary schedule stage 1")
+    parser.add_argument("--moe_aux_stage2_end", type=int, default=30, help="inclusive end epoch of MoE auxiliary schedule stage 2")
+    parser.add_argument("--lambda_router_balance_stage1", type=float, default=0.03, help="router balance weight used in MoE auxiliary schedule stage 1")
+    parser.add_argument("--lambda_router_balance_stage2", type=float, default=0.02, help="router balance weight used in MoE auxiliary schedule stage 2")
+    parser.add_argument("--lambda_router_balance_stage3", type=float, default=0.01, help="router balance weight used in MoE auxiliary schedule stage 3")
+    parser.add_argument("--lambda_shared_consistency_stage1", type=float, default=0.10, help="shared consistency weight used in MoE auxiliary schedule stage 1")
+    parser.add_argument("--lambda_shared_consistency_stage2", type=float, default=0.08, help="shared consistency weight used in MoE auxiliary schedule stage 2")
+    parser.add_argument("--lambda_shared_consistency_stage3", type=float, default=0.05, help="shared consistency weight used in MoE auxiliary schedule stage 3")
+    parser.add_argument("--moe_shared_consistency_mode", type=str, default="batch_mean", choices=["batch_mean", "id_pair"], help="shared consistency supervision mode for the RGBT MoE adapter")
+    parser.add_argument("--log_moe_pid_stats", default=False, action='store_true', help="log pid-aware MoE statistics when available")
+    parser.add_argument("--use_rgbt_moe_adapter_a2", default=False, action='store_true', help="enable A2-only training refinements for the visual RGBT MoE adapter")
+    parser.add_argument("--lambda_router_warmup", type=float, default=0.0, help="A2-only extra loss weight for early shared-favoring router warmup")
+    parser.add_argument("--moe_router_warmup_epochs", type=int, default=0, help="A2-only number of early epochs using shared-favoring router warmup")
+    parser.add_argument("--moe_router_shared_target_start", type=float, default=0.8, help="A2-only target shared expert probability at the first warmup epoch")
+    parser.add_argument("--moe_router_shared_target_end", type=float, default=0.5, help="A2-only target shared expert probability at the last warmup epoch")
 
     ######################## image-only local filtering v1 settings ########################
     # Lightweight patch selection/refinement over visual global features only.

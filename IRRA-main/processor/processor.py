@@ -25,6 +25,185 @@ def _safe_l2_normalize(feats, dim=1, eps=1e-12):
     return feats / norm
 
 
+def _compute_batch_mean_shared_consistency_layer_loss(rgb_feat, thermal_feat):
+    rgb_feat = _safe_l2_normalize(rgb_feat.float(), dim=1)
+    thermal_feat = _safe_l2_normalize(thermal_feat.float(), dim=1)
+    cosine_sim = F.cosine_similarity(rgb_feat, thermal_feat, dim=1)
+    return 1.0 - cosine_sim.mean()
+
+
+def _compute_id_pair_shared_consistency_layer_loss(rgb_feat, thermal_feat, pids):
+    zero = rgb_feat.new_zeros(())
+    if not torch.is_tensor(pids):
+        return zero
+
+    pids = pids.reshape(-1)
+    if pids.shape[0] != rgb_feat.shape[0] or pids.shape[0] != thermal_feat.shape[0]:
+        return zero
+
+    rgb_feat = _safe_l2_normalize(rgb_feat.float(), dim=1)
+    thermal_feat = _safe_l2_normalize(thermal_feat.float(), dim=1)
+    rgb_pids = pids.to(device=rgb_feat.device)
+    thermal_pids = pids.to(device=thermal_feat.device)
+
+    pid_terms = []
+    for pid in torch.unique(rgb_pids):
+        rgb_mask = rgb_pids == pid
+        thermal_mask = thermal_pids == pid
+        if not bool(rgb_mask.any()) or not bool(thermal_mask.any()):
+            continue
+
+        rgb_pid_feat = _safe_l2_normalize(
+            rgb_feat[rgb_mask].mean(dim=0, keepdim=True), dim=1
+        )
+        thermal_pid_feat = _safe_l2_normalize(
+            thermal_feat[thermal_mask].mean(dim=0, keepdim=True), dim=1
+        )
+        pid_terms.append(
+            1.0 - F.cosine_similarity(rgb_pid_feat, thermal_pid_feat, dim=1).squeeze(0)
+        )
+
+    if not pid_terms:
+        return zero
+    return torch.stack(pid_terms).mean()
+
+
+def _compute_shared_consistency_layer_loss(rgb_feat, thermal_feat, pids, mode):
+    mode = str(mode).lower()
+    if mode == "batch_mean":
+        return _compute_batch_mean_shared_consistency_layer_loss(
+            rgb_feat, thermal_feat
+        )
+    if mode == "id_pair":
+        return _compute_id_pair_shared_consistency_layer_loss(
+            rgb_feat, thermal_feat, pids
+        )
+    raise ValueError(f"Unsupported moe_shared_consistency_mode={mode}.")
+
+
+def _compute_shared_consistency_batch_stats(rgb_feat, thermal_feat, pids):
+    rgb_count = int(rgb_feat.shape[0]) if torch.is_tensor(rgb_feat) and rgb_feat.dim() == 2 else 0
+    thermal_count = (
+        int(thermal_feat.shape[0])
+        if torch.is_tensor(thermal_feat) and thermal_feat.dim() == 2
+        else 0
+    )
+    common_pid_count = 0
+    if (
+        torch.is_tensor(pids)
+        and rgb_count > 0
+        and thermal_count > 0
+    ):
+        pids = pids.reshape(-1)
+        if pids.shape[0] == rgb_count and pids.shape[0] == thermal_count:
+            common_pid_count = int(torch.unique(pids).numel())
+    return rgb_count, thermal_count, common_pid_count
+
+
+def _resolve_moe_router_warmup_target(args, epoch):
+    if not bool(getattr(args, "use_rgbt_moe_adapter_a2", False)):
+        return 0.5, False
+
+    warmup_epochs = int(getattr(args, "moe_router_warmup_epochs", 0))
+    if warmup_epochs <= 0 or int(epoch) > warmup_epochs:
+        return 0.5, False
+
+    target_start = float(getattr(args, "moe_router_shared_target_start", 0.8))
+    target_end = float(getattr(args, "moe_router_shared_target_end", 0.5))
+    if not 0.0 <= target_start <= 1.0:
+        raise ValueError(
+            "moe_router_shared_target_start must be in [0, 1], "
+            f"got {target_start}."
+        )
+    if not 0.0 <= target_end <= 1.0:
+        raise ValueError(
+            "moe_router_shared_target_end must be in [0, 1], "
+            f"got {target_end}."
+        )
+
+    if warmup_epochs == 1:
+        return target_start, True
+
+    progress = float(int(epoch) - 1) / float(warmup_epochs - 1)
+    target_shared = target_start + (target_end - target_start) * progress
+    return target_shared, True
+
+
+def _compute_router_warmup_term(weights, specific_index, target_shared):
+    allowed_weights = torch.stack([weights[:, 0], weights[:, specific_index]], dim=1)
+    target = allowed_weights.new_tensor([target_shared, 1.0 - target_shared]).view(1, 2)
+    return F.mse_loss(allowed_weights, target.expand_as(allowed_weights))
+
+
+def _get_moe_aux_schedule_config(args):
+    schedule_mode = str(getattr(args, "moe_aux_schedule_mode", "constant")).lower()
+    stage1_end = int(getattr(args, "moe_aux_stage1_end", 10))
+    stage2_end = int(getattr(args, "moe_aux_stage2_end", 30))
+    return schedule_mode, stage1_end, stage2_end
+
+
+def resolve_moe_aux_effective_lambdas(args, epoch):
+    schedule_mode, stage1_end, stage2_end = _get_moe_aux_schedule_config(args)
+    default_router_balance = float(getattr(args, "lambda_router_balance", 0.01))
+    default_shared_consistency = float(
+        getattr(args, "lambda_shared_consistency", 0.05)
+    )
+
+    if schedule_mode == "constant":
+        return "constant", default_router_balance, default_shared_consistency
+
+    if schedule_mode == "three_stage":
+        if stage1_end > stage2_end:
+            raise ValueError(
+                "moe_aux_stage1_end must be <= moe_aux_stage2_end, "
+                f"got {stage1_end} and {stage2_end}."
+            )
+        epoch = int(epoch)
+        if epoch <= stage1_end:
+            return (
+                "stage1",
+                float(getattr(args, "lambda_router_balance_stage1", 0.03)),
+                float(getattr(args, "lambda_shared_consistency_stage1", 0.10)),
+            )
+        if epoch <= stage2_end:
+            return (
+                "stage2",
+                float(getattr(args, "lambda_router_balance_stage2", 0.02)),
+                float(getattr(args, "lambda_shared_consistency_stage2", 0.08)),
+            )
+        return (
+            "stage3",
+            float(getattr(args, "lambda_router_balance_stage3", 0.01)),
+            float(getattr(args, "lambda_shared_consistency_stage3", 0.05)),
+        )
+
+    raise ValueError(f"Unsupported moe_aux_schedule_mode={schedule_mode}.")
+
+
+def log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch"):
+    if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
+        return
+
+    schedule_mode, stage1_end, stage2_end = _get_moe_aux_schedule_config(args)
+    stage_name, effective_lambda_router_balance, effective_lambda_shared_consistency = (
+        resolve_moe_aux_effective_lambdas(args, epoch)
+    )
+    logger.info(
+        "%s [MOE] aux schedule state: current_epoch=%d (1-based), "
+        "moe_aux_schedule_mode=%s, current_moe_aux_stage=%s, moe_aux_stage1_end=%d, "
+        "moe_aux_stage2_end=%d, effective_lambda_router_balance=%.6f, "
+        "effective_lambda_shared_consistency=%.6f",
+        prefix,
+        int(epoch),
+        schedule_mode,
+        stage_name,
+        stage1_end,
+        stage2_end,
+        effective_lambda_router_balance,
+        effective_lambda_shared_consistency,
+    )
+
+
 def _get_img_local_stage_config(args):
     use_image_local_filter = bool(getattr(args, "use_image_local_filter", False))
     stage_mode = str(getattr(args, "img_local_stage_mode", "always")).lower()
@@ -336,14 +515,21 @@ def log_rgbt_moe_adapter_config(logger, args, model):
             enabled_layers = [int(v.strip()) for v in layer_spec.split(",") if v.strip()]
 
     logger.info(
-        "[MOE] use_rgbt_moe_adapter=%s, enabled_visual_layers(0-based)=%s, moe_adapter_dim=%d, moe_adapter_dropout=%.6f, moe_router_temp=%.6f, lambda_router_balance=%.6f, lambda_shared_consistency=%.6f",
+        "[MOE] use_rgbt_moe_adapter=%s, use_rgbt_moe_adapter_a2=%s, shared_consistency_mode=%s, log_moe_pid_stats=%s, enabled_visual_layers(0-based)=%s, moe_adapter_dim=%d, moe_adapter_dropout=%.6f, moe_router_temp=%.6f, lambda_router_balance=%.6f, lambda_shared_consistency=%.6f, lambda_router_warmup=%.6f, moe_router_warmup_epochs=%d, moe_router_shared_target_start=%.6f, moe_router_shared_target_end=%.6f",
         bool(getattr(args, "use_rgbt_moe_adapter", False)),
+        bool(getattr(args, "use_rgbt_moe_adapter_a2", False)),
+        str(getattr(args, "moe_shared_consistency_mode", "batch_mean")).lower(),
+        bool(getattr(args, "log_moe_pid_stats", False)),
         enabled_layers,
         int(getattr(args, "moe_adapter_dim", 64)),
         float(getattr(args, "moe_adapter_dropout", 0.1)),
         float(getattr(args, "moe_router_temp", 1.0)),
         float(getattr(args, "lambda_router_balance", 0.01)),
         float(getattr(args, "lambda_shared_consistency", 0.05)),
+        float(getattr(args, "lambda_router_warmup", 0.0)),
+        int(getattr(args, "moe_router_warmup_epochs", 0)),
+        float(getattr(args, "moe_router_shared_target_start", 0.8)),
+        float(getattr(args, "moe_router_shared_target_end", 0.5)),
     )
 
 
@@ -495,18 +681,38 @@ def _build_total_loss(args, ret):
     return total_loss
 
 
-def _compute_rgbt_moe_adapter_terms(args, ret, batch):
+def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
     if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
         return {}
 
     zero = batch["images"].new_zeros(())
+    use_a2 = bool(getattr(args, "use_rgbt_moe_adapter_a2", False))
+    shared_consistency_mode = str(
+        getattr(args, "moe_shared_consistency_mode", "batch_mean")
+    ).lower()
+    (
+        _,
+        effective_lambda_router_balance,
+        effective_lambda_shared_consistency,
+    ) = resolve_moe_aux_effective_lambdas(args, epoch)
     out = {
         "loss_router_balance": zero,
+        "loss_router_warmup": zero,
         "loss_shared_consistency": zero,
+        "effective_lambda_router_balance": zero.new_tensor(
+            effective_lambda_router_balance
+        ),
+        "effective_lambda_shared_consistency": zero.new_tensor(
+            effective_lambda_shared_consistency
+        ),
+        "shared_cons_valid_common_pid_count": zero,
+        "shared_cons_valid_rgb_count": zero,
+        "shared_cons_valid_thermal_count": zero,
         "rgb_shared_weight_mean": zero,
         "rgb_specific_weight_mean": zero,
         "thermal_shared_weight_mean": zero,
         "thermal_specific_weight_mean": zero,
+        "router_warmup_target_shared": zero,
     }
 
     aux = ret.get("rgbt_moe_adapter_aux", None)
@@ -523,8 +729,14 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
     thermal_shared_means = []
     thermal_specific_means = []
     router_balance_terms = []
+    router_warmup_terms = []
 
     uniform_target = zero.new_tensor([0.5, 0.5])
+    router_warmup_target, router_warmup_active = _resolve_moe_router_warmup_target(
+        args, epoch
+    )
+    if router_warmup_active:
+        out["router_warmup_target_shared"] = zero.new_tensor(router_warmup_target)
 
     for layer_key, weights in rgb_router_weights.items():
         if not torch.is_tensor(weights) or weights.numel() == 0:
@@ -537,6 +749,14 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
         router_balance_terms.append(
             F.mse_loss(torch.stack([shared_mean, specific_mean]), uniform_target)
         )
+        if router_warmup_active:
+            router_warmup_terms.append(
+                _compute_router_warmup_term(
+                    weights=weights,
+                    specific_index=1,
+                    target_shared=router_warmup_target,
+                )
+            )
 
     for layer_key, weights in thermal_router_weights.items():
         if not torch.is_tensor(weights) or weights.numel() == 0:
@@ -549,6 +769,14 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
         router_balance_terms.append(
             F.mse_loss(torch.stack([shared_mean, specific_mean]), uniform_target)
         )
+        if router_warmup_active:
+            router_warmup_terms.append(
+                _compute_router_warmup_term(
+                    weights=weights,
+                    specific_index=2,
+                    target_shared=router_warmup_target,
+                )
+            )
 
     if rgb_shared_means:
         out["rgb_shared_weight_mean"] = torch.stack(rgb_shared_means).mean()
@@ -562,12 +790,14 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
         ).mean()
     if router_balance_terms:
         out["loss_router_balance"] = torch.stack(router_balance_terms).mean()
+    if router_warmup_terms:
+        out["loss_router_warmup"] = torch.stack(router_warmup_terms).mean()
 
-    # Current RGBT batch layout provides row-wise paired RGB/T samples, so we use
-    # the same row index across modalities for shared-branch consistency.
     rgb_shared_feats = shared_branch_feats.get("rgb", {})
     thermal_shared_feats = shared_branch_feats.get("thermal", {})
     shared_consistency_terms = []
+    shared_consistency_pids = batch.get("pids", None)
+    shared_consistency_stats_set = False
     for layer_key in sorted(
         set(rgb_shared_feats.keys()).intersection(thermal_shared_feats.keys()),
         key=lambda x: int(x),
@@ -582,10 +812,32 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
             continue
         if rgb_feat.shape[0] == 0:
             continue
-        rgb_feat = F.normalize(rgb_feat.float(), p=2, dim=1)
-        thermal_feat = F.normalize(thermal_feat.float(), p=2, dim=1)
-        cosine_sim = F.cosine_similarity(rgb_feat, thermal_feat, dim=1)
-        shared_consistency_terms.append(1.0 - cosine_sim.mean())
+        if not shared_consistency_stats_set:
+            (
+                valid_rgb_count,
+                valid_thermal_count,
+                valid_common_pid_count,
+            ) = _compute_shared_consistency_batch_stats(
+                rgb_feat=rgb_feat,
+                thermal_feat=thermal_feat,
+                pids=shared_consistency_pids,
+            )
+            out["shared_cons_valid_rgb_count"] = zero.new_tensor(valid_rgb_count)
+            out["shared_cons_valid_thermal_count"] = zero.new_tensor(
+                valid_thermal_count
+            )
+            out["shared_cons_valid_common_pid_count"] = zero.new_tensor(
+                valid_common_pid_count
+            )
+            shared_consistency_stats_set = True
+        shared_consistency_terms.append(
+            _compute_shared_consistency_layer_loss(
+                rgb_feat=rgb_feat,
+                thermal_feat=thermal_feat,
+                pids=shared_consistency_pids,
+                mode=shared_consistency_mode,
+            )
+        )
 
     if shared_consistency_terms:
         out["loss_shared_consistency"] = torch.stack(
@@ -595,17 +847,44 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch):
     return out
 
 
-def _add_rgbt_moe_adapter_terms_to_total_loss(args, total_loss, ret):
+def _add_rgbt_moe_adapter_terms_to_total_loss(args, total_loss, ret, epoch):
     if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
         return total_loss
+    (
+        _,
+        default_effective_lambda_router_balance,
+        default_effective_lambda_shared_consistency,
+    ) = resolve_moe_aux_effective_lambdas(args, epoch)
+    effective_lambda_router_balance = float(
+        _to_scalar(
+            ret.get(
+                "effective_lambda_router_balance",
+                default_effective_lambda_router_balance,
+            )
+        )
+    )
+    effective_lambda_shared_consistency = float(
+        _to_scalar(
+            ret.get(
+                "effective_lambda_shared_consistency",
+                default_effective_lambda_shared_consistency,
+            )
+        )
+    )
     if "loss_router_balance" in ret:
+        total_loss = (
+            total_loss
+            + effective_lambda_router_balance * ret["loss_router_balance"]
+        )
+    if "loss_router_warmup" in ret:
         total_loss = total_loss + float(
-            getattr(args, "lambda_router_balance", 0.01)
-        ) * ret["loss_router_balance"]
+            getattr(args, "lambda_router_warmup", 0.0)
+        ) * ret["loss_router_warmup"]
     if "loss_shared_consistency" in ret:
-        total_loss = total_loss + float(
-            getattr(args, "lambda_shared_consistency", 0.05)
-        ) * ret["loss_shared_consistency"]
+        total_loss = (
+            total_loss
+            + effective_lambda_shared_consistency * ret["loss_shared_consistency"]
+        )
     return total_loss
 
 
@@ -991,7 +1270,13 @@ def do_train(
         "loss_dist_sdm_text_rgb": AverageMeter(),
         "loss_dist_sdm_rgb_thermal": AverageMeter(),
         "loss_router_balance": AverageMeter(),
+        "loss_router_warmup": AverageMeter(),
         "loss_shared_consistency": AverageMeter(),
+        "effective_lambda_router_balance": AverageMeter(),
+        "effective_lambda_shared_consistency": AverageMeter(),
+        "shared_cons_valid_common_pid_count": AverageMeter(),
+        "shared_cons_valid_rgb_count": AverageMeter(),
+        "shared_cons_valid_thermal_count": AverageMeter(),
         "loss_hn": AverageMeter(),
         "hn_active": AverageMeter(),
         "hn_num_valid_queries": AverageMeter(),
@@ -1016,6 +1301,7 @@ def do_train(
         "rgb_specific_weight_mean": AverageMeter(),
         "thermal_shared_weight_mean": AverageMeter(),
         "thermal_specific_weight_mean": AverageMeter(),
+        "router_warmup_target_shared": AverageMeter(),
         "avg_img_local_uncertainty": AverageMeter(),
         "avg_img_local_keep_ratio": AverageMeter(),
         "avg_img_local_weight_entropy": AverageMeter(),
@@ -1043,6 +1329,7 @@ def do_train(
         set_model_proto_runtime_epoch(model, epoch)
         model.train()
         log_proto_calib_state(logger, args, model, epoch, prefix="Epoch")
+        log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch")
 
         for n_iter, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -1050,12 +1337,12 @@ def do_train(
             ret = model(batch)
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
-            ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch))
+            ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))
             if getattr(args, "use_hardneg_aux", False):
                 ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
             ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
             total_loss = _add_rgbt_moe_adapter_terms_to_total_loss(
-                args, original_total_loss, ret
+                args, original_total_loss, ret, epoch
             )
             total_loss = _add_proto_calibration_to_total_loss(args, total_loss, ret)
             if getattr(args, "use_hardneg_aux", False):
@@ -1104,8 +1391,32 @@ def do_train(
             meters["loss_router_balance"].update(
                 _to_scalar(ret.get("loss_router_balance", 0)), batch_size
             )
+            meters["loss_router_warmup"].update(
+                _to_scalar(ret.get("loss_router_warmup", 0)), batch_size
+            )
             meters["loss_shared_consistency"].update(
                 _to_scalar(ret.get("loss_shared_consistency", 0)), batch_size
+            )
+            if "effective_lambda_router_balance" in ret:
+                meters["effective_lambda_router_balance"].update(
+                    _to_scalar(ret["effective_lambda_router_balance"]), batch_size
+                )
+            if "effective_lambda_shared_consistency" in ret:
+                meters["effective_lambda_shared_consistency"].update(
+                    _to_scalar(ret["effective_lambda_shared_consistency"]),
+                    batch_size,
+                )
+            meters["shared_cons_valid_common_pid_count"].update(
+                _to_scalar(ret.get("shared_cons_valid_common_pid_count", 0)),
+                batch_size,
+            )
+            meters["shared_cons_valid_rgb_count"].update(
+                _to_scalar(ret.get("shared_cons_valid_rgb_count", 0)),
+                batch_size,
+            )
+            meters["shared_cons_valid_thermal_count"].update(
+                _to_scalar(ret.get("shared_cons_valid_thermal_count", 0)),
+                batch_size,
             )
             if getattr(args, "use_hardneg_aux", False):
                 meters["loss_hn"].update(_to_scalar(ret.get("loss_hn", 0)), batch_size)
@@ -1174,6 +1485,10 @@ def do_train(
                 meters["thermal_specific_weight_mean"].update(
                     _to_scalar(ret["thermal_specific_weight_mean"]), batch_size
                 )
+            if "router_warmup_target_shared" in ret:
+                meters["router_warmup_target_shared"].update(
+                    _to_scalar(ret["router_warmup_target_shared"]), batch_size
+                )
             if "avg_img_local_uncertainty" in ret:
                 meters["avg_img_local_uncertainty"].update(
                     _to_scalar(ret["avg_img_local_uncertainty"]), batch_size
@@ -1210,6 +1525,15 @@ def do_train(
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 for k, v in meters.items():
                     if v.count > 0:
+                        if (
+                            not bool(getattr(args, "log_moe_pid_stats", False))
+                            and k in {
+                                "shared_cons_valid_common_pid_count",
+                                "shared_cons_valid_rgb_count",
+                                "shared_cons_valid_thermal_count",
+                            }
+                        ):
+                            continue
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)

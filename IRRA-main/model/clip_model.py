@@ -298,6 +298,9 @@ class Transformer(nn.Module):
         self.use_rgbt_moe_adapter = bool(
             getattr(adapter_args, "use_rgbt_moe_adapter", False)
         )
+        self.use_rgbt_moe_adapter_a2 = bool(
+            getattr(adapter_args, "use_rgbt_moe_adapter_a2", False)
+        )
         self.rgbt_moe_adapter_layers = tuple()
         self.rgbt_moe_adapters = nn.ModuleDict()
         if self.use_rgbt_moe_adapter:
@@ -311,11 +314,23 @@ class Transformer(nn.Module):
                     args=adapter_args,
                 )
 
-    def _build_adapter_aux(self, layer_idx, router_weights, shared_branch_output):
+    def _build_adapter_aux(
+        self, layer_idx, router_weights, shared_branch_output, adapter_input
+    ):
         if shared_branch_output.dim() == 3:
-            shared_pooled_feature = shared_branch_output[:, 0, :].float()
+            if self.use_rgbt_moe_adapter_a2:
+                shared_pooled_feature = (
+                    adapter_input[:, 0, :].detach() + shared_branch_output[:, 0, :]
+                ).float()
+            else:
+                shared_pooled_feature = shared_branch_output[:, 0, :].float()
         else:
-            shared_pooled_feature = shared_branch_output.float()
+            if self.use_rgbt_moe_adapter_a2:
+                shared_pooled_feature = (
+                    adapter_input.detach() + shared_branch_output
+                ).float()
+            else:
+                shared_pooled_feature = shared_branch_output.float()
 
         return {
             "layer_index": int(layer_idx),
@@ -366,6 +381,7 @@ class Transformer(nn.Module):
                     layer_idx=layer_idx,
                     router_weights=router_weights,
                     shared_branch_output=shared_branch_output,
+                    adapter_input=adapter_input,
                 )
             )
 
