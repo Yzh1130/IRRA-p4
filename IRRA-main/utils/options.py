@@ -96,6 +96,15 @@ def get_args():
     # 5) deterministic training: --use_mum --no_use_prob_sampling (default)
     # 6) probabilistic training: --use_mum --use_prob_sampling
 
+    ######################## visual RGBT MoE adapter settings ########################
+    parser.add_argument("--use_rgbt_moe_adapter", default=False, action='store_true', help="enable the visual RGBT MoE adapter")
+    parser.add_argument("--moe_adapter_layers", type=str, default='6,7,8,9,10,11', help="comma-separated visual block indices used by the RGBT MoE adapter")
+    parser.add_argument("--moe_adapter_dim", type=int, default=64, help="bottleneck dim of the RGBT MoE adapter")
+    parser.add_argument("--moe_adapter_dropout", type=float, default=0.1, help="dropout used by the RGBT MoE adapter")
+    parser.add_argument("--moe_router_temp", type=float, default=1.0, help="router temperature of the RGBT MoE adapter")
+    parser.add_argument("--lambda_router_balance", type=float, default=0.01, help="reserved router balance loss weight for the RGBT MoE adapter")
+    parser.add_argument("--lambda_shared_consistency", type=float, default=0.05, help="reserved shared consistency loss weight for the RGBT MoE adapter")
+
     ######################## image-only local filtering v1 settings ########################
     # Lightweight patch selection/refinement over visual global features only.
     parser.add_argument("--use_img_local_filter", default=False, action='store_true', help="enable image-only local filtering v1 on visual global features")

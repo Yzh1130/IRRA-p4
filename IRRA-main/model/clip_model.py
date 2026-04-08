@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .rgbt_moe_adapter import RGBTMoEAdapter
+
 
 logger = logging.getLogger("IRRA.model")
 
@@ -227,6 +229,32 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
+def _parse_moe_adapter_layers(layer_spec, total_layers):
+    if layer_spec is None:
+        return tuple()
+
+    if isinstance(layer_spec, str):
+        stripped = layer_spec.strip()
+        if stripped == "":
+            return tuple()
+        parts = [p.strip() for p in stripped.split(",") if p.strip() != ""]
+        layer_indices = [int(p) for p in parts]
+    elif isinstance(layer_spec, (list, tuple)):
+        layer_indices = [int(v) for v in layer_spec]
+    else:
+        raise TypeError(
+            "moe adapter layers must be a comma-separated string or a list/tuple "
+            f"of ints, got {type(layer_spec)}."
+        )
+
+    invalid = [idx for idx in layer_indices if idx < 0 or idx >= total_layers]
+    if invalid:
+        raise ValueError(
+            f"Invalid visual block indices {invalid} for total_layers={total_layers}."
+        )
+    return tuple(layer_indices)
+
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -252,19 +280,112 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+    def __init__(
+        self,
+        width: int,
+        layers: int,
+        heads: int,
+        attn_mask: torch.Tensor = None,
+        adapter_args=None,
+    ):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.Sequential(
+            *[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)]
+        )
 
-    def forward(self, x: torch.Tensor):
-        # Pass through all residual attention blocks in order.
-        return self.resblocks(x)
+        self.use_rgbt_moe_adapter = bool(
+            getattr(adapter_args, "use_rgbt_moe_adapter", False)
+        )
+        self.rgbt_moe_adapter_layers = tuple()
+        self.rgbt_moe_adapters = nn.ModuleDict()
+        if self.use_rgbt_moe_adapter:
+            self.rgbt_moe_adapter_layers = _parse_moe_adapter_layers(
+                getattr(adapter_args, "moe_adapter_layers", ""),
+                total_layers=layers,
+            )
+            for layer_idx in self.rgbt_moe_adapter_layers:
+                self.rgbt_moe_adapters[str(layer_idx)] = RGBTMoEAdapter(
+                    embed_dim=width,
+                    args=adapter_args,
+                )
+
+    def _build_adapter_aux(self, layer_idx, router_weights, shared_branch_output):
+        if shared_branch_output.dim() == 3:
+            shared_pooled_feature = shared_branch_output[:, 0, :].float()
+        else:
+            shared_pooled_feature = shared_branch_output.float()
+
+        return {
+            "layer_index": int(layer_idx),
+            "router_weights": router_weights.float(),
+            "avg_shared_weight": router_weights[:, 0].mean().float(),
+            "avg_rgb_specific_weight": router_weights[:, 1].mean().float(),
+            "avg_thermal_specific_weight": router_weights[:, 2].mean().float(),
+            "shared_pooled_feature": shared_pooled_feature,
+        }
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality=None,
+        return_adapter_aux: bool = False,
+    ):
+        # Keep the exact original path when the adapter is disabled.
+        if not self.use_rgbt_moe_adapter:
+            if return_adapter_aux:
+                return self.resblocks(x), None
+            return self.resblocks(x)
+
+        if modality is None:
+            raise ValueError(
+                "modality must be explicitly provided when "
+                "use_rgbt_moe_adapter=True."
+            )
+
+        adapter_aux = {"layer_indices": list(self.rgbt_moe_adapter_layers), "per_layer": []}
+        for layer_idx, block in enumerate(self.resblocks):
+            x = x + block.attention(block.ln_1(x))
+            mlp_input = block.ln_2(x)
+            mlp_output = block.mlp(mlp_input)
+            x = x + mlp_output
+
+            layer_key = str(layer_idx)
+            if layer_key not in self.rgbt_moe_adapters:
+                continue
+
+            adapter_input = mlp_input.permute(1, 0, 2)  # [L, B, C] -> [B, L, C]
+            adapted_output, router_weights, shared_branch_output = (
+                self.rgbt_moe_adapters[layer_key](adapter_input, modality)
+            )
+            adapter_delta = adapted_output - adapter_input
+            x = x + adapter_delta.permute(1, 0, 2).to(x.dtype)
+            adapter_aux["per_layer"].append(
+                self._build_adapter_aux(
+                    layer_idx=layer_idx,
+                    router_weights=router_weights,
+                    shared_branch_output=shared_branch_output,
+                )
+            )
+
+        if return_adapter_aux:
+            return x, adapter_aux
+        return x
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: Tuple[int, int], patch_size: int, stride_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(
+        self,
+        input_resolution: Tuple[int, int],
+        patch_size: int,
+        stride_size: int,
+        width: int,
+        layers: int,
+        heads: int,
+        output_dim: int,
+        adapter_args=None,
+    ):
         super().__init__()
         self.input_resolution = input_resolution # (384, 128)
         # Compute patch-grid size given image size, patch size, and stride.
@@ -281,13 +402,18 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = Transformer(width, layers, heads)
+        self.transformer = Transformer(
+            width,
+            layers,
+            heads,
+            adapter_args=adapter_args,
+        )
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, modality=None, return_adapter_aux: bool = False):
         # Turn image into patch tokens.
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -298,7 +424,15 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        if return_adapter_aux:
+            x, adapter_aux = self.transformer(
+                x,
+                modality=modality,
+                return_adapter_aux=True,
+            )
+        else:
+            x = self.transformer(x, modality=modality)
+            adapter_aux = None
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         # x = self.ln_post(x[:, 0, :])
@@ -307,7 +441,9 @@ class VisionTransformer(nn.Module):
         if self.proj is not None:
             # Project into CLIP joint embedding space.
             x = x @ self.proj
-    
+
+        if return_adapter_aux:
+            return x, adapter_aux
         return x
 
 
@@ -326,15 +462,24 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 args=None,
                  ):
         super().__init__()
 
         # Maximum token length for the text encoder.
         self.context_length = context_length
+        self.use_rgbt_moe_adapter = bool(
+            getattr(args, "use_rgbt_moe_adapter", False)
+        )
 
         # Visual encoder can be either ResNet or ViT depending on checkpoint structure.
         if isinstance(vision_layers, (tuple, list)):
+            if self.use_rgbt_moe_adapter:
+                raise ValueError(
+                    "use_rgbt_moe_adapter=True currently requires a ViT visual "
+                    "backbone, but the loaded visual backbone is ResNet-style."
+                )
             vision_heads = vision_width * 32 // 64
             self.visual = ModifiedResNet(
                 layers=vision_layers,
@@ -352,7 +497,8 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                adapter_args=args,
             )
 
         self.transformer = Transformer(
@@ -416,9 +562,20 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
+    def encode_image(self, image, modality=None, return_adapter_aux: bool = False):
         # Image forward pass through visual encoder.
-        return self.visual(image.type(self.dtype))
+        image = image.type(self.dtype)
+        if isinstance(self.visual, VisionTransformer):
+            if return_adapter_aux:
+                return self.visual(
+                    image,
+                    modality=modality,
+                    return_adapter_aux=True,
+                )
+            return self.visual(image, modality=modality)
+        if return_adapter_aux:
+            return self.visual(image), None
+        return self.visual(image)
 
     def encode_text(self, text):
         # Convert token ids into embeddings, then run the text transformer.
@@ -440,7 +597,7 @@ class CLIP(nn.Module):
 
     def forward(self, image, text):
         # Return token-level image/text features for downstream task heads.
-        image_features = self.encode_image(image)
+        image_features = self.encode_image(image, modality="rgb")
         text_features = self.encode_text(text)
 
         # # normalized features
@@ -524,7 +681,14 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_CLIP_from_openai_pretrained(name: str, image_size: Union[int, Tuple[int, int]], stride_size: int, jit: bool = False, download_root: str = None):
+def build_CLIP_from_openai_pretrained(
+    name: str,
+    image_size: Union[int, Tuple[int, int]],
+    stride_size: int,
+    jit: bool = False,
+    download_root: str = None,
+    args=None,
+):
     """Load a CLIP model
 
     Parameters
@@ -611,7 +775,7 @@ def build_CLIP_from_openai_pretrained(name: str, image_size: Union[int, Tuple[in
     model_cfg['image_resolution'] = image_size
     model_cfg['stride_size'] = stride_size
     logger.info(f"Load pretrained {name} CLIP model with model config: {model_cfg}")
-    model = CLIP(**model_cfg)
+    model = CLIP(**model_cfg, args=args)
 
     # covert model to fp16
     # convert_weights(model)

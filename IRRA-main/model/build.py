@@ -86,7 +86,7 @@ class IRRA(nn.Module):
 
         # CLIP backbone (shared by RGB and Thermal).
         self.base_model, base_cfg = build_CLIP_from_openai_pretrained(
-            args.pretrain_choice, args.img_size, args.stride_size
+            args.pretrain_choice, args.img_size, args.stride_size, args=args
         )
         self.embed_dim = base_cfg["embed_dim"]
 
@@ -95,6 +95,9 @@ class IRRA(nn.Module):
 
         # Ablation switches.
         self.use_rgbt_add_fusion = getattr(args, "use_rgbt_add_fusion", True)
+        self.use_rgbt_moe_adapter = bool(
+            getattr(args, "use_rgbt_moe_adapter", False)
+        )
         self.use_mum = bool(getattr(args, "use_mum", False))
         self.use_global_uncertainty = bool(
             getattr(args, "use_global_uncertainty", False)
@@ -589,6 +592,72 @@ class IRRA(nn.Module):
             )
         return None
 
+    def _encode_visual_tokens(
+        self, image, modality, return_adapter_aux=False
+    ):
+        if return_adapter_aux and self.use_rgbt_moe_adapter:
+            return self.base_model.encode_image(
+                image,
+                modality=modality,
+                return_adapter_aux=True,
+            )
+        image_tokens = self.base_model.encode_image(image, modality=modality)
+        return image_tokens, None
+
+    def _merge_rgbt_moe_adapter_aux(self, rgb_aux=None, thermal_aux=None):
+        if rgb_aux is None and thermal_aux is None:
+            return None
+
+        merged_aux = {
+            "layer_indices": [],
+            "router_weights": {"rgb": {}, "thermal": {}},
+            "rgb_shared_avg_weights": {},
+            "rgb_specific_avg_weights": {},
+            "thermal_shared_avg_weights": {},
+            "thermal_specific_avg_weights": {},
+            "shared_branch_pooled_features": {"rgb": {}, "thermal": {}},
+        }
+
+        layer_indices = set()
+        if rgb_aux is not None:
+            layer_indices.update(rgb_aux.get("layer_indices", []))
+            for layer_aux in rgb_aux.get("per_layer", []):
+                layer_key = str(layer_aux["layer_index"])
+                layer_indices.add(int(layer_aux["layer_index"]))
+                merged_aux["router_weights"]["rgb"][layer_key] = layer_aux[
+                    "router_weights"
+                ]
+                merged_aux["rgb_shared_avg_weights"][layer_key] = layer_aux[
+                    "avg_shared_weight"
+                ]
+                merged_aux["rgb_specific_avg_weights"][layer_key] = layer_aux[
+                    "avg_rgb_specific_weight"
+                ]
+                merged_aux["shared_branch_pooled_features"]["rgb"][
+                    layer_key
+                ] = layer_aux["shared_pooled_feature"]
+
+        if thermal_aux is not None:
+            layer_indices.update(thermal_aux.get("layer_indices", []))
+            for layer_aux in thermal_aux.get("per_layer", []):
+                layer_key = str(layer_aux["layer_index"])
+                layer_indices.add(int(layer_aux["layer_index"]))
+                merged_aux["router_weights"]["thermal"][layer_key] = layer_aux[
+                    "router_weights"
+                ]
+                merged_aux["thermal_shared_avg_weights"][layer_key] = layer_aux[
+                    "avg_shared_weight"
+                ]
+                merged_aux["thermal_specific_avg_weights"][layer_key] = layer_aux[
+                    "avg_thermal_specific_weight"
+                ]
+                merged_aux["shared_branch_pooled_features"]["thermal"][
+                    layer_key
+                ] = layer_aux["shared_pooled_feature"]
+
+        merged_aux["layer_indices"] = sorted(layer_indices)
+        return merged_aux
+
     def _maybe_apply_img_local_filter_v1(self, global_feat, patch_tokens):
         if not self.use_img_local_filter:
             return global_feat
@@ -685,11 +754,18 @@ class IRRA(nn.Module):
         }
         return F.normalize(fused_global, p=2, dim=-1), local_stats  # [B, C]
 
-    def encode_image(self, image):
+    def encode_image(self, image, modality="rgb", return_adapter_aux=False):
         # image: [B, 3, H, W] -> image_tokens: [B, L_v, C]
-        image_tokens = self.base_model.encode_image(image)
+        image_tokens, adapter_aux = self._encode_visual_tokens(
+            image,
+            modality=modality,
+            return_adapter_aux=return_adapter_aux,
+        )
         # global cls token: [B, C]
-        return image_tokens[:, 0, :].float()
+        image_global = image_tokens[:, 0, :].float()
+        if return_adapter_aux:
+            return image_global, adapter_aux
+        return image_global
 
     def encode_text(self, text):
         # text: [B, L_t] -> text_tokens: [B, L_t, C]
@@ -707,7 +783,7 @@ class IRRA(nn.Module):
 
     def encode_rgbt_deterministic(self, rgb_image, thermal_image=None):
         # Deterministic fused visual feature used by retrieval evaluation.
-        rgb_global_feat, thermal_global_feat, _, _, _ = self.encode_rgbt_global(
+        rgb_global_feat, thermal_global_feat, _, _, _, _ = self.encode_rgbt_global(
             rgb_image, thermal_image
         )
         rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
@@ -787,7 +863,11 @@ class IRRA(nn.Module):
                 "precision_weight_valid": [B], whether precision weights are valid
             }
         """
-        rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
+        rgb_tokens, _ = self._encode_visual_tokens(
+            rgb_image,
+            modality="rgb",
+            return_adapter_aux=False,
+        )
         rgb_global_feat, _ = self._apply_image_local_filter(rgb_tokens)  # [B, C]
         rgb_patch_tokens = self._extract_patch_tokens(
             rgb_tokens, reference_feat=rgb_global_feat
@@ -797,7 +877,11 @@ class IRRA(nn.Module):
         )
 
         if thermal_image is not None:
-            thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
+            thermal_tokens, _ = self._encode_visual_tokens(
+                thermal_image,
+                modality="thermal",
+                return_adapter_aux=False,
+            )
             thermal_global_feat, _ = self._apply_image_local_filter(
                 thermal_tokens
             )  # [B, C]
@@ -895,8 +979,13 @@ class IRRA(nn.Module):
             v_t_c: [B, C]
             f_c: [B, C], fused by element-wise addition
             rgb_tokens: [B, L_v, C]
+            moe_adapter_aux: dict or None
         """
-        rgb_tokens = self.base_model.encode_image(rgb_image)  # [B, L_v, C]
+        rgb_tokens, rgb_moe_adapter_aux = self._encode_visual_tokens(
+            rgb_image,
+            modality="rgb",
+            return_adapter_aux=self.use_rgbt_moe_adapter,
+        )
         v_rgb_c, rgb_local_stats = self._apply_image_local_filter(rgb_tokens)  # [B, C]
         rgb_patch_tokens = self._extract_patch_tokens(
             rgb_tokens, reference_feat=v_rgb_c
@@ -904,7 +993,11 @@ class IRRA(nn.Module):
         v_rgb_c = self._maybe_apply_img_local_filter_v1(v_rgb_c, rgb_patch_tokens)
 
         if thermal_image is not None:
-            thermal_tokens = self.base_model.encode_image(thermal_image)  # [B, L_v, C]
+            thermal_tokens, thermal_moe_adapter_aux = self._encode_visual_tokens(
+                thermal_image,
+                modality="thermal",
+                return_adapter_aux=self.use_rgbt_moe_adapter,
+            )
             v_t_c, thermal_local_stats = self._apply_image_local_filter(
                 thermal_tokens
             )  # [B, C]
@@ -918,6 +1011,7 @@ class IRRA(nn.Module):
             # Backward compatibility for old single-image datasets.
             v_t_c = torch.zeros_like(v_rgb_c)  # [B, C]
             thermal_local_stats = None
+            thermal_moe_adapter_aux = None
 
         if self.use_rgbt_add_fusion:
             f_c = v_rgb_c + v_t_c  # [B, C]
@@ -934,7 +1028,11 @@ class IRRA(nn.Module):
                 local_stats[key] = torch.stack(
                     [stats[key] for stats in modality_stats], dim=0
                 ).mean()
-        return v_rgb_c, v_t_c, f_c, rgb_tokens, local_stats
+        moe_adapter_aux = self._merge_rgbt_moe_adapter_aux(
+            rgb_aux=rgb_moe_adapter_aux,
+            thermal_aux=thermal_moe_adapter_aux,
+        )
+        return v_rgb_c, v_t_c, f_c, rgb_tokens, local_stats, moe_adapter_aux
 
     def _deterministic_uncertainty_outputs(self, f_c, l_c):
         zero_sigma = torch.zeros_like(f_c)
@@ -963,7 +1061,14 @@ class IRRA(nn.Module):
         caption_ids = batch["caption_ids"]
 
         # 1) RGB/Thermal pooled global branch (before uncertainty heads).
-        v_rgb_c_raw, v_t_c_raw, _, rgb_tokens, img_local_stats = self.encode_rgbt_global(
+        (
+            v_rgb_c_raw,
+            v_t_c_raw,
+            _,
+            rgb_tokens,
+            img_local_stats,
+            rgbt_moe_adapter_aux,
+        ) = self.encode_rgbt_global(
             images, thermal_images
         )
 
@@ -1013,6 +1118,8 @@ class IRRA(nn.Module):
         ret.update(uncertainty_outputs)
         if img_local_stats is not None:
             ret.update(img_local_stats)
+        if rgbt_moe_adapter_aux is not None:
+            ret["rgbt_moe_adapter_aux"] = rgbt_moe_adapter_aux
         ret.update(
             {
                 "v_rgb_c": v_rgb_c,  # [B, C]

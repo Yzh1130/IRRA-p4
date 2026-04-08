@@ -318,6 +318,35 @@ def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
         )
 
 
+def log_rgbt_moe_adapter_config(logger, args, model):
+    if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
+        return
+
+    target_model = _unwrap_runtime_model(model)
+    enabled_layers = []
+    visual = getattr(getattr(target_model, "base_model", None), "visual", None)
+    transformer = getattr(visual, "transformer", None)
+    if transformer is not None:
+        enabled_layers = list(
+            getattr(transformer, "rgbt_moe_adapter_layers", enabled_layers)
+        )
+    if not enabled_layers:
+        layer_spec = str(getattr(args, "moe_adapter_layers", "")).strip()
+        if layer_spec:
+            enabled_layers = [int(v.strip()) for v in layer_spec.split(",") if v.strip()]
+
+    logger.info(
+        "[MOE] use_rgbt_moe_adapter=%s, enabled_visual_layers(0-based)=%s, moe_adapter_dim=%d, moe_adapter_dropout=%.6f, moe_router_temp=%.6f, lambda_router_balance=%.6f, lambda_shared_consistency=%.6f",
+        bool(getattr(args, "use_rgbt_moe_adapter", False)),
+        enabled_layers,
+        int(getattr(args, "moe_adapter_dim", 64)),
+        float(getattr(args, "moe_adapter_dropout", 0.1)),
+        float(getattr(args, "moe_router_temp", 1.0)),
+        float(getattr(args, "lambda_router_balance", 0.01)),
+        float(getattr(args, "lambda_shared_consistency", 0.05)),
+    )
+
+
 def log_img_local_filter_state(
     logger, args, epoch, active, effective_fuse_gamma, prefix="Epoch"
 ):
@@ -463,6 +492,120 @@ def _build_total_loss(args, ret):
     if getattr(args, "use_distribution_sdm_aux", False):
         if "loss_dist_sdm_total" in ret:
             total_loss = total_loss + getattr(args, "lambda_dist_sdm", 1.0) * ret["loss_dist_sdm_total"]
+    return total_loss
+
+
+def _compute_rgbt_moe_adapter_terms(args, ret, batch):
+    if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
+        return {}
+
+    zero = batch["images"].new_zeros(())
+    out = {
+        "loss_router_balance": zero,
+        "loss_shared_consistency": zero,
+        "rgb_shared_weight_mean": zero,
+        "rgb_specific_weight_mean": zero,
+        "thermal_shared_weight_mean": zero,
+        "thermal_specific_weight_mean": zero,
+    }
+
+    aux = ret.get("rgbt_moe_adapter_aux", None)
+    if not isinstance(aux, dict):
+        return out
+
+    router_weights = aux.get("router_weights", {})
+    shared_branch_feats = aux.get("shared_branch_pooled_features", {})
+    rgb_router_weights = router_weights.get("rgb", {})
+    thermal_router_weights = router_weights.get("thermal", {})
+
+    rgb_shared_means = []
+    rgb_specific_means = []
+    thermal_shared_means = []
+    thermal_specific_means = []
+    router_balance_terms = []
+
+    uniform_target = zero.new_tensor([0.5, 0.5])
+
+    for layer_key, weights in rgb_router_weights.items():
+        if not torch.is_tensor(weights) or weights.numel() == 0:
+            continue
+        weights = weights.float()
+        shared_mean = weights[:, 0].mean()
+        specific_mean = weights[:, 1].mean()
+        rgb_shared_means.append(shared_mean)
+        rgb_specific_means.append(specific_mean)
+        router_balance_terms.append(
+            F.mse_loss(torch.stack([shared_mean, specific_mean]), uniform_target)
+        )
+
+    for layer_key, weights in thermal_router_weights.items():
+        if not torch.is_tensor(weights) or weights.numel() == 0:
+            continue
+        weights = weights.float()
+        shared_mean = weights[:, 0].mean()
+        specific_mean = weights[:, 2].mean()
+        thermal_shared_means.append(shared_mean)
+        thermal_specific_means.append(specific_mean)
+        router_balance_terms.append(
+            F.mse_loss(torch.stack([shared_mean, specific_mean]), uniform_target)
+        )
+
+    if rgb_shared_means:
+        out["rgb_shared_weight_mean"] = torch.stack(rgb_shared_means).mean()
+    if rgb_specific_means:
+        out["rgb_specific_weight_mean"] = torch.stack(rgb_specific_means).mean()
+    if thermal_shared_means:
+        out["thermal_shared_weight_mean"] = torch.stack(thermal_shared_means).mean()
+    if thermal_specific_means:
+        out["thermal_specific_weight_mean"] = torch.stack(
+            thermal_specific_means
+        ).mean()
+    if router_balance_terms:
+        out["loss_router_balance"] = torch.stack(router_balance_terms).mean()
+
+    # Current RGBT batch layout provides row-wise paired RGB/T samples, so we use
+    # the same row index across modalities for shared-branch consistency.
+    rgb_shared_feats = shared_branch_feats.get("rgb", {})
+    thermal_shared_feats = shared_branch_feats.get("thermal", {})
+    shared_consistency_terms = []
+    for layer_key in sorted(
+        set(rgb_shared_feats.keys()).intersection(thermal_shared_feats.keys()),
+        key=lambda x: int(x),
+    ):
+        rgb_feat = rgb_shared_feats[layer_key]
+        thermal_feat = thermal_shared_feats[layer_key]
+        if not torch.is_tensor(rgb_feat) or not torch.is_tensor(thermal_feat):
+            continue
+        if rgb_feat.dim() != 2 or thermal_feat.dim() != 2:
+            continue
+        if rgb_feat.shape != thermal_feat.shape:
+            continue
+        if rgb_feat.shape[0] == 0:
+            continue
+        rgb_feat = F.normalize(rgb_feat.float(), p=2, dim=1)
+        thermal_feat = F.normalize(thermal_feat.float(), p=2, dim=1)
+        cosine_sim = F.cosine_similarity(rgb_feat, thermal_feat, dim=1)
+        shared_consistency_terms.append(1.0 - cosine_sim.mean())
+
+    if shared_consistency_terms:
+        out["loss_shared_consistency"] = torch.stack(
+            shared_consistency_terms
+        ).mean()
+
+    return out
+
+
+def _add_rgbt_moe_adapter_terms_to_total_loss(args, total_loss, ret):
+    if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
+        return total_loss
+    if "loss_router_balance" in ret:
+        total_loss = total_loss + float(
+            getattr(args, "lambda_router_balance", 0.01)
+        ) * ret["loss_router_balance"]
+    if "loss_shared_consistency" in ret:
+        total_loss = total_loss + float(
+            getattr(args, "lambda_shared_consistency", 0.05)
+        ) * ret["loss_shared_consistency"]
     return total_loss
 
 
@@ -829,6 +972,7 @@ def do_train(
     logger = logging.getLogger("IRRA.train")
     logger.info("start training")
     log_img_local_filter_v1_train_config(logger, args)
+    log_rgbt_moe_adapter_config(logger, args, model)
 
     meters = {
         "loss": AverageMeter(),
@@ -846,6 +990,8 @@ def do_train(
         "loss_dist_sdm_total": AverageMeter(),
         "loss_dist_sdm_text_rgb": AverageMeter(),
         "loss_dist_sdm_rgb_thermal": AverageMeter(),
+        "loss_router_balance": AverageMeter(),
+        "loss_shared_consistency": AverageMeter(),
         "loss_hn": AverageMeter(),
         "hn_active": AverageMeter(),
         "hn_num_valid_queries": AverageMeter(),
@@ -866,6 +1012,10 @@ def do_train(
         "mean_fused_logvar": AverageMeter(),
         "avg_fused_batch_uncertainty": AverageMeter(),
         "avg_text_batch_uncertainty": AverageMeter(),
+        "rgb_shared_weight_mean": AverageMeter(),
+        "rgb_specific_weight_mean": AverageMeter(),
+        "thermal_shared_weight_mean": AverageMeter(),
+        "thermal_specific_weight_mean": AverageMeter(),
         "avg_img_local_uncertainty": AverageMeter(),
         "avg_img_local_keep_ratio": AverageMeter(),
         "avg_img_local_weight_entropy": AverageMeter(),
@@ -900,12 +1050,14 @@ def do_train(
             ret = model(batch)
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
+            ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch))
             if getattr(args, "use_hardneg_aux", False):
                 ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
             ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
-            total_loss = _add_proto_calibration_to_total_loss(
+            total_loss = _add_rgbt_moe_adapter_terms_to_total_loss(
                 args, original_total_loss, ret
             )
+            total_loss = _add_proto_calibration_to_total_loss(args, total_loss, ret)
             if getattr(args, "use_hardneg_aux", False):
                 total_loss = _add_hardneg_aux_to_total_loss(
                     args, total_loss, ret, epoch
@@ -948,6 +1100,12 @@ def do_train(
             )
             meters["loss_dist_sdm_rgb_thermal"].update(
                 _to_scalar(ret.get("loss_dist_sdm_rgb_thermal", 0)), batch_size
+            )
+            meters["loss_router_balance"].update(
+                _to_scalar(ret.get("loss_router_balance", 0)), batch_size
+            )
+            meters["loss_shared_consistency"].update(
+                _to_scalar(ret.get("loss_shared_consistency", 0)), batch_size
             )
             if getattr(args, "use_hardneg_aux", False):
                 meters["loss_hn"].update(_to_scalar(ret.get("loss_hn", 0)), batch_size)
@@ -999,6 +1157,22 @@ def do_train(
             if "sigma_batch_t" in ret:
                 meters["avg_text_batch_uncertainty"].update(
                     _to_scalar(ret["sigma_batch_t"]), batch_size
+                )
+            if "rgb_shared_weight_mean" in ret:
+                meters["rgb_shared_weight_mean"].update(
+                    _to_scalar(ret["rgb_shared_weight_mean"]), batch_size
+                )
+            if "rgb_specific_weight_mean" in ret:
+                meters["rgb_specific_weight_mean"].update(
+                    _to_scalar(ret["rgb_specific_weight_mean"]), batch_size
+                )
+            if "thermal_shared_weight_mean" in ret:
+                meters["thermal_shared_weight_mean"].update(
+                    _to_scalar(ret["thermal_shared_weight_mean"]), batch_size
+                )
+            if "thermal_specific_weight_mean" in ret:
+                meters["thermal_specific_weight_mean"].update(
+                    _to_scalar(ret["thermal_specific_weight_mean"]), batch_size
                 )
             if "avg_img_local_uncertainty" in ret:
                 meters["avg_img_local_uncertainty"].update(
