@@ -54,6 +54,7 @@ class Evaluator():
         self.img_loader = img_loader # gallery
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("IRRA.eval")
+        self.last_eval_result = None
 
     def _encode_text_feature(self, model, caption, return_local_tokens=False):
         if return_local_tokens and hasattr(model, "encode_text_eval"):
@@ -467,5 +468,12 @@ class Evaluator():
         table.custom_format["mAP"] = lambda f, v: f"{v:.3f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.3f}"
         self.logger.info('\n' + str(table))
+        self.last_eval_result = {
+            "R1": float(t2i_cmc[0]),
+            "R5": float(t2i_cmc[4]),
+            "R10": float(t2i_cmc[9]),
+            "mAP": float(t2i_mAP),
+            "mINP": float(t2i_mINP),
+        }
         
         return t2i_cmc[0]

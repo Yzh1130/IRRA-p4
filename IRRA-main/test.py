@@ -149,7 +149,7 @@ if __name__ == "__main__":
     checkpoint = checkpointer.load(f=op.join(args.output_dir, "best.pth"))
     best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
     apply_img_local_filter_stage(
-        model, args, best_epoch, logger=logger, prefix="Inference"
+        model, args, best_epoch, logger=None, prefix="INFERENCE"
     )
 
     model.to(device)

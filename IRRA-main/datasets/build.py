@@ -180,7 +180,16 @@ def build_dataloader(args, tranforms=None):
             test_transforms = build_transforms(img_size=args.img_size,
                                                is_train=False)
 
-        ds = dataset.test
+        eval_split = str(getattr(args, "eval_dataset", "test")).lower()
+        if eval_split == "val":
+            ds = dataset.val
+        elif eval_split == "test":
+            ds = dataset.test
+        else:
+            raise ValueError(
+                f"Unsupported eval_dataset={eval_split!r}. Expected 'val' or 'test'."
+            )
+        logger.info("building eval dataloader on split=%s", eval_split)
         if "img_paths_t" in ds:
             test_img_set = ImageDatasetRGBT(
                 ds["image_pids"], ds["img_paths"], ds["img_paths_t"], test_transforms

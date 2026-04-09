@@ -459,7 +459,7 @@ def set_model_img_local_filter_active(model, active):
 def log_img_local_filter_v1_train_config(logger, args):
     if not bool(getattr(args, "use_img_local_filter", False)):
         return
-    logger.info("[LOCAL] image-only local filter enabled")
+    logger.info("[LOCAL_V1] legacy image-only local filter v1 enabled")
     logger.info("topr=%d", int(getattr(args, "img_local_topr", 4)))
     logger.info("gamma=%.6f", float(getattr(args, "img_local_gamma", 0.1)))
     logger.info("temp=%.6f", float(getattr(args, "img_local_temp", 0.07)))
@@ -468,7 +468,7 @@ def log_img_local_filter_v1_train_config(logger, args):
         bool(getattr(args, "img_local_detach_global", True)),
     )
     if float(getattr(args, "img_local_gamma", 0.1)) <= 0.0:
-        logger.info("[LOCAL] gamma<=0, fallback to original global feature")
+        logger.info("[LOCAL_V1] gamma<=0, fallback to original global feature")
 
 
 def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
@@ -482,7 +482,7 @@ def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
     )
     if not enabled:
         logger.info(
-            "[LOCAL][%s] image-only local filter enabled=False",
+            "[LOCAL_V1][%s] legacy image-only local filter v1 enabled=False",
             str(prefix).upper(),
         )
         return
@@ -494,7 +494,7 @@ def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
         )
     )
     logger.info(
-        "[LOCAL][%s] image-only local filter enabled=%s, topr=%d, gamma=%.6f, temp=%.6f, detach_global=%s",
+        "[LOCAL_V1][%s] legacy image-only local filter v1 enabled=%s, topr=%d, gamma=%.6f, temp=%.6f, detach_global=%s",
         str(prefix).upper(),
         enabled,
         int(
@@ -526,7 +526,7 @@ def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
     )
     if enabled and gamma <= 0.0:
         logger.info(
-            "[LOCAL][%s] gamma<=0, current runtime falls back to original global feature",
+            "[LOCAL_V1][%s] gamma<=0, current runtime falls back to original global feature",
             str(prefix).upper(),
         )
 
@@ -573,31 +573,50 @@ def log_img_local_filter_train_config(logger, args):
 
 def log_img_local_filter_eval_state(logger, model, prefix="EVAL"):
     target_model = _unwrap_runtime_model(model)
-    enabled = bool(
-        getattr(
-            target_model,
-            "img_local_filter_active",
-            False,
-        )
-    )
+    model_args = getattr(target_model, "args", None)
     configured = bool(
         getattr(
             target_model,
             "use_image_local_filter",
-            getattr(
-                getattr(target_model, "args", None),
-                "use_image_local_filter",
-                False,
-            ),
+            getattr(model_args, "use_image_local_filter", False),
         )
     )
-    if not configured:
-        return
+    enabled = bool(
+        configured and getattr(target_model, "img_local_filter_active", False)
+    )
     logger.info(
-        "[LOCAL][%s] image-only local filter enabled=%s, effective_img_local_fuse_gamma=%.6f",
+        "[LOCAL][%s] image-only local filter enabled=%s, effective_img_local_fuse_gamma=%.6f, img_local_topk=%d, img_local_topr=%d, img_local_unc_lambda=%.6f, img_local_score_temp=%.6f",
         str(prefix).upper(),
         enabled,
         float(getattr(target_model, "effective_img_local_fuse_gamma", 0.0)),
+        int(
+            getattr(
+                target_model,
+                "img_local_topk",
+                getattr(model_args, "img_local_topk", 64),
+            )
+        ),
+        int(
+            getattr(
+                target_model,
+                "img_local_topr",
+                getattr(model_args, "img_local_topr", 4),
+            )
+        ),
+        float(
+            getattr(
+                target_model,
+                "img_local_unc_lambda",
+                getattr(model_args, "img_local_unc_lambda", 0.3),
+            )
+        ),
+        float(
+            getattr(
+                target_model,
+                "img_local_score_temp",
+                getattr(model_args, "img_local_score_temp", 0.07),
+            )
+        ),
     )
 
 
@@ -1694,12 +1713,11 @@ def do_train(
                 model,
                 args,
                 epoch,
-                logger=logger,
-                prefix="Validation",
+                logger=None,
+                prefix="VALIDATION",
                 runtime=epoch_img_local_runtime,
             )
             log_img_local_filter_eval_state(logger, model, prefix="VALIDATION")
-            log_img_local_filter_v1_eval_state(logger, model, prefix="VALIDATION")
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
                 top1 = evaluator.eval(model.module.eval())
@@ -1720,6 +1738,5 @@ def do_inference(model, test_img_loader, test_txt_loader):
     logger = logging.getLogger("IRRA.test")
     logger.info("Enter inferencing")
     log_img_local_filter_eval_state(logger, model, prefix="INFERENCE")
-    log_img_local_filter_v1_eval_state(logger, model, prefix="INFERENCE")
     evaluator = Evaluator(test_img_loader, test_txt_loader)
     evaluator.eval(model.eval())
