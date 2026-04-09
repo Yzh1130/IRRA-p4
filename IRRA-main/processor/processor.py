@@ -531,6 +531,76 @@ def log_img_local_filter_v1_eval_state(logger, model, prefix="EVAL"):
         )
 
 
+def log_img_local_filter_train_config(logger, args):
+    if not bool(getattr(args, "use_image_local_filter", False)):
+        return
+    logger.info(
+        "[LOCAL] image-only local filter config: "
+        "use_image_local_filter=%s, "
+        "img_local_stage_mode=%s, "
+        "img_local_stage_start=%d, "
+        "img_local_stage_end=%d, "
+        "img_local_topk=%d, "
+        "img_local_topr=%d, "
+        "img_local_unc_lambda=%.6f, "
+        "img_local_fuse_gamma=%.6f, "
+        "img_local_gamma_schedule_mode=%s, "
+        "img_local_gamma_stage1_end=%d, "
+        "img_local_gamma_stage2_end=%d, "
+        "img_local_gamma_stage1_value=%.6f, "
+        "img_local_gamma_stage2_value=%.6f, "
+        "img_local_gamma_stage3_value=%.6f, "
+        "img_local_score_temp=%.6f, "
+        "img_local_detach_global=%s",
+        bool(getattr(args, "use_image_local_filter", False)),
+        str(getattr(args, "img_local_stage_mode", "always")).lower(),
+        int(getattr(args, "img_local_stage_start", 1)),
+        int(getattr(args, "img_local_stage_end", 9999)),
+        int(getattr(args, "img_local_topk", 64)),
+        int(getattr(args, "img_local_topr", 4)),
+        float(getattr(args, "img_local_unc_lambda", 0.3)),
+        float(getattr(args, "img_local_fuse_gamma", 0.1)),
+        str(getattr(args, "img_local_gamma_schedule_mode", "constant")).lower(),
+        int(getattr(args, "img_local_gamma_stage1_end", 6)),
+        int(getattr(args, "img_local_gamma_stage2_end", 12)),
+        float(getattr(args, "img_local_gamma_stage1_value", 0.05)),
+        float(getattr(args, "img_local_gamma_stage2_value", 0.02)),
+        float(getattr(args, "img_local_gamma_stage3_value", 0.0)),
+        float(getattr(args, "img_local_score_temp", 0.07)),
+        bool(getattr(args, "img_local_detach_global", True)),
+    )
+
+
+def log_img_local_filter_eval_state(logger, model, prefix="EVAL"):
+    target_model = _unwrap_runtime_model(model)
+    enabled = bool(
+        getattr(
+            target_model,
+            "img_local_filter_active",
+            False,
+        )
+    )
+    configured = bool(
+        getattr(
+            target_model,
+            "use_image_local_filter",
+            getattr(
+                getattr(target_model, "args", None),
+                "use_image_local_filter",
+                False,
+            ),
+        )
+    )
+    if not configured:
+        return
+    logger.info(
+        "[LOCAL][%s] image-only local filter enabled=%s, effective_img_local_fuse_gamma=%.6f",
+        str(prefix).upper(),
+        enabled,
+        float(getattr(target_model, "effective_img_local_fuse_gamma", 0.0)),
+    )
+
+
 def log_rgbt_moe_adapter_config(logger, args, model):
     if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
         return
@@ -593,6 +663,11 @@ def log_img_local_filter_state(
         "img_local_stage_start=%d, "
         "img_local_stage_end=%d, "
         "img_local_filter_active=%s, "
+        "img_local_topk=%d, "
+        "img_local_topr=%d, "
+        "img_local_unc_lambda=%.6f, "
+        "img_local_score_temp=%.6f, "
+        "img_local_detach_global=%s, "
         "img_local_gamma_schedule_mode=%s, "
         "img_local_fuse_gamma=%.6f, "
         "effective_img_local_fuse_gamma=%.6f, "
@@ -608,6 +683,11 @@ def log_img_local_filter_state(
         img_local_stage_start,
         img_local_stage_end,
         active,
+        int(getattr(args, "img_local_topk", 64)),
+        int(getattr(args, "img_local_topr", 4)),
+        float(getattr(args, "img_local_unc_lambda", 0.3)),
+        float(getattr(args, "img_local_score_temp", 0.07)),
+        bool(getattr(args, "img_local_detach_global", True)),
         img_local_gamma_schedule_mode,
         float(getattr(args, "img_local_fuse_gamma", 0.1)),
         float(effective_fuse_gamma),
@@ -1298,6 +1378,7 @@ def do_train(
     logger = logging.getLogger("IRRA.train")
     logger.info("start training")
     log_img_local_filter_v1_train_config(logger, args)
+    log_img_local_filter_train_config(logger, args)
     log_rgbt_moe_adapter_config(logger, args, model)
 
     meters = {
@@ -1617,6 +1698,7 @@ def do_train(
                 prefix="Validation",
                 runtime=epoch_img_local_runtime,
             )
+            log_img_local_filter_eval_state(logger, model, prefix="VALIDATION")
             log_img_local_filter_v1_eval_state(logger, model, prefix="VALIDATION")
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
@@ -1637,6 +1719,7 @@ def do_train(
 def do_inference(model, test_img_loader, test_txt_loader):
     logger = logging.getLogger("IRRA.test")
     logger.info("Enter inferencing")
+    log_img_local_filter_eval_state(logger, model, prefix="INFERENCE")
     log_img_local_filter_v1_eval_state(logger, model, prefix="INFERENCE")
     evaluator = Evaluator(test_img_loader, test_txt_loader)
     evaluator.eval(model.eval())

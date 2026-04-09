@@ -297,9 +297,10 @@ class IRRA(nn.Module):
                 delattr(self, "effective_img_local_fuse_gamma")
             return
 
-        self.img_local_filter_active = bool(active)
+        runtime_gamma = float(fuse_gamma)
+        self.img_local_filter_active = bool(active) and runtime_gamma > 0.0
         if self.img_local_filter_active:
-            self.effective_img_local_fuse_gamma = float(fuse_gamma)
+            self.effective_img_local_fuse_gamma = runtime_gamma
         else:
             self.effective_img_local_fuse_gamma = 0.0
 
@@ -700,7 +701,8 @@ class IRRA(nn.Module):
 
         # Keep the baseline global definition unchanged: raw CLS token.
         g_global = image_tokens[:, 0, :].float()  # [B, C]
-        if not self.img_local_filter_active:
+        runtime_gamma = float(getattr(self, "effective_img_local_fuse_gamma", 0.0))
+        if (not self.img_local_filter_active) or runtime_gamma <= 0.0:
             return g_global, None
 
         patch_tokens = image_tokens[:, 1:, :].float()  # [B, N, C], no CLS
@@ -739,7 +741,6 @@ class IRRA(nn.Module):
 
         # Weighted local aggregation over the retained patch tokens only.
         g_local = torch.sum(weights.unsqueeze(-1) * patch_tokens, dim=1)  # [B, C]
-        runtime_gamma = float(self.effective_img_local_fuse_gamma)
         fused_global = (
             (1.0 - runtime_gamma) * g_global
             + runtime_gamma * g_local
