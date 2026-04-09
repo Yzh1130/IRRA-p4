@@ -79,6 +79,7 @@ if __name__ == "__main__":
         distributed_rank=get_rank(),
     )
     logger.info("Using {} GPUs".format(num_gpus))
+    logger.info("[WARMSTART] load_ckpt_file={}".format(args.load_ckpt_file))
     logger.info(str(args).replace(",", "\n"))
     if args.training:
         save_train_configs(args.output_dir, args)
@@ -115,9 +116,17 @@ if __name__ == "__main__":
     if args.resume:
         if args.training:
             checkpoint = checkpointer.resume(args.resume_ckpt_file)
-            start_epoch = checkpoint["epoch"]
+            start_epoch = checkpoint.get("epoch", 0)
         else:
             checkpointer.load(args.resume_ckpt_file)
+    elif args.load_ckpt_file:
+        checkpointer.load(args.load_ckpt_file)
+        start_epoch = 0
+        logger.info(
+            "Warm-start loaded model weights only from {}".format(
+                args.load_ckpt_file
+            )
+        )
 
     if args.training:
         do_train(

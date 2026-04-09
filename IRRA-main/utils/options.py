@@ -14,6 +14,7 @@ def get_args():
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--load_ckpt_file", type=str, default="", help="load model weights only from ...")
 
     ######################## model general settings ########################
     # pretrain_choice chooses which CLIP checkpoint to initialize.
