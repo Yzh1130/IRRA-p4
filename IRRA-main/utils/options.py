@@ -114,6 +114,7 @@ def get_args():
     parser.add_argument("--lambda_shared_consistency_stage2", type=float, default=0.08, help="shared consistency weight used in MoE auxiliary schedule stage 2")
     parser.add_argument("--lambda_shared_consistency_stage3", type=float, default=0.05, help="shared consistency weight used in MoE auxiliary schedule stage 3")
     parser.add_argument("--moe_shared_consistency_mode", type=str, default="batch_mean", choices=["batch_mean", "id_pair"], help="shared consistency supervision mode for the RGBT MoE adapter")
+    parser.add_argument("--moe_shared_consistency_layers", type=str, default='all', help="shared consistency layer selection: 'all' keeps the current A2.1 behavior, or provide a comma-separated layer list such as '10,11'")
     parser.add_argument("--log_moe_pid_stats", default=False, action='store_true', help="log pid-aware MoE statistics when available")
     parser.add_argument("--use_rgbt_moe_adapter_a2", default=False, action='store_true', help="enable A2-only training refinements for the visual RGBT MoE adapter")
     parser.add_argument("--lambda_router_warmup", type=float, default=0.0, help="A2-only extra loss weight for early shared-favoring router warmup")

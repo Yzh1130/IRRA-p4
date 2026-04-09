@@ -100,6 +100,40 @@ def _compute_shared_consistency_batch_stats(rgb_feat, thermal_feat, pids):
     return rgb_count, thermal_count, common_pid_count
 
 
+def _resolve_shared_consistency_layer_keys(args, rgb_shared_feats, thermal_shared_feats):
+    layer_keys = sorted(
+        set(rgb_shared_feats.keys()).intersection(thermal_shared_feats.keys()),
+        key=lambda x: int(x),
+    )
+    layer_spec = str(getattr(args, "moe_shared_consistency_layers", "all")).strip()
+    if not layer_spec or layer_spec.lower() == "all":
+        return layer_keys
+
+    requested_layer_keys = []
+    requested_seen = set()
+    for token in layer_spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            layer_key = str(int(token))
+        except ValueError as exc:
+            raise ValueError(
+                "moe_shared_consistency_layers must be 'all' or a comma-separated "
+                f"list of integers, got {layer_spec!r}."
+            ) from exc
+        if layer_key in requested_seen:
+            continue
+        requested_seen.add(layer_key)
+        requested_layer_keys.append(layer_key)
+
+    if not requested_layer_keys:
+        return layer_keys
+
+    available_layer_keys = set(layer_keys)
+    return [layer_key for layer_key in requested_layer_keys if layer_key in available_layer_keys]
+
+
 def _resolve_moe_router_warmup_target(args, epoch):
     if not bool(getattr(args, "use_rgbt_moe_adapter_a2", False)):
         return 0.5, False
@@ -515,10 +549,11 @@ def log_rgbt_moe_adapter_config(logger, args, model):
             enabled_layers = [int(v.strip()) for v in layer_spec.split(",") if v.strip()]
 
     logger.info(
-        "[MOE] use_rgbt_moe_adapter=%s, use_rgbt_moe_adapter_a2=%s, shared_consistency_mode=%s, log_moe_pid_stats=%s, enabled_visual_layers(0-based)=%s, moe_adapter_dim=%d, moe_adapter_dropout=%.6f, moe_router_temp=%.6f, lambda_router_balance=%.6f, lambda_shared_consistency=%.6f, lambda_router_warmup=%.6f, moe_router_warmup_epochs=%d, moe_router_shared_target_start=%.6f, moe_router_shared_target_end=%.6f",
+        "[MOE] use_rgbt_moe_adapter=%s, use_rgbt_moe_adapter_a2=%s, shared_consistency_mode=%s, moe_shared_consistency_layers=%s, log_moe_pid_stats=%s, enabled_visual_layers(0-based)=%s, moe_adapter_dim=%d, moe_adapter_dropout=%.6f, moe_router_temp=%.6f, lambda_router_balance=%.6f, lambda_shared_consistency=%.6f, lambda_router_warmup=%.6f, moe_router_warmup_epochs=%d, moe_router_shared_target_start=%.6f, moe_router_shared_target_end=%.6f",
         bool(getattr(args, "use_rgbt_moe_adapter", False)),
         bool(getattr(args, "use_rgbt_moe_adapter_a2", False)),
         str(getattr(args, "moe_shared_consistency_mode", "batch_mean")).lower(),
+        str(getattr(args, "moe_shared_consistency_layers", "all")).strip(),
         bool(getattr(args, "log_moe_pid_stats", False)),
         enabled_layers,
         int(getattr(args, "moe_adapter_dim", 64)),
@@ -705,6 +740,7 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
         "effective_lambda_shared_consistency": zero.new_tensor(
             effective_lambda_shared_consistency
         ),
+        "shared_consistency_active_layer_count": zero,
         "shared_cons_valid_common_pid_count": zero,
         "shared_cons_valid_rgb_count": zero,
         "shared_cons_valid_thermal_count": zero,
@@ -713,6 +749,7 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
         "thermal_shared_weight_mean": zero,
         "thermal_specific_weight_mean": zero,
         "router_warmup_target_shared": zero,
+        "shared_consistency_active_layers": "none",
     }
 
     aux = ret.get("rgbt_moe_adapter_aux", None)
@@ -796,11 +833,13 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
     rgb_shared_feats = shared_branch_feats.get("rgb", {})
     thermal_shared_feats = shared_branch_feats.get("thermal", {})
     shared_consistency_terms = []
+    shared_consistency_active_layers = []
     shared_consistency_pids = batch.get("pids", None)
     shared_consistency_stats_set = False
-    for layer_key in sorted(
-        set(rgb_shared_feats.keys()).intersection(thermal_shared_feats.keys()),
-        key=lambda x: int(x),
+    for layer_key in _resolve_shared_consistency_layer_keys(
+        args,
+        rgb_shared_feats=rgb_shared_feats,
+        thermal_shared_feats=thermal_shared_feats,
     ):
         rgb_feat = rgb_shared_feats[layer_key]
         thermal_feat = thermal_shared_feats[layer_key]
@@ -830,6 +869,7 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
                 valid_common_pid_count
             )
             shared_consistency_stats_set = True
+        shared_consistency_active_layers.append(layer_key)
         shared_consistency_terms.append(
             _compute_shared_consistency_layer_loss(
                 rgb_feat=rgb_feat,
@@ -843,6 +883,13 @@ def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
         out["loss_shared_consistency"] = torch.stack(
             shared_consistency_terms
         ).mean()
+    out["shared_consistency_active_layer_count"] = zero.new_tensor(
+        len(shared_consistency_active_layers)
+    )
+    if shared_consistency_active_layers:
+        out["shared_consistency_active_layers"] = ",".join(
+            shared_consistency_active_layers
+        )
 
     return out
 
@@ -1274,6 +1321,7 @@ def do_train(
         "loss_shared_consistency": AverageMeter(),
         "effective_lambda_router_balance": AverageMeter(),
         "effective_lambda_shared_consistency": AverageMeter(),
+        "shared_consistency_active_layer_count": AverageMeter(),
         "shared_cons_valid_common_pid_count": AverageMeter(),
         "shared_cons_valid_rgb_count": AverageMeter(),
         "shared_cons_valid_thermal_count": AverageMeter(),
@@ -1406,6 +1454,10 @@ def do_train(
                     _to_scalar(ret["effective_lambda_shared_consistency"]),
                     batch_size,
                 )
+            meters["shared_consistency_active_layer_count"].update(
+                _to_scalar(ret.get("shared_consistency_active_layer_count", 0)),
+                batch_size,
+            )
             meters["shared_cons_valid_common_pid_count"].update(
                 _to_scalar(ret.get("shared_cons_valid_common_pid_count", 0)),
                 batch_size,
@@ -1535,6 +1587,8 @@ def do_train(
                         ):
                             continue
                         info_str += f", {k}: {v.avg:.4f}"
+                active_layers = ret.get("shared_consistency_active_layers", "none")
+                info_str += f", shared_consistency_active_layers: {active_layers}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
 
