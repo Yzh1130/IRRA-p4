@@ -198,13 +198,13 @@ def get_args():
     parser.add_argument("--lambda_rgb_txt_stage2", type=float, default=0.08, help="stage2 weight for rgb-text auxiliary loss")
     parser.add_argument("--lambda_rgb_txt_stage3", type=float, default=0.15, help="stage3 weight for rgb-text auxiliary loss")
     parser.add_argument("--lambda_th_txt_stage1", type=float, default=0.0, help="stage1 weight for thermal-text auxiliary loss")
-    parser.add_argument("--lambda_th_txt_stage2", type=float, default=0.08, help="stage2 weight for thermal-text auxiliary loss")
-    parser.add_argument("--lambda_th_txt_stage3", type=float, default=0.15, help="stage3 weight for thermal-text auxiliary loss")
+    parser.add_argument("--lambda_th_txt_stage2", type=float, default=0.04, help="stage2 weight for thermal-text auxiliary loss")
+    parser.add_argument("--lambda_th_txt_stage3", type=float, default=0.08, help="stage3 weight for thermal-text auxiliary loss")
     parser.add_argument("--lambda_txt_cons_stage1", type=float, default=0.0, help="stage1 weight for text-consistency auxiliary loss")
-    parser.add_argument("--lambda_txt_cons_stage2", type=float, default=0.01, help="stage2 weight for text-consistency auxiliary loss")
-    parser.add_argument("--lambda_txt_cons_stage3", type=float, default=0.02, help="stage3 weight for text-consistency auxiliary loss")
-    parser.add_argument("--mtp_eval_fusion_alpha", type=float, default=0.15, help="eval-time fusion alpha for modality-text prompting")
-    parser.add_argument("--mtp_eval_fusion_beta", type=float, default=0.10, help="eval-time fusion beta for modality-text prompting")
+    parser.add_argument("--lambda_txt_cons_stage2", type=float, default=0.005, help="stage2 weight for text-consistency auxiliary loss")
+    parser.add_argument("--lambda_txt_cons_stage3", type=float, default=0.01, help="stage3 weight for text-consistency auxiliary loss")
+    parser.add_argument("--mtp_eval_fusion_alpha", type=float, default=0.12, help="eval-time fusion alpha for modality-text prompting")
+    parser.add_argument("--mtp_eval_fusion_beta", type=float, default=0.03, help="eval-time fusion beta for modality-text prompting")
 
     ######################## solver ########################
     # Optimizer hyperparameters.

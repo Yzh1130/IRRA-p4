@@ -1086,9 +1086,11 @@ class IRRA(nn.Module):
         images = batch["images"]
         thermal_images = batch.get("thermal_images", None)
         caption_ids = batch["caption_ids"]
+        caption_ids_full_clean = None
         caption_ids_rgb = None
         caption_ids_th = None
         if self.use_modality_text_prompt:
+            caption_ids_full_clean = batch.get("caption_ids_full_clean", caption_ids)
             caption_ids_rgb = batch.get("caption_ids_rgb", caption_ids)
             caption_ids_th = batch.get("caption_ids_th", caption_ids)
 
@@ -1108,9 +1110,13 @@ class IRRA(nn.Module):
         _, l_c_raw, text_mu, text_logvar = self._encode_caption_ids_with_uncertainty(
             caption_ids
         )
+        text_feat_full = l_c
         text_feat_rgb = None
         text_feat_th = None
         if self.use_modality_text_prompt:
+            _, _, text_feat_full, _ = self._encode_caption_ids_with_uncertainty(
+                caption_ids_full_clean
+            )
             _, _, text_feat_rgb, _ = self._encode_caption_ids_with_uncertainty(
                 caption_ids_rgb
             )
@@ -1176,7 +1182,7 @@ class IRRA(nn.Module):
         if self.use_modality_text_prompt:
             ret.update(
                 {
-                    "text_feat_full": l_c,
+                    "text_feat_full": text_feat_full,
                     "text_feat_rgb": text_feat_rgb,
                     "text_feat_th": text_feat_th,
                 }

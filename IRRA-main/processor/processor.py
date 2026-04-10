@@ -273,8 +273,8 @@ def resolve_mtp_effective_lambdas(args, epoch):
         return (
             "constant",
             float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_th_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_txt_cons_stage3", 0.02)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.08)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.01)),
         )
 
     if schedule_mode == "three_stage":
@@ -295,14 +295,14 @@ def resolve_mtp_effective_lambdas(args, epoch):
             return (
                 "stage2",
                 float(getattr(args, "lambda_rgb_txt_stage2", 0.08)),
-                float(getattr(args, "lambda_th_txt_stage2", 0.08)),
-                float(getattr(args, "lambda_txt_cons_stage2", 0.01)),
+                float(getattr(args, "lambda_th_txt_stage2", 0.04)),
+                float(getattr(args, "lambda_txt_cons_stage2", 0.005)),
             )
         return (
             "stage3",
             float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_th_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_txt_cons_stage3", 0.02)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.08)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.01)),
         )
 
     raise ValueError(f"Unsupported mtp_stage_mode={schedule_mode}.")
@@ -1672,29 +1672,30 @@ def do_train(
         for n_iter, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             if use_modality_text_prompt and (not mtp_text_example_logged):
-                full_example = _decode_caption_token_ids_for_log(
-                    batch["caption_ids"][0], mtp_text_tokenizer
+                full_clean_example = _decode_caption_token_ids_for_log(
+                    batch.get("caption_ids_full_clean", batch["caption_ids"])[0],
+                    mtp_text_tokenizer,
                 )
                 if "caption_ids_rgb" in batch:
                     rgb_example = _decode_caption_token_ids_for_log(
                         batch["caption_ids_rgb"][0], mtp_text_tokenizer
                     )
                 else:
-                    rgb_example = build_rgb_text(full_example)
+                    rgb_example = build_rgb_text(full_clean_example)
                 if "caption_ids_th" in batch:
                     th_example = _decode_caption_token_ids_for_log(
                         batch["caption_ids_th"][0], mtp_text_tokenizer
                     )
                 else:
                     th_example = build_thermal_text(
-                        full_example,
+                        full_clean_example,
                         color_drop_mode=str(
                             getattr(args, "mtp_color_drop_mode", "delete")
                         ),
                     )
                 logger.info(
-                    "[MTP][TEXT_EXAMPLE] full=%s",
-                    _truncate_log_text(full_example),
+                    "[MTP][TEXT_EXAMPLE] full_clean=%s",
+                    _truncate_log_text(full_clean_example),
                 )
                 logger.info(
                     "[MTP][TEXT_EXAMPLE] rgb=%s",
@@ -1974,11 +1975,11 @@ def do_train(
             )
             logger.info(
                 "[MTP][VALIDATION] alpha=%.6f",
-                float(getattr(args, "mtp_eval_fusion_alpha", 0.15)),
+                float(getattr(args, "mtp_eval_fusion_alpha", 0.12)),
             )
             logger.info(
                 "[MTP][VALIDATION] beta=%.6f",
-                float(getattr(args, "mtp_eval_fusion_beta", 0.10)),
+                float(getattr(args, "mtp_eval_fusion_beta", 0.03)),
             )
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
@@ -1999,6 +2000,19 @@ def do_train(
 def do_inference(model, test_img_loader, test_txt_loader):
     logger = logging.getLogger("IRRA.test")
     logger.info("Enter inferencing")
+    model_args = getattr(model, "args", None)
+    logger.info(
+        "[MTP][VALIDATION] enabled=%s",
+        bool(getattr(model_args, "use_modality_text_prompt", False)),
+    )
+    logger.info(
+        "[MTP][VALIDATION] alpha=%.6f",
+        float(getattr(model_args, "mtp_eval_fusion_alpha", 0.12)),
+    )
+    logger.info(
+        "[MTP][VALIDATION] beta=%.6f",
+        float(getattr(model_args, "mtp_eval_fusion_beta", 0.03)),
+    )
     log_img_local_filter_eval_state(logger, model, prefix="INFERENCE")
     evaluator = Evaluator(test_img_loader, test_txt_loader)
     evaluator.eval(model.eval())

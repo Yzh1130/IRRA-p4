@@ -107,12 +107,13 @@ class ImageTextDataset(Dataset):
             thermal_text = build_thermal_text(
                 caption, color_drop_mode=self.mtp_color_drop_mode
             )
-            tokens = tokenize(
+            tokens_full_clean = tokenize(
                 full_text,
                 tokenizer=self.tokenizer,
                 text_length=self.text_length,
                 truncate=self.truncate,
             )
+            tokens = tokens_full_clean
             tokens_rgb = tokenize(
                 rgb_text,
                 tokenizer=self.tokenizer,
@@ -140,6 +141,7 @@ class ImageTextDataset(Dataset):
             'caption_ids': tokens,
         }
         if self.use_modality_text_prompt:
+            ret['caption_ids_full_clean'] = tokens_full_clean
             ret['caption_ids_rgb'] = tokens_rgb
             ret['caption_ids_th'] = tokens_th
         if t_img_path is not None:
@@ -261,12 +263,13 @@ class ImageTextMLMDataset(Dataset):
             thermal_text = build_thermal_text(
                 caption, color_drop_mode=self.mtp_color_drop_mode
             )
-            caption_tokens = tokenize(
+            caption_tokens_full_clean = tokenize(
                 full_text,
                 tokenizer=self.tokenizer,
                 text_length=self.text_length,
                 truncate=self.truncate,
             )
+            caption_tokens = caption_tokens_full_clean.clone()
             caption_tokens_rgb = tokenize(
                 rgb_text,
                 tokenizer=self.tokenizer,
@@ -299,6 +302,7 @@ class ImageTextMLMDataset(Dataset):
             'mlm_labels': mlm_labels
         }
         if self.use_modality_text_prompt:
+            ret['caption_ids_full_clean'] = caption_tokens_full_clean
             ret['caption_ids_rgb'] = caption_tokens_rgb
             ret['caption_ids_th'] = caption_tokens_th
         if t_img_path is not None:
