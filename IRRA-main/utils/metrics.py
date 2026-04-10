@@ -7,6 +7,8 @@ import logging
 
 from utils.query_adaptive_rerank import QueryAdaptiveLocalReranker
 from utils.transport_rerank import build_transport_reranker
+from utils.mtp_text import build_rgb_text, build_thermal_text
+from utils.simple_tokenizer import SimpleTokenizer
 
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
@@ -55,6 +57,68 @@ class Evaluator():
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("IRRA.eval")
         self.last_eval_result = None
+        self._mtp_tokenizer = None
+
+    def _get_mtp_tokenizer(self):
+        if self._mtp_tokenizer is None:
+            self._mtp_tokenizer = SimpleTokenizer()
+        return self._mtp_tokenizer
+
+    def _decode_caption_batch(self, caption_ids):
+        tokenizer = self._get_mtp_tokenizer()
+        sot_token = int(tokenizer.encoder["<|startoftext|>"])
+        eot_token = int(tokenizer.encoder["<|endoftext|>"])
+        caption_ids_cpu = caption_ids.detach().cpu()
+        captions = []
+        for row in caption_ids_cpu:
+            token_ids = []
+            for token_id in row.tolist():
+                token_id = int(token_id)
+                if token_id == 0 or token_id == sot_token:
+                    continue
+                if token_id == eot_token:
+                    break
+                token_ids.append(token_id)
+            if token_ids:
+                captions.append(" ".join(tokenizer.decode(token_ids).split()))
+            else:
+                captions.append("")
+        return captions
+
+    def _tokenize_text_batch(self, texts, text_length, device):
+        tokenizer = self._get_mtp_tokenizer()
+        sot_token = int(tokenizer.encoder["<|startoftext|>"])
+        eot_token = int(tokenizer.encoder["<|endoftext|>"])
+        output = torch.zeros(len(texts), int(text_length), dtype=torch.long)
+        for row_index, text in enumerate(texts):
+            token_ids = [sot_token] + tokenizer.encode(text) + [eot_token]
+            if len(token_ids) > int(text_length):
+                token_ids = token_ids[: int(text_length)]
+                token_ids[-1] = eot_token
+            output[row_index, : len(token_ids)] = torch.tensor(
+                token_ids, dtype=torch.long
+            )
+        return output.to(device)
+
+    def _build_mtp_query_token_views(self, caption_ids, model):
+        captions = self._decode_caption_batch(caption_ids)
+        color_drop_mode = str(
+            getattr(getattr(model, "args", None), "mtp_color_drop_mode", "delete")
+        )
+        rgb_texts = [build_rgb_text(caption) for caption in captions]
+        th_texts = [
+            build_thermal_text(caption, color_drop_mode=color_drop_mode)
+            for caption in captions
+        ]
+        text_length = int(caption_ids.shape[1])
+        device = caption_ids.device
+        caption_ids_rgb = self._tokenize_text_batch(
+            rgb_texts, text_length=text_length, device=device
+        )
+        caption_ids_th = self._tokenize_text_batch(
+            th_texts, text_length=text_length, device=device
+        )
+        return caption_ids_rgb, caption_ids_th
 
     def _encode_text_feature(self, model, caption, return_local_tokens=False):
         if return_local_tokens and hasattr(model, "encode_text_eval"):
@@ -124,17 +188,22 @@ class Evaluator():
         t_feat = model.encode_image(thermal_img)
         return rgb_feat + t_feat
 
-    def _compute_embedding(self, model, return_local_tokens=False):
+    def _compute_embedding(
+        self, model, return_local_tokens=False, use_mtp_eval_fusion=False
+    ):
         # Encode all queries and gallery samples once, then evaluate by matrix ops.
         model = model.eval()
         device = next(model.parameters()).device
 
         qids, gids, qfeats, gfeats = [], [], [], []
+        qfeats_rgb, qfeats_th = [], []
+        gfeats_rgb, gfeats_th = [], []
         query_token_embeddings, query_token_ids, query_global_embeddings = [], [], []
         gallery_rgb_patch_tokens, gallery_thermal_patch_tokens = [], []
         gallery_rgb_precision_weights = []
         gallery_thermal_precision_weights = []
         gallery_precision_weight_valid = []
+        need_rich_gallery_outputs = bool(return_local_tokens or use_mtp_eval_fusion)
         # Encode text queries.
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
@@ -154,8 +223,32 @@ class Evaluator():
                 )
             else:
                 qfeats.append(text_outputs)
+            if use_mtp_eval_fusion:
+                caption_rgb, caption_th = self._build_mtp_query_token_views(
+                    caption, model
+                )
+                with torch.no_grad():
+                    text_outputs_rgb = self._encode_text_feature(
+                        model,
+                        caption_rgb,
+                        return_local_tokens=False,
+                    )
+                    text_outputs_th = self._encode_text_feature(
+                        model,
+                        caption_th,
+                        return_local_tokens=False,
+                    )
+                if isinstance(text_outputs_rgb, dict):
+                    text_outputs_rgb = text_outputs_rgb["global_feat"]
+                if isinstance(text_outputs_th, dict):
+                    text_outputs_th = text_outputs_th["global_feat"]
+                qfeats_rgb.append(text_outputs_rgb)
+                qfeats_th.append(text_outputs_th)
         qids = torch.cat(qids, 0)
         qfeats = torch.cat(qfeats, 0)
+        if use_mtp_eval_fusion:
+            qfeats_rgb = torch.cat(qfeats_rgb, 0)
+            qfeats_th = torch.cat(qfeats_th, 0)
         if return_local_tokens:
             query_token_embeddings = torch.cat(query_token_embeddings, 0)
             query_token_ids = torch.cat(query_token_ids, 0)
@@ -179,52 +272,68 @@ class Evaluator():
                     model,
                     img,
                     thermal_img,
-                    return_local_tokens=return_local_tokens,
+                    return_local_tokens=need_rich_gallery_outputs,
                 )
             gids.append(pid.view(-1)) # flatten 
-            if return_local_tokens:
+            if need_rich_gallery_outputs:
+                if not isinstance(image_outputs, dict):
+                    image_outputs = {"global_feat": image_outputs}
                 gfeats.append(image_outputs["global_feat"])
-                gallery_rgb_patch_tokens.append(
-                    image_outputs["rgb_patch_tokens"]
-                )
-                gallery_thermal_patch_tokens.append(
-                    image_outputs["thermal_patch_tokens"]
-                )
-                batch_size = image_outputs["global_feat"].shape[0]
-                rgb_precision_weight = image_outputs.get("rgb_precision_weight", None)
-                thermal_precision_weight = image_outputs.get(
-                    "thermal_precision_weight", None
-                )
-                precision_weight_valid = image_outputs.get(
-                    "precision_weight_valid", None
-                )
-                if rgb_precision_weight is None:
-                    rgb_precision_weight = image_outputs["global_feat"].new_full(
-                        (batch_size,), 0.5
+                if use_mtp_eval_fusion:
+                    gfeats_rgb.append(
+                        image_outputs.get("rgb_global_feat", image_outputs["global_feat"])
                     )
-                if thermal_precision_weight is None:
-                    thermal_precision_weight = image_outputs["global_feat"].new_full(
-                        (batch_size,), 0.5
+                    gfeats_th.append(
+                        image_outputs.get(
+                            "thermal_global_feat",
+                            torch.zeros_like(image_outputs["global_feat"]),
+                        )
                     )
-                if precision_weight_valid is None:
-                    precision_weight_valid = torch.zeros(
-                        batch_size,
-                        device=image_outputs["global_feat"].device,
-                        dtype=torch.bool,
+                if return_local_tokens:
+                    gallery_rgb_patch_tokens.append(
+                        image_outputs["rgb_patch_tokens"]
                     )
-                gallery_rgb_precision_weights.append(
-                    rgb_precision_weight.float()
-                )
-                gallery_thermal_precision_weights.append(
-                    thermal_precision_weight.float()
-                )
-                gallery_precision_weight_valid.append(
-                    precision_weight_valid.bool()
-                )
+                    gallery_thermal_patch_tokens.append(
+                        image_outputs["thermal_patch_tokens"]
+                    )
+                    batch_size = image_outputs["global_feat"].shape[0]
+                    rgb_precision_weight = image_outputs.get("rgb_precision_weight", None)
+                    thermal_precision_weight = image_outputs.get(
+                        "thermal_precision_weight", None
+                    )
+                    precision_weight_valid = image_outputs.get(
+                        "precision_weight_valid", None
+                    )
+                    if rgb_precision_weight is None:
+                        rgb_precision_weight = image_outputs["global_feat"].new_full(
+                            (batch_size,), 0.5
+                        )
+                    if thermal_precision_weight is None:
+                        thermal_precision_weight = image_outputs["global_feat"].new_full(
+                            (batch_size,), 0.5
+                        )
+                    if precision_weight_valid is None:
+                        precision_weight_valid = torch.zeros(
+                            batch_size,
+                            device=image_outputs["global_feat"].device,
+                            dtype=torch.bool,
+                        )
+                    gallery_rgb_precision_weights.append(
+                        rgb_precision_weight.float()
+                    )
+                    gallery_thermal_precision_weights.append(
+                        thermal_precision_weight.float()
+                    )
+                    gallery_precision_weight_valid.append(
+                        precision_weight_valid.bool()
+                    )
             else:
                 gfeats.append(image_outputs)
         gids = torch.cat(gids, 0)
         gfeats = torch.cat(gfeats, 0)
+        if use_mtp_eval_fusion:
+            gfeats_rgb = torch.cat(gfeats_rgb, 0)
+            gfeats_th = torch.cat(gfeats_th, 0)
 
         if return_local_tokens:
             gallery_rgb_patch_tokens = torch.cat(gallery_rgb_patch_tokens, 0)
@@ -240,7 +349,7 @@ class Evaluator():
             gallery_precision_weight_valid = torch.cat(
                 gallery_precision_weight_valid, 0
             )
-            return {
+            outputs = {
                 "qfeats": qfeats,
                 "gfeats": gfeats,
                 "qids": qids,
@@ -254,6 +363,27 @@ class Evaluator():
                 "gallery_thermal_precision_weights": gallery_thermal_precision_weights,
                 "gallery_precision_weight_valid": gallery_precision_weight_valid,
             }
+            if use_mtp_eval_fusion:
+                outputs.update(
+                    {
+                        "qfeats_rgb": qfeats_rgb,
+                        "qfeats_th": qfeats_th,
+                        "gfeats_rgb": gfeats_rgb,
+                        "gfeats_th": gfeats_th,
+                    }
+                )
+            return outputs
+        if use_mtp_eval_fusion:
+            return {
+                "qfeats": qfeats,
+                "gfeats": gfeats,
+                "qids": qids,
+                "gids": gids,
+                "qfeats_rgb": qfeats_rgb,
+                "qfeats_th": qfeats_th,
+                "gfeats_rgb": gfeats_rgb,
+                "gfeats_th": gfeats_th,
+            }
         return qfeats, gfeats, qids, gids
 
     def _compute_embedding_with_local(self, model):
@@ -265,14 +395,19 @@ class Evaluator():
         use_transport_rerank = bool(
             getattr(getattr(model, "args", None), "use_transport_rerank", False)
         )
+        use_mtp_eval_fusion = bool(
+            getattr(getattr(model, "args", None), "use_modality_text_prompt", False)
+        )
         return_local_tokens = bool(
             return_local_tokens or use_qalr or use_transport_rerank
         )
 
         # 1) Get embeddings.
-        if return_local_tokens:
+        if return_local_tokens or use_mtp_eval_fusion:
             embedding_outputs = self._compute_embedding(
-                model, return_local_tokens=True
+                model,
+                return_local_tokens=return_local_tokens,
+                use_mtp_eval_fusion=use_mtp_eval_fusion,
             )
             qfeats = embedding_outputs["qfeats"]
             gfeats = embedding_outputs["gfeats"]
@@ -287,6 +422,18 @@ class Evaluator():
 
         # 3) Text-to-image similarity matrix.
         similarity = qfeats @ gfeats.t()
+        if use_mtp_eval_fusion:
+            alpha = float(getattr(model.args, "mtp_eval_fusion_alpha", 0.15))
+            beta = float(getattr(model.args, "mtp_eval_fusion_beta", 0.10))
+            qfeats_rgb = F.normalize(embedding_outputs["qfeats_rgb"], p=2, dim=1)
+            qfeats_th = F.normalize(embedding_outputs["qfeats_th"], p=2, dim=1)
+            gfeats_rgb = F.normalize(embedding_outputs["gfeats_rgb"], p=2, dim=1)
+            gfeats_th = F.normalize(embedding_outputs["gfeats_th"], p=2, dim=1)
+            similarity = (
+                similarity
+                + alpha * (qfeats_rgb @ gfeats_rgb.t())
+                + beta * (qfeats_th @ gfeats_th.t())
+            )
         baseline_similarity = similarity.clone()
         if use_qalr:
             use_qalr_score_norm = bool(

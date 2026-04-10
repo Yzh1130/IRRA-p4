@@ -5,6 +5,7 @@ import logging
 import torch
 from utils.iotools import read_image
 from utils.simple_tokenizer import SimpleTokenizer
+from utils.mtp_text import build_full_text, build_rgb_text, build_thermal_text
 from prettytable import PrettyTable
 import random
 import regex as re
@@ -64,11 +65,15 @@ class ImageTextDataset(Dataset):
                  dataset,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 use_modality_text_prompt: bool = False,
+                 mtp_color_drop_mode: str = "delete"):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
+        self.use_modality_text_prompt = bool(use_modality_text_prompt)
+        self.mtp_color_drop_mode = str(mtp_color_drop_mode)
         self.tokenizer = SimpleTokenizer()
 
     def __len__(self):
@@ -96,7 +101,37 @@ class ImageTextDataset(Dataset):
                 t_img = self.transform(t_img)
 
         # Tokenize caption into fixed-length CLIP token ids.
-        tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
+        if self.use_modality_text_prompt:
+            full_text = build_full_text(caption)
+            rgb_text = build_rgb_text(caption)
+            thermal_text = build_thermal_text(
+                caption, color_drop_mode=self.mtp_color_drop_mode
+            )
+            tokens = tokenize(
+                full_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+            tokens_rgb = tokenize(
+                rgb_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+            tokens_th = tokenize(
+                thermal_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+        else:
+            tokens = tokenize(
+                caption,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
 
         ret = {
             'pids': pid,
@@ -104,6 +139,9 @@ class ImageTextDataset(Dataset):
             'images': img,
             'caption_ids': tokens,
         }
+        if self.use_modality_text_prompt:
+            ret['caption_ids_rgb'] = tokens_rgb
+            ret['caption_ids_th'] = tokens_th
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 
@@ -181,11 +219,15 @@ class ImageTextMLMDataset(Dataset):
                  dataset,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 use_modality_text_prompt: bool = False,
+                 mtp_color_drop_mode: str = "delete"):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
+        self.use_modality_text_prompt = bool(use_modality_text_prompt)
+        self.mtp_color_drop_mode = str(mtp_color_drop_mode)
 
         self.tokenizer = SimpleTokenizer()
 
@@ -213,7 +255,37 @@ class ImageTextMLMDataset(Dataset):
             if self.transform is not None:
                 t_img = self.transform(t_img)
         
-        caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
+        if self.use_modality_text_prompt:
+            full_text = build_full_text(caption)
+            rgb_text = build_rgb_text(caption)
+            thermal_text = build_thermal_text(
+                caption, color_drop_mode=self.mtp_color_drop_mode
+            )
+            caption_tokens = tokenize(
+                full_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+            caption_tokens_rgb = tokenize(
+                rgb_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+            caption_tokens_th = tokenize(
+                thermal_text,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
+        else:
+            caption_tokens = tokenize(
+                caption,
+                tokenizer=self.tokenizer,
+                text_length=self.text_length,
+                truncate=self.truncate,
+            )
 
         # Randomly mask tokens following BERT-style masking policy.
         mlm_tokens, mlm_labels = self._build_random_masked_tokens_and_labels(caption_tokens.cpu().numpy())
@@ -226,6 +298,9 @@ class ImageTextMLMDataset(Dataset):
             'mlm_ids': mlm_tokens,
             'mlm_labels': mlm_labels
         }
+        if self.use_modality_text_prompt:
+            ret['caption_ids_rgb'] = caption_tokens_rgb
+            ret['caption_ids_th'] = caption_tokens_th
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 

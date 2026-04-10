@@ -81,6 +81,28 @@ if __name__ == "__main__":
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info("[WARMSTART] load_ckpt_file={}".format(args.load_ckpt_file))
     logger.info(str(args).replace(",", "\n"))
+    logger.info(
+        "[MTP] use_modality_text_prompt=%s",
+        bool(getattr(args, "use_modality_text_prompt", False)),
+    )
+    logger.info(
+        "[MTP] color_drop_mode=%s",
+        str(getattr(args, "mtp_color_drop_mode", "delete")),
+    )
+    logger.info(
+        "[MTP] stage_mode=%s",
+        str(getattr(args, "mtp_stage_mode", "constant")),
+    )
+    logger.info(
+        "[MTP] stage1_end=%d stage2_end=%d",
+        int(getattr(args, "mtp_stage1_end", 10)),
+        int(getattr(args, "mtp_stage2_end", 30)),
+    )
+    logger.info(
+        "[MTP] eval_fusion_alpha=%.6f eval_fusion_beta=%.6f",
+        float(getattr(args, "mtp_eval_fusion_alpha", 0.15)),
+        float(getattr(args, "mtp_eval_fusion_beta", 0.10)),
+    )
     if args.training:
         save_train_configs(args.output_dir, args)
 

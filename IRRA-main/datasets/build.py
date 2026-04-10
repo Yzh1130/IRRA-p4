@@ -104,13 +104,29 @@ def build_dataloader(args, tranforms=None):
 
         if args.MLM:
             # MLM training needs extra masked tokens and labels.
-            train_set = ImageTextMLMDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length)
+            train_set = ImageTextMLMDataset(
+                dataset.train,
+                train_transforms,
+                text_length=args.text_length,
+                use_modality_text_prompt=bool(
+                    getattr(args, "use_modality_text_prompt", False)
+                ),
+                mtp_color_drop_mode=str(
+                    getattr(args, "mtp_color_drop_mode", "delete")
+                ),
+            )
         else:
-            train_set = ImageTextDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length)
+            train_set = ImageTextDataset(
+                dataset.train,
+                train_transforms,
+                text_length=args.text_length,
+                use_modality_text_prompt=bool(
+                    getattr(args, "use_modality_text_prompt", False)
+                ),
+                mtp_color_drop_mode=str(
+                    getattr(args, "mtp_color_drop_mode", "delete")
+                ),
+            )
 
         if args.sampler == 'identity':
             if args.distributed:

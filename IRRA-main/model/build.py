@@ -119,10 +119,23 @@ class IRRA(nn.Module):
             self.use_precision_fusion = bool(configured_precision_fusion)
         self.eval_use_fused_mu = bool(getattr(args, "eval_use_fused_mu", True))
         self.eval_use_mu_only = bool(getattr(args, "eval_use_mu_only", False))
+        self.use_modality_text_prompt = bool(
+            getattr(args, "use_modality_text_prompt", False)
+        )
+        self.mtp_rgb_ctx_len = int(getattr(args, "mtp_rgb_ctx_len", 4))
+        self.mtp_th_ctx_len = int(getattr(args, "mtp_th_ctx_len", 4))
         if self.use_global_uncertainty and self.uncertainty_dist_type != "diag_gaussian":
             raise ValueError(
                 f"Unsupported uncertainty_dist_type={self.uncertainty_dist_type}. "
                 "Only 'diag_gaussian' is currently implemented."
+            )
+        if self.mtp_rgb_ctx_len < 0:
+            raise ValueError(
+                f"mtp_rgb_ctx_len must be >= 0, got {self.mtp_rgb_ctx_len}."
+            )
+        if self.mtp_th_ctx_len < 0:
+            raise ValueError(
+                f"mtp_th_ctx_len must be >= 0, got {self.mtp_th_ctx_len}."
             )
 
         # Global uncertainty heads (pooled global feature -> mu/logvar).
@@ -388,6 +401,15 @@ class IRRA(nn.Module):
         return self._project_global_gaussian(
             text_global_feat, self.text_mu_head, self.text_logvar_head
         )
+
+    def _encode_caption_ids_with_uncertainty(self, caption_ids):
+        text_tokens = self.base_model.encode_text(caption_ids)  # [B, L_t, C]
+        batch_index = torch.arange(text_tokens.shape[0], device=text_tokens.device)
+        text_global_raw = text_tokens[
+            batch_index, caption_ids.argmax(dim=-1)
+        ].float()  # [B, C]
+        text_mu, text_logvar = self._encode_text_global_gaussian(text_global_raw)
+        return text_tokens, text_global_raw, text_mu, text_logvar
 
     def _encode_visual_global_gaussian(
         self, rgb_global_feat, thermal_global_feat, thermal_available
@@ -857,6 +879,8 @@ class IRRA(nn.Module):
         Returns:
             {
                 "global_feat": [B, C], deterministic retrieval embedding
+                "rgb_global_feat": [B, C], RGB global embedding before fused selection
+                "thermal_global_feat": [B, C], Thermal global embedding before fused selection
                 "rgb_patch_tokens": [B, Np, C]
                 "thermal_patch_tokens": [B, Np, C] or [B, 0, C] when thermal is absent
                 "rgb_precision_weight": [B], scalar modality weight for local rerank
@@ -931,6 +955,8 @@ class IRRA(nn.Module):
 
         return {
             "global_feat": self._maybe_eval_sampling(global_feat),
+            "rgb_global_feat": self._maybe_eval_sampling(rgb_mu),
+            "thermal_global_feat": self._maybe_eval_sampling(thermal_mu),
             "rgb_patch_tokens": rgb_patch_tokens,
             "thermal_patch_tokens": thermal_patch_tokens,
             "rgb_precision_weight": rgb_precision_weight,
@@ -1060,6 +1086,11 @@ class IRRA(nn.Module):
         images = batch["images"]
         thermal_images = batch.get("thermal_images", None)
         caption_ids = batch["caption_ids"]
+        caption_ids_rgb = None
+        caption_ids_th = None
+        if self.use_modality_text_prompt:
+            caption_ids_rgb = batch.get("caption_ids_rgb", caption_ids)
+            caption_ids_th = batch.get("caption_ids_th", caption_ids)
 
         # 1) RGB/Thermal pooled global branch (before uncertainty heads).
         (
@@ -1074,13 +1105,21 @@ class IRRA(nn.Module):
         )
 
         # 2) Text pooled global branch (before uncertainty heads).
-        text_tokens = self.base_model.encode_text(caption_ids)  # [B, L_t, C]
-        batch_index = torch.arange(text_tokens.shape[0], device=text_tokens.device)
-        l_c_raw = text_tokens[batch_index, caption_ids.argmax(dim=-1)].float()  # [B, C]
+        _, l_c_raw, text_mu, text_logvar = self._encode_caption_ids_with_uncertainty(
+            caption_ids
+        )
+        text_feat_rgb = None
+        text_feat_th = None
+        if self.use_modality_text_prompt:
+            _, _, text_feat_rgb, _ = self._encode_caption_ids_with_uncertainty(
+                caption_ids_rgb
+            )
+            _, _, text_feat_th, _ = self._encode_caption_ids_with_uncertainty(
+                caption_ids_th
+            )
 
         # 3) Optional diagonal-Gaussian heads over global pooled features.
         # Returned mu/logvar are used by later uncertainty-aware losses/fusion.
-        text_mu, text_logvar = self._encode_text_global_gaussian(l_c_raw)
         rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
             v_rgb_c_raw,
             v_t_c_raw,
@@ -1134,6 +1173,14 @@ class IRRA(nn.Module):
                 "text_prob_feat": p_t,
             }
         )
+        if self.use_modality_text_prompt:
+            ret.update(
+                {
+                    "text_feat_full": l_c,
+                    "text_feat_rgb": text_feat_rgb,
+                    "text_feat_th": text_feat_th,
+                }
+            )
         if self._use_diag_gaussian_global():
             ret.update(
                 {

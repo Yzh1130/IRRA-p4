@@ -9,6 +9,8 @@ from model import objectives
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
+from utils.mtp_text import build_rgb_text, build_thermal_text
+from utils.simple_tokenizer import SimpleTokenizer
 
 
 def _to_scalar(value):
@@ -23,6 +25,30 @@ def _to_scalar(value):
 def _safe_l2_normalize(feats, dim=1, eps=1e-12):
     norm = feats.norm(p=2, dim=dim, keepdim=True).clamp_min(eps)
     return feats / norm
+
+
+def _truncate_log_text(text, max_chars=160):
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3] + "..."
+
+
+def _decode_caption_token_ids_for_log(caption_ids, tokenizer):
+    token_ids = caption_ids.detach().cpu().reshape(-1).tolist()
+    sot_token = int(tokenizer.encoder["<|startoftext|>"])
+    eot_token = int(tokenizer.encoder["<|endoftext|>"])
+    filtered = []
+    for token_id in token_ids:
+        token_id = int(token_id)
+        if token_id == 0 or token_id == sot_token:
+            continue
+        if token_id == eot_token:
+            break
+        filtered.append(token_id)
+    if not filtered:
+        return ""
+    return " ".join(tokenizer.decode(filtered).split())
 
 
 def _compute_batch_mean_shared_consistency_layer_loss(rgb_feat, thermal_feat):
@@ -236,6 +262,65 @@ def log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch"):
         effective_lambda_router_balance,
         effective_lambda_shared_consistency,
     )
+
+
+def resolve_mtp_effective_lambdas(args, epoch):
+    schedule_mode = str(getattr(args, "mtp_stage_mode", "constant")).lower()
+    stage1_end = int(getattr(args, "mtp_stage1_end", 10))
+    stage2_end = int(getattr(args, "mtp_stage2_end", 30))
+
+    if schedule_mode == "constant":
+        return (
+            "constant",
+            float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.15)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.02)),
+        )
+
+    if schedule_mode == "three_stage":
+        if stage1_end > stage2_end:
+            raise ValueError(
+                "mtp_stage1_end must be <= mtp_stage2_end, "
+                f"got {stage1_end} and {stage2_end}."
+            )
+        epoch = int(epoch)
+        if epoch <= stage1_end:
+            return (
+                "stage1",
+                float(getattr(args, "lambda_rgb_txt_stage1", 0.0)),
+                float(getattr(args, "lambda_th_txt_stage1", 0.0)),
+                float(getattr(args, "lambda_txt_cons_stage1", 0.0)),
+            )
+        if epoch <= stage2_end:
+            return (
+                "stage2",
+                float(getattr(args, "lambda_rgb_txt_stage2", 0.08)),
+                float(getattr(args, "lambda_th_txt_stage2", 0.08)),
+                float(getattr(args, "lambda_txt_cons_stage2", 0.01)),
+            )
+        return (
+            "stage3",
+            float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.15)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.02)),
+        )
+
+    raise ValueError(f"Unsupported mtp_stage_mode={schedule_mode}.")
+
+
+def log_mtp_schedule_state(logger, args, epoch):
+    if not bool(getattr(args, "use_modality_text_prompt", False)):
+        return
+    (
+        _,
+        effective_lambda_rgb_txt,
+        effective_lambda_th_txt,
+        effective_lambda_txt_cons,
+    ) = resolve_mtp_effective_lambdas(args, epoch)
+    logger.info("[MTP] current_epoch=%d", int(epoch))
+    logger.info("[MTP] effective_lambda_rgb_txt=%.6f", effective_lambda_rgb_txt)
+    logger.info("[MTP] effective_lambda_th_txt=%.6f", effective_lambda_th_txt)
+    logger.info("[MTP] effective_lambda_txt_cons=%.6f", effective_lambda_txt_cons)
 
 
 def _get_img_local_stage_config(args):
@@ -1034,6 +1119,97 @@ def _add_rgbt_moe_adapter_terms_to_total_loss(args, total_loss, ret, epoch):
     return total_loss
 
 
+def _compute_mtp_text_prompt_terms(args, ret, batch, epoch):
+    if not bool(getattr(args, "use_modality_text_prompt", False)):
+        return {}
+
+    zero = batch["images"].new_zeros(())
+    (
+        _,
+        effective_lambda_rgb_txt,
+        effective_lambda_th_txt,
+        effective_lambda_txt_cons,
+    ) = resolve_mtp_effective_lambdas(args, epoch)
+    out = {
+        "loss_rgb_txt": zero,
+        "loss_th_txt": zero,
+        "loss_txt_cons": zero,
+        "effective_lambda_rgb_txt": zero.new_tensor(effective_lambda_rgb_txt),
+        "effective_lambda_th_txt": zero.new_tensor(effective_lambda_th_txt),
+        "effective_lambda_txt_cons": zero.new_tensor(effective_lambda_txt_cons),
+    }
+
+    f_rgb = ret.get("v_rgb_c", ret.get("rgb_mu", None))
+    f_th = ret.get("v_t_c", ret.get("thermal_mu", None))
+    e_full = ret.get("text_feat_full", ret.get("text_det_feat", None))
+    e_rgb = ret.get("text_feat_rgb", None)
+    e_th = ret.get("text_feat_th", None)
+    pids = batch.get("pids", None)
+    if (
+        f_rgb is None
+        or e_full is None
+        or e_rgb is None
+        or e_th is None
+        or pids is None
+    ):
+        raise KeyError(
+            "MTP losses require model outputs 'v_rgb_c', 'text_feat_full', "
+            "'text_feat_rgb', 'text_feat_th' and batch['pids']."
+        )
+
+    temperature = ret.get("temperature", None)
+    if temperature is None:
+        logit_scale = f_rgb.new_tensor(1.0 / float(getattr(args, "temperature", 0.02)))
+    elif torch.is_tensor(temperature):
+        logit_scale = 1.0 / temperature.to(device=f_rgb.device, dtype=f_rgb.dtype).clamp_min(1e-12)
+    else:
+        logit_scale = f_rgb.new_tensor(1.0 / max(float(temperature), 1e-12))
+
+    out["loss_rgb_txt"] = objectives.compute_sdm(
+        f_rgb, e_rgb, pids, logit_scale
+    )
+    if "thermal_images" in batch and f_th is not None:
+        out["loss_th_txt"] = objectives.compute_sdm(
+            f_th, e_th, pids, logit_scale
+        )
+
+    e_rgb_th = F.normalize(e_rgb.float() + e_th.float(), p=2, dim=1)
+    out["loss_txt_cons"] = 1.0 - F.cosine_similarity(
+        e_full.float(), e_rgb_th, dim=1
+    ).mean()
+
+    return out
+
+
+def _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch):
+    if not bool(getattr(args, "use_modality_text_prompt", False)):
+        return total_loss
+
+    (
+        _,
+        default_lambda_rgb_txt,
+        default_lambda_th_txt,
+        default_lambda_txt_cons,
+    ) = resolve_mtp_effective_lambdas(args, epoch)
+    effective_lambda_rgb_txt = float(
+        _to_scalar(ret.get("effective_lambda_rgb_txt", default_lambda_rgb_txt))
+    )
+    effective_lambda_th_txt = float(
+        _to_scalar(ret.get("effective_lambda_th_txt", default_lambda_th_txt))
+    )
+    effective_lambda_txt_cons = float(
+        _to_scalar(ret.get("effective_lambda_txt_cons", default_lambda_txt_cons))
+    )
+
+    if "loss_rgb_txt" in ret:
+        total_loss = total_loss + effective_lambda_rgb_txt * ret["loss_rgb_txt"]
+    if "loss_th_txt" in ret:
+        total_loss = total_loss + effective_lambda_th_txt * ret["loss_th_txt"]
+    if "loss_txt_cons" in ret:
+        total_loss = total_loss + effective_lambda_txt_cons * ret["loss_txt_cons"]
+    return total_loss
+
+
 def _compute_hardneg_aux_terms(args, ret, batch, epoch):
     if not bool(getattr(args, "use_hardneg_aux", False)):
         return {}
@@ -1409,6 +1585,12 @@ def do_train(
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
         "loss_mlm": AverageMeter(),
+        "loss_rgb_txt": AverageMeter(),
+        "loss_th_txt": AverageMeter(),
+        "loss_txt_cons": AverageMeter(),
+        "effective_lambda_rgb_txt": AverageMeter(),
+        "effective_lambda_th_txt": AverageMeter(),
+        "effective_lambda_txt_cons": AverageMeter(),
         "loss_unc_total": AverageMeter(),
         "loss_unc_text_rgb": AverageMeter(),
         "loss_unc_rgb_thermal": AverageMeter(),
@@ -1460,6 +1642,13 @@ def do_train(
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
     best_top1 = 0.0
+    mtp_text_example_logged = False
+    use_modality_text_prompt = bool(
+        getattr(args, "use_modality_text_prompt", False)
+    )
+    mtp_text_tokenizer = (
+        SimpleTokenizer() if use_modality_text_prompt else None
+    )
 
     for epoch in range(start_epoch, num_epoch + 1):
         start_time = time.time()
@@ -1478,9 +1667,44 @@ def do_train(
         model.train()
         log_proto_calib_state(logger, args, model, epoch, prefix="Epoch")
         log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch")
+        log_mtp_schedule_state(logger, args, epoch)
 
         for n_iter, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
+            if use_modality_text_prompt and (not mtp_text_example_logged):
+                full_example = _decode_caption_token_ids_for_log(
+                    batch["caption_ids"][0], mtp_text_tokenizer
+                )
+                if "caption_ids_rgb" in batch:
+                    rgb_example = _decode_caption_token_ids_for_log(
+                        batch["caption_ids_rgb"][0], mtp_text_tokenizer
+                    )
+                else:
+                    rgb_example = build_rgb_text(full_example)
+                if "caption_ids_th" in batch:
+                    th_example = _decode_caption_token_ids_for_log(
+                        batch["caption_ids_th"][0], mtp_text_tokenizer
+                    )
+                else:
+                    th_example = build_thermal_text(
+                        full_example,
+                        color_drop_mode=str(
+                            getattr(args, "mtp_color_drop_mode", "delete")
+                        ),
+                    )
+                logger.info(
+                    "[MTP][TEXT_EXAMPLE] full=%s",
+                    _truncate_log_text(full_example),
+                )
+                logger.info(
+                    "[MTP][TEXT_EXAMPLE] rgb=%s",
+                    _truncate_log_text(rgb_example),
+                )
+                logger.info(
+                    "[MTP][TEXT_EXAMPLE] th=%s",
+                    _truncate_log_text(th_example),
+                )
+                mtp_text_example_logged = True
 
             ret = model(batch)
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
@@ -1489,6 +1713,7 @@ def do_train(
             if getattr(args, "use_hardneg_aux", False):
                 ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
             ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
+            ret.update(_compute_mtp_text_prompt_terms(args, ret, batch, epoch))
             total_loss = _add_rgbt_moe_adapter_terms_to_total_loss(
                 args, original_total_loss, ret, epoch
             )
@@ -1497,6 +1722,7 @@ def do_train(
                 total_loss = _add_hardneg_aux_to_total_loss(
                     args, total_loss, ret, epoch
                 )
+            total_loss = _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch)
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
@@ -1515,6 +1741,30 @@ def do_train(
             meters["loss_mlm"].update(
                 _to_scalar(ret.get("loss_mlm", ret.get("mlm_loss", 0))), batch_size
             )
+            if "loss_rgb_txt" in ret:
+                meters["loss_rgb_txt"].update(
+                    _to_scalar(ret["loss_rgb_txt"]), batch_size
+                )
+            if "loss_th_txt" in ret:
+                meters["loss_th_txt"].update(
+                    _to_scalar(ret["loss_th_txt"]), batch_size
+                )
+            if "loss_txt_cons" in ret:
+                meters["loss_txt_cons"].update(
+                    _to_scalar(ret["loss_txt_cons"]), batch_size
+                )
+            if "effective_lambda_rgb_txt" in ret:
+                meters["effective_lambda_rgb_txt"].update(
+                    _to_scalar(ret["effective_lambda_rgb_txt"]), batch_size
+                )
+            if "effective_lambda_th_txt" in ret:
+                meters["effective_lambda_th_txt"].update(
+                    _to_scalar(ret["effective_lambda_th_txt"]), batch_size
+                )
+            if "effective_lambda_txt_cons" in ret:
+                meters["effective_lambda_txt_cons"].update(
+                    _to_scalar(ret["effective_lambda_txt_cons"]), batch_size
+                )
             meters["loss_unc_total"].update(
                 _to_scalar(ret.get("loss_unc_total", 0)), batch_size
             )
@@ -1718,6 +1968,18 @@ def do_train(
                 runtime=epoch_img_local_runtime,
             )
             log_img_local_filter_eval_state(logger, model, prefix="VALIDATION")
+            logger.info(
+                "[MTP][VALIDATION] enabled=%s",
+                bool(getattr(args, "use_modality_text_prompt", False)),
+            )
+            logger.info(
+                "[MTP][VALIDATION] alpha=%.6f",
+                float(getattr(args, "mtp_eval_fusion_alpha", 0.15)),
+            )
+            logger.info(
+                "[MTP][VALIDATION] beta=%.6f",
+                float(getattr(args, "mtp_eval_fusion_beta", 0.10)),
+            )
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
                 top1 = evaluator.eval(model.module.eval())
