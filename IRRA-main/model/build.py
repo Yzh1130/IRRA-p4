@@ -1090,7 +1090,12 @@ class IRRA(nn.Module):
         caption_ids_rgb = None
         caption_ids_th = None
         if self.use_modality_text_prompt:
-            caption_ids_full_clean = batch.get("caption_ids_full_clean", caption_ids)
+            if "caption_ids_full_clean" not in batch:
+                raise KeyError(
+                    "use_modality_text_prompt=True requires batch['caption_ids_full_clean'] "
+                    "for clean full-text encoding."
+                )
+            caption_ids_full_clean = batch["caption_ids_full_clean"]
             caption_ids_rgb = batch.get("caption_ids_rgb", caption_ids)
             caption_ids_th = batch.get("caption_ids_th", caption_ids)
 
@@ -1110,7 +1115,7 @@ class IRRA(nn.Module):
         _, l_c_raw, text_mu, text_logvar = self._encode_caption_ids_with_uncertainty(
             caption_ids
         )
-        text_feat_full = l_c
+        text_feat_full = None
         text_feat_rgb = None
         text_feat_th = None
         if self.use_modality_text_prompt:
