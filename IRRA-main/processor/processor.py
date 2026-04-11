@@ -264,6 +264,37 @@ def log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch"):
     )
 
 
+def _linear_ramp(cur_epoch, start_epoch, ramp_epochs, target):
+    cur_epoch = int(cur_epoch)
+    start_epoch = int(start_epoch)
+    ramp_epochs = int(ramp_epochs)
+    target = float(target)
+    if ramp_epochs <= 0:
+        return target if cur_epoch >= start_epoch else 0.0
+    if cur_epoch < start_epoch:
+        return 0.0
+    if cur_epoch >= start_epoch + ramp_epochs:
+        return target
+    ratio = float(cur_epoch - start_epoch) / float(ramp_epochs)
+    return target * ratio
+
+
+def _linear_interp(cur_epoch, start_epoch, ramp_epochs, start_value, end_value):
+    cur_epoch = int(cur_epoch)
+    start_epoch = int(start_epoch)
+    ramp_epochs = int(ramp_epochs)
+    start_value = float(start_value)
+    end_value = float(end_value)
+    if ramp_epochs <= 0:
+        return end_value if cur_epoch >= start_epoch else start_value
+    if cur_epoch < start_epoch:
+        return start_value
+    if cur_epoch >= start_epoch + ramp_epochs:
+        return end_value
+    ratio = float(cur_epoch - start_epoch) / float(ramp_epochs)
+    return start_value + ratio * (end_value - start_value)
+
+
 def resolve_mtp_effective_lambdas(args, epoch):
     schedule_mode = str(getattr(args, "mtp_stage_mode", "three_stage")).lower()
     stage1_end = int(getattr(args, "mtp_stage1_end", 10))
@@ -283,41 +314,118 @@ def resolve_mtp_effective_lambdas(args, epoch):
                 "mtp_stage1_end must be <= mtp_stage2_end, "
                 f"got {stage1_end} and {stage2_end}."
             )
-        epoch = int(epoch)
-        if epoch <= stage1_end:
+        cur_epoch = int(epoch)
+        if cur_epoch <= 0:
+            # Keep existing 1-based training-loop behavior while tolerating 0-based calls.
+            cur_epoch = cur_epoch + 1
+
+        lambda_rgb_txt_stage2 = float(getattr(args, "lambda_rgb_txt_stage2", 0.08))
+        lambda_th_txt_stage2 = float(getattr(args, "lambda_th_txt_stage2", 0.03))
+        lambda_txt_cons_stage2 = float(getattr(args, "lambda_txt_cons_stage2", 0.003))
+        lambda_rgb_txt_stage3 = float(getattr(args, "lambda_rgb_txt_stage3", 0.10))
+        lambda_th_txt_stage3 = float(getattr(args, "lambda_th_txt_stage3", 0.04))
+        lambda_txt_cons_stage3 = float(getattr(args, "lambda_txt_cons_stage3", 0.005))
+
+        if cur_epoch <= stage1_end:
             return (
                 "stage1",
-                float(getattr(args, "lambda_rgb_txt_stage1", 0.0)),
-                float(getattr(args, "lambda_th_txt_stage1", 0.0)),
-                float(getattr(args, "lambda_txt_cons_stage1", 0.0)),
+                0.0,
+                0.0,
+                0.0,
             )
-        if epoch <= stage2_end:
+        if cur_epoch <= stage2_end:
+            stage2_start_epoch = stage1_end + 1
+            stage2_ramp_epochs = int(getattr(args, "mtp_stage2_ramp_epochs", 0))
             return (
                 "stage2",
-                float(getattr(args, "lambda_rgb_txt_stage2", 0.08)),
-                float(getattr(args, "lambda_th_txt_stage2", 0.03)),
-                float(getattr(args, "lambda_txt_cons_stage2", 0.003)),
+                _linear_ramp(
+                    cur_epoch, stage2_start_epoch, stage2_ramp_epochs, lambda_rgb_txt_stage2
+                ),
+                _linear_ramp(
+                    cur_epoch, stage2_start_epoch, stage2_ramp_epochs, lambda_th_txt_stage2
+                ),
+                _linear_ramp(
+                    cur_epoch,
+                    stage2_start_epoch,
+                    stage2_ramp_epochs,
+                    lambda_txt_cons_stage2,
+                ),
             )
+        stage3_start_epoch = stage2_end + 1
+        stage3_ramp_epochs = int(getattr(args, "mtp_stage3_ramp_epochs", 0))
         return (
             "stage3",
-            float(getattr(args, "lambda_rgb_txt_stage3", 0.10)),
-            float(getattr(args, "lambda_th_txt_stage3", 0.04)),
-            float(getattr(args, "lambda_txt_cons_stage3", 0.005)),
+            _linear_interp(
+                cur_epoch,
+                stage3_start_epoch,
+                stage3_ramp_epochs,
+                lambda_rgb_txt_stage2,
+                lambda_rgb_txt_stage3,
+            ),
+            _linear_interp(
+                cur_epoch,
+                stage3_start_epoch,
+                stage3_ramp_epochs,
+                lambda_th_txt_stage2,
+                lambda_th_txt_stage3,
+            ),
+            _linear_interp(
+                cur_epoch,
+                stage3_start_epoch,
+                stage3_ramp_epochs,
+                lambda_txt_cons_stage2,
+                lambda_txt_cons_stage3,
+            ),
         )
 
     raise ValueError(f"Unsupported mtp_stage_mode={schedule_mode}.")
+
+
+def _resolve_mtp_current_phase(args, epoch, stage_name):
+    schedule_mode = str(getattr(args, "mtp_stage_mode", "three_stage")).lower()
+    if schedule_mode != "three_stage":
+        return stage_name
+
+    cur_epoch = int(epoch)
+    if cur_epoch <= 0:
+        cur_epoch = cur_epoch + 1
+
+    stage1_end = int(getattr(args, "mtp_stage1_end", 10))
+    stage2_end = int(getattr(args, "mtp_stage2_end", 45))
+    stage2_ramp_epochs = int(getattr(args, "mtp_stage2_ramp_epochs", 0))
+    stage3_ramp_epochs = int(getattr(args, "mtp_stage3_ramp_epochs", 0))
+
+    if stage_name == "stage1":
+        return "stage1"
+    if stage_name == "stage2":
+        stage2_start_epoch = stage1_end + 1
+        if stage2_ramp_epochs > 0 and cur_epoch < stage2_start_epoch + stage2_ramp_epochs:
+            return "stage2_ramp"
+        return "stage2_hold"
+    if stage_name == "stage3":
+        stage3_start_epoch = stage2_end + 1
+        if stage3_ramp_epochs > 0 and cur_epoch < stage3_start_epoch + stage3_ramp_epochs:
+            return "stage3_ramp"
+        return "stage3_hold"
+    return stage_name
 
 
 def log_mtp_schedule_state(logger, args, epoch):
     if not bool(getattr(args, "use_modality_text_prompt", False)):
         return
     (
-        _,
+        stage_name,
         effective_lambda_rgb_txt,
         effective_lambda_th_txt,
         effective_lambda_txt_cons,
     ) = resolve_mtp_effective_lambdas(args, epoch)
+    mtp_stage2_ramp_epochs = int(getattr(args, "mtp_stage2_ramp_epochs", 0))
+    mtp_stage3_ramp_epochs = int(getattr(args, "mtp_stage3_ramp_epochs", 0))
+    current_mtp_phase = _resolve_mtp_current_phase(args, epoch, stage_name)
     logger.info("[MTP] current_epoch=%d", int(epoch))
+    logger.info("[MTP] mtp_stage2_ramp_epochs=%d", mtp_stage2_ramp_epochs)
+    logger.info("[MTP] mtp_stage3_ramp_epochs=%d", mtp_stage3_ramp_epochs)
+    logger.info("[MTP] current_mtp_phase=%s", current_mtp_phase)
     logger.info("[MTP] effective_lambda_rgb_txt=%.6f", effective_lambda_rgb_txt)
     logger.info("[MTP] effective_lambda_th_txt=%.6f", effective_lambda_th_txt)
     logger.info("[MTP] effective_lambda_txt_cons=%.6f", effective_lambda_txt_cons)

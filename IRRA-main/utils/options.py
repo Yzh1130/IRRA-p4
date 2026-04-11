@@ -194,6 +194,8 @@ def get_args():
     parser.add_argument("--mtp_stage_mode", type=str, default='three_stage', choices=['constant', 'three_stage'], help="stage schedule mode for modality-text losses")
     parser.add_argument("--mtp_stage1_end", type=int, default=10, help="inclusive end epoch of modality-text stage 1")
     parser.add_argument("--mtp_stage2_end", type=int, default=45, help="inclusive end epoch of modality-text stage 2")
+    parser.add_argument("--mtp_stage2_ramp_epochs", type=int, default=0, help="epochs used to smoothly ramp stage2 weights from stage1 values; 0 keeps legacy hard switch behavior")
+    parser.add_argument("--mtp_stage3_ramp_epochs", type=int, default=0, help="epochs used to smoothly ramp stage3 weights from stage2 values; 0 keeps legacy hard switch behavior")
     parser.add_argument("--lambda_rgb_txt_stage1", type=float, default=0.0, help="stage1 weight for rgb-text auxiliary loss")
     parser.add_argument("--lambda_rgb_txt_stage2", type=float, default=0.08, help="stage2 weight for rgb-text auxiliary loss")
     parser.add_argument("--lambda_rgb_txt_stage3", type=float, default=0.10, help="stage3 weight for rgb-text auxiliary loss")
