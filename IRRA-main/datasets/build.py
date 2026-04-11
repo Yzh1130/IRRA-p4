@@ -1,4 +1,5 @@
 import logging
+import os.path as op
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
@@ -7,6 +8,7 @@ from datasets.sampler_ddp import RandomIdentitySampler_DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.comm import get_world_size
+from utils.iotools import read_json
 
 from .bases import (
     ImageDataset,
@@ -86,6 +88,108 @@ def collate(batch):
 
     return batch_tensor_dict
 
+
+def _extract_img_path_from_train_sample(sample):
+    # Legacy: (pid, image_id, img_path, caption)
+    # RGBT:  (pid, image_id, rgb_path, thermal_path, caption)
+    if len(sample) == 5:
+        return sample[2]
+    if len(sample) == 4:
+        return sample[2]
+    raise ValueError(
+        "Unsupported train sample format for synthetic captions. "
+        f"Expected len=4 or len=5, got len={len(sample)}."
+    )
+
+
+def _clone_train_sample_with_caption(sample, caption):
+    if len(sample) == 5:
+        pid, image_id, img_path, t_img_path, _ = sample
+        return (pid, image_id, img_path, t_img_path, caption)
+    if len(sample) == 4:
+        pid, image_id, img_path, _ = sample
+        return (pid, image_id, img_path, caption)
+    raise ValueError(
+        "Unsupported train sample format for synthetic captions. "
+        f"Expected len=4 or len=5, got len={len(sample)}."
+    )
+
+
+def _append_synth_captions_to_train(dataset, args, logger):
+    use_synth = bool(getattr(args, "use_synth_caption_bank", False))
+    train_mode = str(getattr(args, "synth_caption_train_mode", "append")).lower()
+    bank_file = str(getattr(args, "synth_caption_bank_file", ""))
+    keep_per_image = int(getattr(args, "synth_caption_keep_per_image", 2))
+
+    added_synth_captions = 0
+    enabled = use_synth and train_mode == "append"
+
+    if enabled:
+        if keep_per_image < 0:
+            raise ValueError(
+                "synth_caption_keep_per_image must be >= 0, "
+                f"got {keep_per_image}."
+            )
+        if bank_file == "":
+            raise ValueError(
+                "use_synth_caption_bank=True requires non-empty synth_caption_bank_file."
+            )
+        if not op.isfile(bank_file):
+            raise RuntimeError(
+                f"synth_caption_bank_file='{bank_file}' does not exist."
+            )
+
+        synth_bank = read_json(bank_file)
+        if not isinstance(synth_bank, dict):
+            raise ValueError(
+                "synth_caption_bank_file must be a JSON object: "
+                "{<stable_image_key>: [caption1, caption2, ...], ...}."
+            )
+
+        # One base sample per image_id, preserving first-seen order.
+        base_sample_by_image_id = {}
+        for sample in dataset.train:
+            image_id = sample[1]
+            if image_id not in base_sample_by_image_id:
+                base_sample_by_image_id[image_id] = sample
+
+        appended_samples = []
+        for base_sample in base_sample_by_image_id.values():
+            # Stable key aligns to current train sample key: basename(img_path).
+            img_path = _extract_img_path_from_train_sample(base_sample)
+            stable_image_key = op.basename(str(img_path))
+            synth_captions = synth_bank.get(stable_image_key, [])
+            if not isinstance(synth_captions, list):
+                continue
+
+            kept = 0
+            for synth_caption in synth_captions:
+                if kept >= keep_per_image:
+                    break
+                if not isinstance(synth_caption, str):
+                    continue
+                synth_caption = synth_caption.strip()
+                if synth_caption == "":
+                    continue
+                appended_samples.append(
+                    _clone_train_sample_with_caption(base_sample, synth_caption)
+                )
+                kept += 1
+
+        if appended_samples:
+            dataset.train.extend(appended_samples)
+            added_synth_captions = len(appended_samples)
+
+    logger.info("[SYNTH] enabled=%s", enabled)
+    logger.info("[SYNTH] bank_file=%s", bank_file)
+    logger.info("[SYNTH] keep_per_image=%d", keep_per_image)
+    logger.info("[SYNTH] added_synth_captions=%d", added_synth_captions)
+    logger.info(
+        "[SYNTH] total_train_captions_after_append=%d",
+        len(dataset.train),
+    )
+
+
 def build_dataloader(args, tranforms=None):
     logger = logging.getLogger("IRRA.dataset")
 
@@ -95,6 +199,7 @@ def build_dataloader(args, tranforms=None):
     num_classes = len(dataset.train_id_container)
     
     if args.training:
+        _append_synth_captions_to_train(dataset, args, logger)
         # Build transform pipelines for train and validation.
         train_transforms = build_transforms(img_size=args.img_size,
                                             aug=args.img_aug,

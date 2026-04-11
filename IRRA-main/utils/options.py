@@ -239,6 +239,10 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--use_synth_caption_bank", default=False, action='store_true', help="enable synthetic caption bank append for train split only")
+    parser.add_argument("--synth_caption_bank_file", type=str, default="", help="json file path of synthetic caption bank")
+    parser.add_argument("--synth_caption_keep_per_image", type=int, default=2, help="max synthetic captions appended per image")
+    parser.add_argument("--synth_caption_train_mode", type=str, default="append", choices=["append", "off"], help="train-time synthetic caption mode")
     parser.add_argument("--test", dest='training', default=True, action='store_false')
 
     # Parse CLI args into namespace.
