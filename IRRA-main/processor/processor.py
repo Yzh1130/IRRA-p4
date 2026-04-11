@@ -265,16 +265,16 @@ def log_moe_aux_schedule_state(logger, args, epoch, prefix="Epoch"):
 
 
 def resolve_mtp_effective_lambdas(args, epoch):
-    schedule_mode = str(getattr(args, "mtp_stage_mode", "constant")).lower()
+    schedule_mode = str(getattr(args, "mtp_stage_mode", "three_stage")).lower()
     stage1_end = int(getattr(args, "mtp_stage1_end", 10))
-    stage2_end = int(getattr(args, "mtp_stage2_end", 30))
+    stage2_end = int(getattr(args, "mtp_stage2_end", 45))
 
     if schedule_mode == "constant":
         return (
             "constant",
-            float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_th_txt_stage3", 0.08)),
-            float(getattr(args, "lambda_txt_cons_stage3", 0.01)),
+            float(getattr(args, "lambda_rgb_txt_stage3", 0.10)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.04)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.005)),
         )
 
     if schedule_mode == "three_stage":
@@ -295,14 +295,14 @@ def resolve_mtp_effective_lambdas(args, epoch):
             return (
                 "stage2",
                 float(getattr(args, "lambda_rgb_txt_stage2", 0.08)),
-                float(getattr(args, "lambda_th_txt_stage2", 0.04)),
-                float(getattr(args, "lambda_txt_cons_stage2", 0.005)),
+                float(getattr(args, "lambda_th_txt_stage2", 0.03)),
+                float(getattr(args, "lambda_txt_cons_stage2", 0.003)),
             )
         return (
             "stage3",
-            float(getattr(args, "lambda_rgb_txt_stage3", 0.15)),
-            float(getattr(args, "lambda_th_txt_stage3", 0.08)),
-            float(getattr(args, "lambda_txt_cons_stage3", 0.01)),
+            float(getattr(args, "lambda_rgb_txt_stage3", 0.10)),
+            float(getattr(args, "lambda_th_txt_stage3", 0.04)),
+            float(getattr(args, "lambda_txt_cons_stage3", 0.005)),
         )
 
     raise ValueError(f"Unsupported mtp_stage_mode={schedule_mode}.")
@@ -1975,11 +1975,11 @@ def do_train(
             )
             logger.info(
                 "[MTP][VALIDATION] alpha=%.6f",
-                float(getattr(args, "mtp_eval_fusion_alpha", 0.12)),
+                float(getattr(args, "mtp_eval_fusion_alpha", 0.10)),
             )
             logger.info(
                 "[MTP][VALIDATION] beta=%.6f",
-                float(getattr(args, "mtp_eval_fusion_beta", 0.03)),
+                float(getattr(args, "mtp_eval_fusion_beta", 0.00)),
             )
             logger.info("Validation Results - Epoch: {}".format(epoch))
             if args.distributed:
@@ -2007,11 +2007,11 @@ def do_inference(model, test_img_loader, test_txt_loader):
     )
     logger.info(
         "[MTP][VALIDATION] alpha=%.6f",
-        float(getattr(model_args, "mtp_eval_fusion_alpha", 0.12)),
+        float(getattr(model_args, "mtp_eval_fusion_alpha", 0.10)),
     )
     logger.info(
         "[MTP][VALIDATION] beta=%.6f",
-        float(getattr(model_args, "mtp_eval_fusion_beta", 0.03)),
+        float(getattr(model_args, "mtp_eval_fusion_beta", 0.00)),
     )
     log_img_local_filter_eval_state(logger, model, prefix="INFERENCE")
     evaluator = Evaluator(test_img_loader, test_txt_loader)

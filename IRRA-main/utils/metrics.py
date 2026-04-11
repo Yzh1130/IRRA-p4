@@ -423,8 +423,8 @@ class Evaluator():
         # 3) Text-to-image similarity matrix.
         similarity = qfeats @ gfeats.t()
         if use_mtp_eval_fusion:
-            alpha = float(getattr(model.args, "mtp_eval_fusion_alpha", 0.12))
-            beta = float(getattr(model.args, "mtp_eval_fusion_beta", 0.03))
+            alpha = float(getattr(model.args, "mtp_eval_fusion_alpha", 0.10))
+            beta = float(getattr(model.args, "mtp_eval_fusion_beta", 0.00))
             qfeats_rgb = F.normalize(embedding_outputs["qfeats_rgb"], p=2, dim=1)
             qfeats_th = F.normalize(embedding_outputs["qfeats_th"], p=2, dim=1)
             gfeats_rgb = F.normalize(embedding_outputs["gfeats_rgb"], p=2, dim=1)
