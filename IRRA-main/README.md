@@ -65,6 +65,24 @@ python train.py \
 --num_epoch 60
 ```
 
+### Guided Token Masking Examples
+
+These examples only add optional training flags. With A/B omitted, training keeps the baseline random MLM path.
+
+```bash
+# 1. Baseline: A/B all off.
+python train.py --name baseline --img_aug --batch_size 64 --MLM --loss_names 'sdm+mlm+id' --dataset_name 'CUHK-PEDES' --root_dir 'your dataset root dir' --num_epoch 60
+
+# 2. A only: low-score tokens are masked in the main training text input.
+python train.py --name noise_mask_only --img_aug --batch_size 64 --MLM --loss_names 'sdm+mlm+id' --dataset_name 'CUHK-PEDES' --root_dir 'your dataset root dir' --num_epoch 60 --use_noise_token_masking --token_mask_score_source attn --noise_mask_ratio 0.15
+
+# 3. B only: high-score tokens become guided MLM/MTP prediction targets.
+python train.py --name info_mask_only --img_aug --batch_size 64 --MLM --loss_names 'sdm+mlm+id' --dataset_name 'CUHK-PEDES' --root_dir 'your dataset root dir' --num_epoch 60 --use_informative_token_masking --token_mask_score_source attn --info_mask_ratio 0.15 --lambda_guided_mtp 1.0
+
+# 4. A+B: independent noise input masking plus informative MLM/MTP targets.
+python train.py --name noise_info_mask --img_aug --batch_size 64 --MLM --loss_names 'sdm+mlm+id' --dataset_name 'CUHK-PEDES' --root_dir 'your dataset root dir' --num_epoch 60 --use_noise_token_masking --use_informative_token_masking --token_mask_score_source attn --noise_mask_ratio 0.15 --info_mask_ratio 0.15 --lambda_guided_mtp 1.0
+```
+
 ## Testing
 
 ```python

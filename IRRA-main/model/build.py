@@ -13,6 +13,14 @@ from .clip_model import (
     convert_weights,
 )
 from .prototype_bank import IdentityPrototypeBank
+from .text_guided_masking import (
+    apply_guided_mask_to_input_ids,
+    build_guided_mlm_inputs_and_labels,
+    build_informative_token_mask,
+    build_noise_token_mask,
+    compute_token_importance_scores,
+    summarize_mask_stats,
+)
 from .uncertainty import GlobalUncertaintyModeler
 
 
@@ -124,6 +132,46 @@ class IRRA(nn.Module):
         )
         self.mtp_rgb_ctx_len = int(getattr(args, "mtp_rgb_ctx_len", 4))
         self.mtp_th_ctx_len = int(getattr(args, "mtp_th_ctx_len", 4))
+        self.use_noise_token_masking = bool(
+            getattr(args, "use_noise_token_masking", False)
+        )
+        self.use_informative_token_masking = bool(
+            getattr(args, "use_informative_token_masking", False)
+        )
+        self.noise_mask_ratio = float(getattr(args, "noise_mask_ratio", 0.15))
+        self.info_mask_ratio = float(getattr(args, "info_mask_ratio", 0.15))
+        self.token_mask_score_source = str(
+            getattr(args, "token_mask_score_source", "none")
+        ).lower()
+        self.token_mask_min_keep = int(getattr(args, "token_mask_min_keep", 1))
+        self.noise_mask_apply_to_mlm = bool(
+            getattr(args, "noise_mask_apply_to_mlm", False)
+        )
+        self.info_mask_apply_to_mlm = bool(
+            getattr(args, "info_mask_apply_to_mlm", True)
+        )
+        self.guided_mask_detach_score = bool(
+            getattr(args, "guided_mask_detach_score", True)
+        )
+        self.lambda_guided_mtp = float(getattr(args, "lambda_guided_mtp", 1.0))
+        self.debug_print_token_mask_stats = bool(
+            getattr(args, "debug_print_token_mask_stats", False)
+        )
+        self.ablate_random_noise_mask = bool(
+            getattr(args, "ablate_random_noise_mask", False)
+        )
+        self.ablate_random_info_mask = bool(
+            getattr(args, "ablate_random_info_mask", False)
+        )
+        self.guided_mask_token_id = int(getattr(args, "vocab_size", 49408)) - 3
+        self.guided_sot_token_id = int(getattr(args, "vocab_size", 49408)) - 2
+        self.guided_eot_token_id = int(getattr(args, "vocab_size", 49408)) - 1
+        self.guided_mask_special_token_ids = {
+            0,
+            self.guided_mask_token_id,
+            self.guided_sot_token_id,
+            self.guided_eot_token_id,
+        }
         if self.use_global_uncertainty and self.uncertainty_dist_type != "diag_gaussian":
             raise ValueError(
                 f"Unsupported uncertainty_dist_type={self.uncertainty_dist_type}. "
@@ -136,6 +184,29 @@ class IRRA(nn.Module):
         if self.mtp_th_ctx_len < 0:
             raise ValueError(
                 f"mtp_th_ctx_len must be >= 0, got {self.mtp_th_ctx_len}."
+            )
+        if not 0.0 <= self.noise_mask_ratio <= 1.0:
+            raise ValueError(
+                f"noise_mask_ratio must be in [0, 1], got {self.noise_mask_ratio}."
+            )
+        if not 0.0 <= self.info_mask_ratio <= 1.0:
+            raise ValueError(
+                f"info_mask_ratio must be in [0, 1], got {self.info_mask_ratio}."
+            )
+        if self.token_mask_score_source not in {"none", "grad_attn", "attn", "grad"}:
+            raise ValueError(
+                "token_mask_score_source must be one of "
+                "['none', 'grad_attn', 'attn', 'grad'], "
+                f"got {self.token_mask_score_source}."
+            )
+        if self.token_mask_min_keep < 0:
+            raise ValueError(
+                "token_mask_min_keep must be >= 0, "
+                f"got {self.token_mask_min_keep}."
+            )
+        if self.lambda_guided_mtp < 0.0:
+            raise ValueError(
+                f"lambda_guided_mtp must be >= 0, got {self.lambda_guided_mtp}."
             )
 
         # Global uncertainty heads (pooled global feature -> mu/logvar).
@@ -593,6 +664,175 @@ class IRRA(nn.Module):
         x = x.permute(1, 0, 2)  # [L, B, C] -> [B, L, C]
         x = self.ln_post(x)
         return x
+
+    def _noise_token_masking_active(self):
+        # A: train-only text input perturbation. Default False keeps baseline exact.
+        return self.training and self.use_noise_token_masking
+
+    def _informative_token_masking_active(self):
+        # B: train-only guided MLM/MTP target selection. Eval/test never enter it.
+        return self.training and self.use_informative_token_masking
+
+    def _guided_text_masking_requested(self):
+        # A and B are independent. With both off, this is False and no score/mask
+        # tensors are built, so the baseline forward path stays unchanged.
+        return (
+            self._noise_token_masking_active()
+            or self._informative_token_masking_active()
+        )
+
+    def _guided_score_needed(self):
+        if self.token_mask_score_source == "none":
+            return False
+        noise_needs_score = (
+            self._noise_token_masking_active()
+            and not self.ablate_random_noise_mask
+        )
+        info_needs_score = (
+            self._informative_token_masking_active()
+            and not self.ablate_random_info_mask
+        )
+        return noise_needs_score or info_needs_score
+
+    def _guided_mask_mode(self, enabled, ablate_random, token_scores, prefix):
+        if not enabled:
+            return "disabled"
+        if ablate_random:
+            return "random_ablate"
+        if token_scores is None:
+            return "random_fallback"
+        return f"guided_{self.token_mask_score_source}_{prefix}"
+
+    def _compute_guided_token_scores(self, caption_ids, attention_mask):
+        if not self._guided_score_needed():
+            return None
+
+        with torch.no_grad():
+            score_tokens = self.base_model.encode_text(caption_ids)
+            batch_index = torch.arange(score_tokens.shape[0], device=score_tokens.device)
+            text_global = score_tokens[batch_index, caption_ids.argmax(dim=-1)]
+            token_scores = compute_token_importance_scores(
+                input_ids=caption_ids,
+                token_embeddings=score_tokens,
+                global_embedding=text_global,
+                attention_mask=attention_mask,
+                special_token_ids=self.guided_mask_special_token_ids,
+                score_source=self.token_mask_score_source,
+                detach_score=self.guided_mask_detach_score,
+            )
+        return token_scores
+
+    def _build_guided_mask_aux(self, caption_ids):
+        if not self._guided_text_masking_requested():
+            return None
+
+        # Shared lightweight score source for A/B. A samples low-score tokens;
+        # B samples high-score tokens. Random ablations skip score computation.
+        attention_mask = caption_ids.ne(0)
+        candidate_mask = attention_mask.clone()
+        for token_id in self.guided_mask_special_token_ids:
+            candidate_mask = candidate_mask & caption_ids.ne(int(token_id))
+        token_scores = self._compute_guided_token_scores(
+            caption_ids=caption_ids,
+            attention_mask=attention_mask,
+        )
+        noise_mask_mode = self._guided_mask_mode(
+            enabled=self._noise_token_masking_active(),
+            ablate_random=self.ablate_random_noise_mask,
+            token_scores=token_scores,
+            prefix="noise",
+        )
+        info_mask_mode = self._guided_mask_mode(
+            enabled=self._informative_token_masking_active(),
+            ablate_random=self.ablate_random_info_mask,
+            token_scores=token_scores,
+            prefix="info",
+        )
+        noise_mask = build_noise_token_mask(
+            input_ids=caption_ids,
+            attention_mask=attention_mask,
+            token_scores=token_scores,
+            enabled=self.use_noise_token_masking,
+            is_training=self.training,
+            mask_ratio=self.noise_mask_ratio,
+            min_keep=self.token_mask_min_keep,
+            special_token_ids=self.guided_mask_special_token_ids,
+            ablate_random=self.ablate_random_noise_mask,
+        )
+        info_mask = build_informative_token_mask(
+            input_ids=caption_ids,
+            attention_mask=attention_mask,
+            token_scores=token_scores,
+            enabled=self.use_informative_token_masking,
+            is_training=self.training,
+            mask_ratio=self.info_mask_ratio,
+            min_keep=self.token_mask_min_keep,
+            special_token_ids=self.guided_mask_special_token_ids,
+            ablate_random=self.ablate_random_info_mask,
+        )
+
+        aux = {
+            "token_scores": token_scores,
+            "noise_mask": noise_mask,
+            "info_mask": info_mask,
+            "guided_mask_stats": None,
+            "noise_mask_mode": noise_mask_mode,
+            "info_mask_mode": info_mask_mode,
+        }
+        if self.debug_print_token_mask_stats:
+            aux["guided_mask_stats"] = summarize_mask_stats(
+                token_scores=token_scores,
+                noise_mask=noise_mask,
+                info_mask=info_mask,
+                candidate_mask=candidate_mask,
+                enabled_noise=self.use_noise_token_masking,
+                enabled_info=self.use_informative_token_masking,
+                noise_mask_mode=noise_mask_mode,
+                info_mask_mode=info_mask_mode,
+            )
+        return aux
+
+    def _apply_noise_mask_to_caption_ids(self, caption_ids, guided_mask_aux=None):
+        # A only changes the main training text encoder input.
+        if guided_mask_aux is None:
+            return caption_ids
+        return apply_guided_mask_to_input_ids(
+            caption_ids,
+            token_mask=guided_mask_aux.get("noise_mask"),
+            mask_token_id=self.guided_mask_token_id,
+            enabled=self._noise_token_masking_active(),
+        )
+
+    def _apply_guided_masks_to_mlm_ids(self, mlm_ids, guided_mask_aux=None):
+        if guided_mask_aux is None:
+            return mlm_ids
+
+        masked_ids = mlm_ids
+        if self.use_noise_token_masking and self.noise_mask_apply_to_mlm:
+            masked_ids = apply_guided_mask_to_input_ids(
+                masked_ids,
+                token_mask=guided_mask_aux.get("noise_mask"),
+                mask_token_id=self.guided_mask_token_id,
+                enabled=self._noise_token_masking_active(),
+            )
+        return masked_ids
+
+    def _guided_informative_mlm_active(self):
+        return self._informative_token_masking_active() and self.info_mask_apply_to_mlm
+
+    def _build_guided_informative_mlm(self, caption_ids, guided_mask_aux=None):
+        # B only changes MLM/MTP prediction targets and reuses the existing MLM head.
+        if not self._guided_informative_mlm_active():
+            return None, None
+        if guided_mask_aux is None:
+            return None, None
+        return build_guided_mlm_inputs_and_labels(
+            input_ids=caption_ids,
+            informative_mask=guided_mask_aux.get("info_mask"),
+            mask_token_id=self.guided_mask_token_id,
+            ignore_index=0,
+            enabled=True,
+        )
 
     def _extract_patch_tokens(self, image_tokens, reference_feat=None):
         """
@@ -1112,8 +1352,17 @@ class IRRA(nn.Module):
         )
 
         # 2) Text pooled global branch (before uncertainty heads).
-        _, l_c_raw, text_mu, text_logvar = self._encode_caption_ids_with_uncertainty(
-            caption_ids
+        # A/B boundary:
+        # - A masks low-score tokens in this main text input during training.
+        # - B does not touch this input; it only builds guided MLM/MTP targets below.
+        # - A+B can run together using separate masks; both off keeps caption_ids.
+        guided_mask_aux = self._build_guided_mask_aux(caption_ids)
+        caption_ids_for_text = self._apply_noise_mask_to_caption_ids(
+            caption_ids,
+            guided_mask_aux=guided_mask_aux,
+        )
+        text_tokens, l_c_raw, text_mu, text_logvar = (
+            self._encode_caption_ids_with_uncertainty(caption_ids_for_text)
         )
         text_feat_full = None
         text_feat_rgb = None
@@ -1171,6 +1420,37 @@ class IRRA(nn.Module):
             ret.update(img_local_stats)
         if rgbt_moe_adapter_aux is not None:
             ret["rgbt_moe_adapter_aux"] = rgbt_moe_adapter_aux
+        if guided_mask_aux is not None:
+            ret["guided_mask_aux"] = guided_mask_aux
+            guided_mask_stats = guided_mask_aux.get("guided_mask_stats", None)
+            if isinstance(guided_mask_stats, dict):
+                ret["noise_mask_avg_tokens"] = f_c.new_tensor(
+                    guided_mask_stats.get("avg_noise_mask_tokens", 0.0)
+                )
+                ret["noise_mask_valid_ratio"] = f_c.new_tensor(
+                    guided_mask_stats.get("noise_mask_valid_ratio", 0.0)
+                )
+                ret["info_mask_avg_tokens"] = f_c.new_tensor(
+                    guided_mask_stats.get("avg_info_mask_tokens", 0.0)
+                )
+                ret["info_mask_valid_ratio"] = f_c.new_tensor(
+                    guided_mask_stats.get("info_mask_valid_ratio", 0.0)
+                )
+                ret["noise_info_overlap_ratio"] = f_c.new_tensor(
+                    guided_mask_stats.get("noise_info_overlap_ratio", 0.0)
+                )
+                ret["token_score_mean"] = f_c.new_tensor(
+                    guided_mask_stats.get("token_score_valid_mean", 0.0)
+                )
+                ret["token_score_var"] = f_c.new_tensor(
+                    guided_mask_stats.get("token_score_var", 0.0)
+                )
+                ret["noise_mask_mode"] = guided_mask_stats.get(
+                    "noise_mask_mode", "none"
+                )
+                ret["info_mask_mode"] = guided_mask_stats.get(
+                    "info_mask_mode", "none"
+                )
         ret.update(
             {
                 "v_rgb_c": v_rgb_c,  # [B, C]
@@ -1256,28 +1536,61 @@ class IRRA(nn.Module):
             ret.update({"txt_acc": (text_pred == batch["pids"]).float().mean()})
 
         # Keep local/MLM branch with RGB image tokens to minimize changes.
+        # B on: replace random MLM targets with guided informative targets.
+        # B off: use the dataloader's original random mlm_ids/mlm_labels unchanged.
         if "mlm" in self.current_task:
-            mlm_ids = batch["mlm_ids"]
+            guided_mlm_active = False
+            mlm_ids, mlm_labels = self._build_guided_informative_mlm(
+                caption_ids,
+                guided_mask_aux=guided_mask_aux,
+            )
+            if mlm_ids is not None and mlm_labels is not None:
+                guided_mlm_active = True
+            else:
+                mlm_ids = self._apply_guided_masks_to_mlm_ids(
+                    batch["mlm_ids"],
+                    guided_mask_aux=guided_mask_aux,
+                )
+                mlm_labels = batch["mlm_labels"]
+
             mlm_feats = self.base_model.encode_text(mlm_ids)  # [B, L_t, C]
             x = self.cross_former(mlm_feats, rgb_tokens, rgb_tokens)  # [B, L_t, C]
             x = self.mlm_head(x)  # [B, L_t, vocab_size]
 
             scores = x.float().reshape(-1, self.args.vocab_size)  # [B*L_t, V]
-            mlm_labels = batch["mlm_labels"].reshape(-1)  # [B*L_t]
-            raw_mlm_loss = objectives.compute_mlm(scores, mlm_labels)
+            mlm_labels = mlm_labels.reshape(-1)  # [B*L_t]
+            mlm_label_mask = mlm_labels.ne(0)
+            if bool(mlm_label_mask.any()):
+                raw_mlm_loss = objectives.compute_mlm(scores, mlm_labels)
+            else:
+                raw_mlm_loss = scores.new_zeros(())
+            guided_mtp_scale = (
+                self.lambda_guided_mtp if guided_mlm_active else 1.0
+            )
             ret.update(
                 {
                     # Legacy weighted key kept for backward compatibility.
-                    "mlm_loss": raw_mlm_loss * self.args.mlm_loss_weight
+                    "mlm_loss": (
+                        raw_mlm_loss
+                        * self.args.mlm_loss_weight
+                        * guided_mtp_scale
+                    )
                 }
             )
             # Requested probabilistic-training key (unweighted).
-            ret.update({"loss_mlm": raw_mlm_loss})
+            ret.update({"loss_mlm": raw_mlm_loss * guided_mtp_scale})
 
             pred = scores.max(1)[1]
-            mlm_label_idx = torch.nonzero(mlm_labels)
-            acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
+            mlm_label_idx = torch.nonzero(mlm_label_mask, as_tuple=False).flatten()
+            if mlm_label_idx.numel() > 0:
+                acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
+            else:
+                acc = scores.new_zeros(())
             ret.update({"mlm_acc": acc})
+            if guided_mlm_active:
+                guided_valid_tokens = mlm_label_mask.sum()
+                ret["guided_mtp_valid_tokens"] = guided_valid_tokens.float()
+                ret["guided_mtp_lambda"] = scores.new_tensor(guided_mtp_scale)
 
         return ret
 

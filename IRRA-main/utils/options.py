@@ -186,6 +186,27 @@ def get_args():
     parser.add_argument("--text_length", type=int, default=77)
     parser.add_argument("--vocab_size", type=int, default=49408)
 
+    ######################## guided text token masking settings ########################
+    # Guided text-side masking switches. They are no-op by default and do not add
+    # standalone loss terms.
+    parser.add_argument("--use_noise_token_masking", default=False, action='store_true', help="enable guided noisy-token masking")
+    parser.add_argument("--use_informative_token_masking", default=False, action='store_true', help="enable guided informative-token MLM/MTP targets")
+    parser.add_argument("--noise_mask_ratio", type=float, default=0.15, help="base ratio for noisy-token masking")
+    parser.add_argument("--info_mask_ratio", type=float, default=0.15, help="base ratio for informative-token masking")
+    parser.add_argument("--token_mask_score_source", type=str, default="none", choices=["none", "grad_attn", "attn", "grad"], help="token score source for guided masking; non-none uses the current lite text-feature proxy")
+    parser.add_argument("--token_mask_min_keep", type=int, default=1, help="minimum number of non-special tokens to keep per text")
+    parser.add_argument("--noise_mask_apply_to_mlm", default=False, action='store_true', help="also apply noisy-token mask to MLM input")
+    info_mask_mlm_group = parser.add_mutually_exclusive_group()
+    info_mask_mlm_group.add_argument("--info_mask_apply_to_mlm", dest="info_mask_apply_to_mlm", default=True, action='store_true', help="apply informative-token mask to MLM input")
+    info_mask_mlm_group.add_argument("--no_info_mask_apply_to_mlm", dest="info_mask_apply_to_mlm", action='store_false', help="disable informative-token mask MLM application")
+    guided_detach_group = parser.add_mutually_exclusive_group()
+    guided_detach_group.add_argument("--guided_mask_detach_score", dest="guided_mask_detach_score", default=True, action='store_true', help="detach reserved token scores before guided masking")
+    guided_detach_group.add_argument("--no_guided_mask_detach_score", dest="guided_mask_detach_score", action='store_false', help="keep reserved token scores attached")
+    parser.add_argument("--lambda_guided_mtp", type=float, default=1.0, help="guided informative MLM/MTP loss multiplier")
+    parser.add_argument("--debug_print_token_mask_stats", default=False, action='store_true', help="return guided token-mask debug statistics")
+    parser.add_argument("--ablate_random_noise_mask", default=False, action='store_true', help="use random noisy-token masking ablation")
+    parser.add_argument("--ablate_random_info_mask", default=False, action='store_true', help="use random informative-token masking ablation")
+
     ######################## modality-aware text prompting settings ########################
     parser.add_argument("--use_modality_text_prompt", default=False, action='store_true', help="enable modality-aware text prompting")
     parser.add_argument("--mtp_rgb_ctx_len", type=int, default=4, help="context token budget for rgb-friendly text prompt")

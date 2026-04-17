@@ -1743,6 +1743,15 @@ def do_train(
         "avg_img_local_uncertainty": AverageMeter(),
         "avg_img_local_keep_ratio": AverageMeter(),
         "avg_img_local_weight_entropy": AverageMeter(),
+        "noise_mask_avg_tokens": AverageMeter(),
+        "noise_mask_valid_ratio": AverageMeter(),
+        "info_mask_avg_tokens": AverageMeter(),
+        "info_mask_valid_ratio": AverageMeter(),
+        "noise_info_overlap_ratio": AverageMeter(),
+        "guided_mtp_valid_tokens": AverageMeter(),
+        "guided_mtp_lambda": AverageMeter(),
+        "token_score_mean": AverageMeter(),
+        "token_score_var": AverageMeter(),
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
         "mlm_acc": AverageMeter(),
@@ -2012,6 +2021,43 @@ def do_train(
                 meters["avg_img_local_weight_entropy"].update(
                     _to_scalar(ret["avg_img_local_weight_entropy"]), batch_size
                 )
+            if bool(getattr(args, "debug_print_token_mask_stats", False)):
+                if "noise_mask_avg_tokens" in ret:
+                    meters["noise_mask_avg_tokens"].update(
+                        _to_scalar(ret["noise_mask_avg_tokens"]), batch_size
+                    )
+                if "noise_mask_valid_ratio" in ret:
+                    meters["noise_mask_valid_ratio"].update(
+                        _to_scalar(ret["noise_mask_valid_ratio"]), batch_size
+                    )
+                if "info_mask_avg_tokens" in ret:
+                    meters["info_mask_avg_tokens"].update(
+                        _to_scalar(ret["info_mask_avg_tokens"]), batch_size
+                    )
+                if "info_mask_valid_ratio" in ret:
+                    meters["info_mask_valid_ratio"].update(
+                        _to_scalar(ret["info_mask_valid_ratio"]), batch_size
+                    )
+                if "noise_info_overlap_ratio" in ret:
+                    meters["noise_info_overlap_ratio"].update(
+                        _to_scalar(ret["noise_info_overlap_ratio"]), batch_size
+                    )
+                if "guided_mtp_valid_tokens" in ret:
+                    meters["guided_mtp_valid_tokens"].update(
+                        _to_scalar(ret["guided_mtp_valid_tokens"]), 1
+                    )
+                if "guided_mtp_lambda" in ret:
+                    meters["guided_mtp_lambda"].update(
+                        _to_scalar(ret["guided_mtp_lambda"]), 1
+                    )
+                if "token_score_mean" in ret:
+                    meters["token_score_mean"].update(
+                        _to_scalar(ret["token_score_mean"]), batch_size
+                    )
+                if "token_score_var" in ret:
+                    meters["token_score_var"].update(
+                        _to_scalar(ret["token_score_var"]), batch_size
+                    )
 
             meters["img_acc"].update(_to_scalar(ret.get("img_acc", 0)), batch_size)
             meters["txt_acc"].update(_to_scalar(ret.get("txt_acc", 0)), batch_size)
@@ -2048,6 +2094,13 @@ def do_train(
                         info_str += f", {k}: {v.avg:.4f}"
                 active_layers = ret.get("shared_consistency_active_layers", "none")
                 info_str += f", shared_consistency_active_layers: {active_layers}"
+                if bool(getattr(args, "debug_print_token_mask_stats", False)):
+                    info_str += (
+                        f", noise_mask_mode: {ret.get('noise_mask_mode', 'none')}"
+                    )
+                    info_str += (
+                        f", info_mask_mode: {ret.get('info_mask_mode', 'none')}"
+                    )
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
 
