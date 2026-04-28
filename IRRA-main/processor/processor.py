@@ -1354,15 +1354,32 @@ def _compute_hardneg_aux_terms(args, ret, batch, epoch):
         return {}
 
     zero = batch["images"].new_zeros(())
-    if int(epoch) < int(getattr(args, "hn_start_epoch", 1)):
+    hardneg_version = str(getattr(args, "hardneg_version", "v1")).lower()
+    hn_direction = str(getattr(args, "hn_direction", "both")).lower()
+    lambda_hn = float(getattr(args, "lambda_hn", 0.05))
+
+    def _inactive_hardneg_terms():
         return {
             "loss_hn": zero,
+            "loss_hn_weighted": zero,
             "hn_active": False,
             "hn_num_valid_queries": 0.0,
             "hn_avg_pos_sim": zero,
             "hn_avg_neg_sim": zero,
             "hn_avg_margin_gap": zero,
+            "hn_violation_rate": zero,
+            "hn_t2i_loss": zero,
+            "hn_i2t_loss": zero,
+            "hn_t2i_valid": 0.0,
+            "hn_i2t_valid": 0.0,
+            "hn_avg_top1_neg_sim": zero,
+            "hn_avg_topk_neg_sim": zero,
+            "hn_version": hardneg_version,
+            "hn_direction": "t2i" if hardneg_version == "v1" else hn_direction,
         }
+
+    if int(epoch) < int(getattr(args, "hn_start_epoch", 1)):
+        return _inactive_hardneg_terms()
 
     fused_feat = ret.get("fused_det_feat", ret.get("fused_prob_feat", None))
     text_feat = ret.get("text_det_feat", ret.get("text_prob_feat", None))
@@ -1373,21 +1390,50 @@ def _compute_hardneg_aux_terms(args, ret, batch, epoch):
             "and batch['pids']."
         )
 
-    hn_out = objectives.compute_hard_negative_aux_loss(
-        query_features=text_feat,
-        gallery_features=fused_feat,
-        query_pid=pids,
-        gallery_pid=pids,
-        margin=float(getattr(args, "hn_margin", 0.05)),
-        topn=int(getattr(args, "hn_topn", 3)),
-    )
+    if hardneg_version == "v1":
+        hn_out = objectives.compute_hard_negative_aux_loss(
+            query_features=text_feat,
+            gallery_features=fused_feat,
+            query_pid=pids,
+            gallery_pid=pids,
+            margin=float(getattr(args, "hn_margin", 0.05)),
+            topn=int(getattr(args, "hn_topn", 3)),
+        )
+        hn_direction = "t2i"
+    elif hardneg_version == "v2":
+        hn_out = objectives.compute_hard_negative_aux_loss_v2(
+            text_features=text_feat,
+            image_features=fused_feat,
+            text_pid=pids,
+            image_pid=pids,
+            margin=float(getattr(args, "hn_margin", 0.05)),
+            topn=int(getattr(args, "hn_topn", 3)),
+            temperature=float(getattr(args, "hn_temperature", 0.07)),
+            loss_type=str(getattr(args, "hn_loss_type", "softplus")).lower(),
+            direction=hn_direction,
+            false_neg_margin=float(getattr(args, "hn_false_neg_margin", 0.0)),
+        )
+    else:
+        raise ValueError(f"Unsupported hardneg_version={hardneg_version}.")
+
+    loss_hn = hn_out["loss"]
     return {
-        "loss_hn": hn_out["loss"],
+        "loss_hn": loss_hn,
+        "loss_hn_weighted": loss_hn * lambda_hn,
         "hn_active": True,
         "hn_num_valid_queries": hn_out["num_valid_queries"],
         "hn_avg_pos_sim": hn_out["avg_pos_sim"],
         "hn_avg_neg_sim": hn_out["avg_neg_sim"],
         "hn_avg_margin_gap": hn_out["avg_margin_gap"],
+        "hn_violation_rate": hn_out.get("violation_rate", zero),
+        "hn_t2i_loss": hn_out.get("t2i_loss", loss_hn),
+        "hn_i2t_loss": hn_out.get("i2t_loss", zero),
+        "hn_t2i_valid": hn_out.get("t2i_valid", hn_out["num_valid_queries"]),
+        "hn_i2t_valid": hn_out.get("i2t_valid", 0.0),
+        "hn_avg_top1_neg_sim": hn_out.get("avg_top1_neg_sim", zero),
+        "hn_avg_topk_neg_sim": hn_out.get("avg_topk_neg_sim", hn_out["avg_neg_sim"]),
+        "hn_version": hardneg_version,
+        "hn_direction": hn_direction,
     }
 
 
@@ -1396,7 +1442,9 @@ def _add_hardneg_aux_to_total_loss(args, total_loss, ret, epoch):
         return total_loss
     if int(epoch) < int(getattr(args, "hn_start_epoch", 5)):
         return total_loss
-    if "loss_hn" in ret:
+    if "loss_hn_weighted" in ret:
+        total_loss = total_loss + ret["loss_hn_weighted"]
+    elif "loss_hn" in ret:
         total_loss = total_loss + float(getattr(args, "lambda_hn", 0.05)) * ret["loss_hn"]
     return total_loss
 
@@ -1797,11 +1845,19 @@ def do_train(
         "shared_cons_valid_rgb_count": AverageMeter(),
         "shared_cons_valid_thermal_count": AverageMeter(),
         "loss_hn": AverageMeter(),
+        "loss_hn_weighted": AverageMeter(),
         "hn_active": AverageMeter(),
         "hn_num_valid_queries": AverageMeter(),
         "hn_avg_pos_sim": AverageMeter(),
         "hn_avg_neg_sim": AverageMeter(),
         "hn_avg_margin_gap": AverageMeter(),
+        "hn_violation_rate": AverageMeter(),
+        "hn_t2i_loss": AverageMeter(),
+        "hn_i2t_loss": AverageMeter(),
+        "hn_t2i_valid": AverageMeter(),
+        "hn_i2t_valid": AverageMeter(),
+        "hn_avg_top1_neg_sim": AverageMeter(),
+        "hn_avg_topk_neg_sim": AverageMeter(),
         "loss_proto_v": AverageMeter(),
         "loss_proto_t": AverageMeter(),
         "proto_loss_active": AverageMeter(),
@@ -2021,6 +2077,9 @@ def do_train(
             )
             if getattr(args, "use_hardneg_aux", False):
                 meters["loss_hn"].update(_to_scalar(ret.get("loss_hn", 0)), batch_size)
+                meters["loss_hn_weighted"].update(
+                    _to_scalar(ret.get("loss_hn_weighted", 0)), batch_size
+                )
                 meters["hn_active"].update(_to_scalar(ret.get("hn_active", 0)), 1)
                 meters["hn_num_valid_queries"].update(
                     _to_scalar(ret.get("hn_num_valid_queries", 0)), 1
@@ -2033,6 +2092,23 @@ def do_train(
                 )
                 meters["hn_avg_margin_gap"].update(
                     _to_scalar(ret.get("hn_avg_margin_gap", 0)), batch_size
+                )
+                meters["hn_violation_rate"].update(
+                    _to_scalar(ret.get("hn_violation_rate", 0)), batch_size
+                )
+                meters["hn_t2i_loss"].update(
+                    _to_scalar(ret.get("hn_t2i_loss", 0)), batch_size
+                )
+                meters["hn_i2t_loss"].update(
+                    _to_scalar(ret.get("hn_i2t_loss", 0)), batch_size
+                )
+                meters["hn_t2i_valid"].update(_to_scalar(ret.get("hn_t2i_valid", 0)), 1)
+                meters["hn_i2t_valid"].update(_to_scalar(ret.get("hn_i2t_valid", 0)), 1)
+                meters["hn_avg_top1_neg_sim"].update(
+                    _to_scalar(ret.get("hn_avg_top1_neg_sim", 0)), batch_size
+                )
+                meters["hn_avg_topk_neg_sim"].update(
+                    _to_scalar(ret.get("hn_avg_topk_neg_sim", 0)), batch_size
                 )
             meters["loss_proto_v"].update(
                 _to_scalar(ret.get("loss_proto_v", 0)), batch_size
@@ -2161,6 +2237,15 @@ def do_train(
 
             if (n_iter + 1) % log_period == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
+                hardneg_debug_meter_names = {
+                    "hn_t2i_loss",
+                    "hn_i2t_loss",
+                    "hn_t2i_valid",
+                    "hn_i2t_valid",
+                    "hn_avg_top1_neg_sim",
+                    "hn_avg_topk_neg_sim",
+                }
+                debug_hardneg_stats = bool(getattr(args, "debug_hardneg_stats", False))
                 for k, v in meters.items():
                     if v.count > 0:
                         if (
@@ -2172,9 +2257,18 @@ def do_train(
                             }
                         ):
                             continue
+                        if (not debug_hardneg_stats) and k in hardneg_debug_meter_names:
+                            continue
                         info_str += f", {k}: {v.avg:.4f}"
                 active_layers = ret.get("shared_consistency_active_layers", "none")
                 info_str += f", shared_consistency_active_layers: {active_layers}"
+                if bool(getattr(args, "use_hardneg_aux", False)):
+                    info_str += (
+                        f", hn_version: {ret.get('hn_version', getattr(args, 'hardneg_version', 'v1'))}"
+                    )
+                    info_str += (
+                        f", hn_direction: {ret.get('hn_direction', getattr(args, 'hn_direction', 'both'))}"
+                    )
                 if bool(getattr(args, "debug_print_token_mask_stats", False)):
                     info_str += (
                         f", noise_mask_mode: {ret.get('noise_mask_mode', 'none')}"

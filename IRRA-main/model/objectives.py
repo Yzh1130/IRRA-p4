@@ -370,13 +370,271 @@ def compute_hard_negative_aux_loss(
     margin_gap = margin - pos_sim + hardneg_sim
     per_query_loss = F.relu(margin_gap)
     loss = per_query_loss[valid_query_mask].mean()
+    valid_margin_gap = margin_gap[valid_query_mask]
+    valid_top1_neg_sim = topk_neg_sim.masked_fill(~valid_topk_mask, float("-inf")).max(
+        dim=1
+    ).values[valid_query_mask]
 
     return {
         "loss": loss,
         "avg_pos_sim": pos_sim[valid_query_mask].mean(),
         "avg_neg_sim": hardneg_sim[valid_query_mask].mean(),
-        "avg_margin_gap": margin_gap[valid_query_mask].mean(),
+        "avg_margin_gap": valid_margin_gap.mean(),
+        "violation_rate": valid_margin_gap.gt(0).float().mean(),
+        "avg_top1_neg_sim": valid_top1_neg_sim.mean(),
+        "avg_topk_neg_sim": hardneg_sim[valid_query_mask].mean(),
         "num_valid_queries": float(valid_query_mask.sum().item()),
+    }
+
+
+def _empty_hard_negative_v2_output(reference):
+    zero = reference.new_zeros(())
+    return {
+        "loss": zero,
+        "avg_pos_sim": zero,
+        "avg_neg_sim": zero,
+        "avg_margin_gap": zero,
+        "violation_rate": zero,
+        "avg_top1_neg_sim": zero,
+        "avg_topk_neg_sim": zero,
+        "num_valid_queries": 0.0,
+        "t2i_loss": zero,
+        "i2t_loss": zero,
+        "t2i_valid": 0.0,
+        "i2t_valid": 0.0,
+    }
+
+
+def _compute_hard_negative_v2_direction(
+    sim_matrix,
+    query_pid,
+    gallery_pid,
+    margin,
+    topn,
+    temperature,
+    loss_type,
+    false_neg_margin=0.0,
+):
+    zero = sim_matrix.new_zeros(())
+    finite_sim_mask = torch.isfinite(sim_matrix)
+    sim_matrix = torch.nan_to_num(
+        sim_matrix, nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp_(min=-1.0, max=1.0)
+
+    pos_mask = query_pid.unsqueeze(1).eq(gallery_pid.unsqueeze(0))
+    neg_mask = ~pos_mask
+    valid_pos_mask = pos_mask & finite_sim_mask
+    valid_neg_mask = neg_mask & finite_sim_mask
+
+    pos_count = valid_pos_mask.sum(dim=1)
+    if not (pos_count > 0).any():
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "violation_rate": zero,
+            "avg_top1_neg_sim": zero,
+            "avg_topk_neg_sim": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    pos_sim = (sim_matrix * valid_pos_mask.float()).sum(dim=1) / pos_count.clamp_min(
+        1
+    ).float()
+
+    if false_neg_margin > 0:
+        false_neg_mask = valid_neg_mask & (
+            sim_matrix >= (pos_sim.unsqueeze(1) - float(false_neg_margin))
+        )
+        valid_neg_mask = valid_neg_mask & ~false_neg_mask
+
+    neg_count = valid_neg_mask.sum(dim=1)
+    valid_query_mask = (pos_count > 0) & (neg_count > 0)
+    if not valid_query_mask.any():
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "violation_rate": zero,
+            "avg_top1_neg_sim": zero,
+            "avg_topk_neg_sim": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    masked_neg_sim = sim_matrix.masked_fill(~valid_neg_mask, float("-inf"))
+    topk = min(int(topn), masked_neg_sim.shape[1])
+    topk_neg_sim = torch.topk(
+        masked_neg_sim, k=topk, dim=1, largest=True, sorted=True
+    ).values
+    valid_topk_mask = torch.isfinite(topk_neg_sim)
+    hardneg_count = valid_topk_mask.sum(dim=1)
+    valid_query_mask = valid_query_mask & (hardneg_count > 0)
+    if not valid_query_mask.any():
+        return {
+            "loss": zero,
+            "avg_pos_sim": zero,
+            "avg_neg_sim": zero,
+            "avg_margin_gap": zero,
+            "violation_rate": zero,
+            "avg_top1_neg_sim": zero,
+            "avg_topk_neg_sim": zero,
+            "num_valid_queries": 0.0,
+        }
+
+    topk_neg_for_lse = topk_neg_sim.masked_fill(~valid_topk_mask, float("-inf"))
+    hardneg_sim = torch.logsumexp(topk_neg_for_lse / temperature, dim=1) * temperature
+    topk_mean_sim = topk_neg_sim.masked_fill(~valid_topk_mask, 0.0).sum(dim=1) / (
+        hardneg_count.clamp_min(1).float()
+    )
+    top1_neg_sim = topk_neg_sim[:, 0]
+
+    margin_gap = hardneg_sim - pos_sim + margin
+    if loss_type == "softplus":
+        per_query_loss = F.softplus(margin_gap / temperature) * temperature
+    elif loss_type == "logsumexp":
+        pairwise_gap = (
+            topk_neg_for_lse - pos_sim.unsqueeze(1) + margin
+        ) / temperature
+        per_query_loss = F.softplus(torch.logsumexp(pairwise_gap, dim=1)) * temperature
+    else:
+        raise ValueError(
+            f"hn_loss_type must be 'softplus' or 'logsumexp', got {loss_type}."
+        )
+
+    valid_loss = per_query_loss[valid_query_mask]
+    valid_margin_gap = margin_gap[valid_query_mask]
+    return {
+        "loss": valid_loss.mean(),
+        "avg_pos_sim": pos_sim[valid_query_mask].mean(),
+        "avg_neg_sim": hardneg_sim[valid_query_mask].mean(),
+        "avg_margin_gap": valid_margin_gap.mean(),
+        "violation_rate": valid_margin_gap.gt(0).float().mean(),
+        "avg_top1_neg_sim": top1_neg_sim[valid_query_mask].mean(),
+        "avg_topk_neg_sim": topk_mean_sim[valid_query_mask].mean(),
+        "num_valid_queries": float(valid_query_mask.sum().item()),
+    }
+
+
+def compute_hard_negative_aux_loss_v2(
+    text_features,
+    image_features,
+    text_pid,
+    image_pid=None,
+    margin=0.05,
+    topn=3,
+    temperature=0.07,
+    loss_type="softplus",
+    direction="both",
+    false_neg_margin=0.0,
+    epsilon=1e-8,
+):
+    """
+    Stable batch-internal hard-negative auxiliary loss over text-image similarities.
+
+    Positives are all same-pid pairs. Negatives are different-pid pairs. Each anchor
+    uses the top-k hardest in-batch negatives and a smooth softplus/logsumexp loss.
+    """
+    if topn <= 0:
+        raise ValueError(f"hn_topn must be > 0, got {topn}.")
+    if temperature <= 0:
+        raise ValueError(f"hn_temperature must be > 0, got {temperature}.")
+    if text_features.dim() != 2 or image_features.dim() != 2:
+        raise ValueError(
+            "Hard-negative v2 expects 2D features, "
+            f"got {tuple(text_features.shape)} and {tuple(image_features.shape)}."
+        )
+    if direction not in {"t2i", "i2t", "both"}:
+        raise ValueError(f"hn_direction must be t2i, i2t or both, got {direction}.")
+
+    if image_pid is None:
+        image_pid = text_pid
+    text_pid = text_pid.reshape(-1)
+    image_pid = image_pid.reshape(-1)
+    if text_features.shape[0] != text_pid.shape[0]:
+        raise ValueError(
+            "text_features and text_pid must share the same batch dimension, "
+            f"got {text_features.shape[0]} and {text_pid.shape[0]}."
+        )
+    if image_features.shape[0] != image_pid.shape[0]:
+        raise ValueError(
+            "image_features and image_pid must share the same batch dimension, "
+            f"got {image_features.shape[0]} and {image_pid.shape[0]}."
+        )
+
+    zero = text_features.new_zeros(())
+    if text_features.shape[0] == 0 or image_features.shape[0] == 0:
+        return _empty_hard_negative_v2_output(text_features)
+
+    text_features = torch.nan_to_num(
+        text_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    image_features = torch.nan_to_num(
+        image_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    text_norm = text_features / text_features.norm(dim=1, keepdim=True).clamp_min(
+        epsilon
+    )
+    image_norm = image_features / image_features.norm(dim=1, keepdim=True).clamp_min(
+        epsilon
+    )
+    sim_matrix = text_norm @ image_norm.t()
+
+    t2i = _compute_hard_negative_v2_direction(
+        sim_matrix=sim_matrix,
+        query_pid=text_pid,
+        gallery_pid=image_pid,
+        margin=margin,
+        topn=topn,
+        temperature=temperature,
+        loss_type=loss_type,
+        false_neg_margin=false_neg_margin,
+    )
+    i2t = _compute_hard_negative_v2_direction(
+        sim_matrix=sim_matrix.t(),
+        query_pid=image_pid,
+        gallery_pid=text_pid,
+        margin=margin,
+        topn=topn,
+        temperature=temperature,
+        loss_type=loss_type,
+        false_neg_margin=false_neg_margin,
+    )
+
+    if direction == "t2i":
+        loss = t2i["loss"]
+        selected = [t2i]
+    elif direction == "i2t":
+        loss = i2t["loss"]
+        selected = [i2t]
+    else:
+        loss = 0.5 * (t2i["loss"] + i2t["loss"])
+        selected = [t2i, i2t]
+
+    total_valid = sum(float(item["num_valid_queries"]) for item in selected)
+
+    def _weighted_stat(key):
+        if total_valid <= 0:
+            return zero
+        out = zero
+        for item in selected:
+            out = out + item[key] * float(item["num_valid_queries"])
+        return out / total_valid
+
+    return {
+        "loss": loss,
+        "avg_pos_sim": _weighted_stat("avg_pos_sim"),
+        "avg_neg_sim": _weighted_stat("avg_neg_sim"),
+        "avg_margin_gap": _weighted_stat("avg_margin_gap"),
+        "violation_rate": _weighted_stat("violation_rate"),
+        "avg_top1_neg_sim": _weighted_stat("avg_top1_neg_sim"),
+        "avg_topk_neg_sim": _weighted_stat("avg_topk_neg_sim"),
+        "num_valid_queries": total_valid,
+        "t2i_loss": t2i["loss"],
+        "i2t_loss": i2t["loss"],
+        "t2i_valid": t2i["num_valid_queries"],
+        "i2t_valid": i2t["num_valid_queries"],
     }
 
 

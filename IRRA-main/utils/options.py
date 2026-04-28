@@ -46,6 +46,12 @@ def get_args():
     parser.add_argument("--hn_margin", type=float, default=0.05, help="margin used by hard-negative auxiliary hinge loss")
     parser.add_argument("--hn_topn", type=int, default=3, help="average the top-n hardest in-batch negatives per query")
     parser.add_argument("--hn_start_epoch", type=int, default=5, help="1-based epoch index to start hard-negative auxiliary loss")
+    parser.add_argument("--hardneg_version", type=str, default="v1", choices=["v1", "v2"], help="hard-negative auxiliary loss version")
+    parser.add_argument("--hn_temperature", type=float, default=0.07, help="temperature for hard-negative v2 softplus/logsumexp scaling")
+    parser.add_argument("--hn_loss_type", type=str, default="softplus", choices=["softplus", "logsumexp"], help="hard-negative v2 loss form")
+    parser.add_argument("--hn_direction", type=str, default="both", choices=["t2i", "i2t", "both"], help="hard-negative v2 direction")
+    parser.add_argument("--hn_false_neg_margin", type=float, default=0.0, help="optional hard-negative v2 false-negative guard margin")
+    parser.add_argument("--debug_hardneg_stats", default=False, action='store_true', help="print extra hard-negative auxiliary stats")
 
     ######################## global uncertainty feature settings ########################
     # Feature-level uncertainty modeling over global embeddings only.
