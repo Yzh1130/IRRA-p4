@@ -1008,6 +1008,23 @@ def _build_total_loss(args, ret):
     return total_loss
 
 
+def _get_caption_weight_for_loss(args, batch, apply_flag_name, default=True):
+    if not bool(getattr(args, "use_synth_loss_weighting", False)):
+        return None
+    if not bool(getattr(args, apply_flag_name, default)):
+        return None
+
+    caption_weight = batch.get("caption_weight", None)
+    if caption_weight is None:
+        return None
+    caption_weight = caption_weight.float().reshape(-1)
+    if caption_weight.numel() == 0:
+        return None
+    if bool(torch.all(caption_weight.eq(1.0)).item()):
+        return None
+    return caption_weight
+
+
 def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
     if not bool(getattr(args, "use_rgbt_moe_adapter", False)):
         return {}
@@ -1264,6 +1281,12 @@ def _compute_mtp_text_prompt_terms(args, ret, batch, epoch):
             "MTP losses require model outputs 'v_rgb_c', 'text_feat_full', "
             "'text_feat_rgb', 'text_feat_th' and batch['pids']."
         )
+    caption_weight_for_sdm = _get_caption_weight_for_loss(
+        args,
+        batch,
+        "synth_weight_apply_to_sdm",
+        default=True,
+    )
 
     temperature = ret.get("temperature", None)
     if temperature is None:
@@ -1274,11 +1297,19 @@ def _compute_mtp_text_prompt_terms(args, ret, batch, epoch):
         logit_scale = f_rgb.new_tensor(1.0 / max(float(temperature), 1e-12))
 
     out["loss_rgb_txt"] = objectives.compute_sdm(
-        f_rgb, e_rgb, pids, logit_scale
+        f_rgb,
+        e_rgb,
+        pids,
+        logit_scale,
+        sample_weight=caption_weight_for_sdm,
     )
     if "thermal_images" in batch and f_th is not None:
         out["loss_th_txt"] = objectives.compute_sdm(
-            f_th, e_th, pids, logit_scale
+            f_th,
+            e_th,
+            pids,
+            logit_scale,
+            sample_weight=caption_weight_for_sdm,
         )
 
     e_rgb_th = F.normalize(e_rgb.float() + e_th.float(), p=2, dim=1)
@@ -1483,7 +1514,7 @@ def update_model_proto_bank_after_step(model, ret, batch):
     )
 
 
-def _mean_positive_pairwise_distance(dist_matrix, pids=None):
+def _mean_positive_pairwise_distance(dist_matrix, pids=None, sample_weight=None):
     """
     Average pairwise distance over positive matches.
 
@@ -1491,13 +1522,49 @@ def _mean_positive_pairwise_distance(dist_matrix, pids=None):
     Otherwise, fallback to diagonal matched pairs (index-aligned assumption).
     """
     if pids is None:
-        return torch.diagonal(dist_matrix).mean()
+        per_sample_dist = torch.diagonal(dist_matrix)
+        if sample_weight is None:
+            return per_sample_dist.mean()
+        sample_weight = sample_weight.to(
+            device=per_sample_dist.device,
+            dtype=per_sample_dist.dtype,
+        ).reshape(-1)
+        weight_sum = sample_weight.sum().clamp_min(1e-8)
+        return (per_sample_dist * sample_weight).sum() / weight_sum
 
     pids = pids.reshape(-1)
     pos_mask = pids.unsqueeze(1).eq(pids.unsqueeze(0))
     if pos_mask.any():
-        return dist_matrix[pos_mask].mean()
-    return torch.diagonal(dist_matrix).mean()
+        if sample_weight is None:
+            return dist_matrix[pos_mask].mean()
+        sample_weight = sample_weight.to(
+            device=dist_matrix.device,
+            dtype=dist_matrix.dtype,
+        ).reshape(-1)
+        if sample_weight.shape[0] != dist_matrix.shape[0]:
+            raise ValueError(
+                "sample_weight for uncertainty loss must have shape [batch_size], "
+                f"got {tuple(sample_weight.shape)} for batch_size={dist_matrix.shape[0]}."
+            )
+        pos_count = pos_mask.sum(dim=1)
+        valid_query = pos_count.gt(0)
+        per_query_dist = (
+            dist_matrix.masked_fill(~pos_mask, 0.0).sum(dim=1)
+            / pos_count.clamp_min(1).to(dist_matrix.dtype)
+        )
+        effective_weight = sample_weight * valid_query.to(sample_weight.dtype)
+        weight_sum = effective_weight.sum().clamp_min(1e-8)
+        return (per_query_dist * effective_weight).sum() / weight_sum
+
+    per_sample_dist = torch.diagonal(dist_matrix)
+    if sample_weight is None:
+        return per_sample_dist.mean()
+    sample_weight = sample_weight.to(
+        device=per_sample_dist.device,
+        dtype=per_sample_dist.dtype,
+    ).reshape(-1)
+    weight_sum = sample_weight.sum().clamp_min(1e-8)
+    return (per_sample_dist * sample_weight).sum() / weight_sum
 
 
 def _compute_uncertainty_alignment_terms(args, ret, batch):
@@ -1545,6 +1612,12 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
     thermal_logvar = ret["thermal_logvar"]
     pids = batch.get("pids", None)
     has_thermal = "thermal_images" in batch
+    caption_weight_for_unc = _get_caption_weight_for_loss(
+        args,
+        batch,
+        "synth_weight_apply_to_unc",
+        default=False,
+    )
 
     eps = float(getattr(args, "uncertainty_eps", 1e-6))
     logvar_min = float(getattr(args, "logvar_min", -6.0))
@@ -1559,7 +1632,11 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
         logvar_min=logvar_min,
         logvar_max=logvar_max,
     )
-    loss_unc_text_rgb = _mean_positive_pairwise_distance(tr_dist, pids)
+    loss_unc_text_rgb = _mean_positive_pairwise_distance(
+        tr_dist,
+        pids,
+        sample_weight=caption_weight_for_unc,
+    )
 
     rt_dist = None
     if has_thermal:
@@ -1586,7 +1663,11 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
             logvar_min=logvar_min,
             logvar_max=logvar_max,
         )
-        loss_unc_text_thermal = _mean_positive_pairwise_distance(tt_dist, pids)
+        loss_unc_text_thermal = _mean_positive_pairwise_distance(
+            tt_dist,
+            pids,
+            sample_weight=caption_weight_for_unc,
+        )
     else:
         loss_unc_text_thermal = loss_unc_text_rgb.new_zeros(())
 
@@ -1676,7 +1757,7 @@ def do_train(
     device = "cuda"
     num_epoch = args.num_epoch
 
-    arguments = {"num_epoch": num_epoch, "iteration": 0}
+    arguments = {"num_epoch": num_epoch, "iteration": 0, "epoch": 0}
 
     logger = logging.getLogger("IRRA.train")
     logger.info("start training")
@@ -2101,6 +2182,30 @@ def do_train(
                     info_str += (
                         f", info_mask_mode: {ret.get('info_mask_mode', 'none')}"
                     )
+                if bool(getattr(args, "debug_print_synth_weight_stats", False)):
+                    caption_is_synth = batch.get("caption_is_synth", None)
+                    caption_weight = batch.get("caption_weight", None)
+                    if caption_is_synth is not None and caption_weight is not None:
+                        caption_is_synth = caption_is_synth.reshape(-1)
+                        caption_weight = caption_weight.float().reshape(-1)
+                        info_str += (
+                            f", [SYNTH_WEIGHT][BATCH] num_synth="
+                            f"{int(caption_is_synth.float().sum().item())}"
+                        )
+                        info_str += (
+                            f" mean_w="
+                            f"{caption_weight.mean().item():.4f}"
+                        )
+                        info_str += (
+                            f" min_w="
+                            f"{caption_weight.min().item():.4f}"
+                        )
+                        info_str += (
+                            f" max_w="
+                            f"{caption_weight.max().item():.4f}"
+                        )
+                    else:
+                        info_str += ", [SYNTH_WEIGHT][BATCH] missing"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
 

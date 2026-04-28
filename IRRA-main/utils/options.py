@@ -264,6 +264,14 @@ def get_args():
     parser.add_argument("--synth_caption_bank_file", type=str, default="", help="json file path of synthetic caption bank")
     parser.add_argument("--synth_caption_keep_per_image", type=int, default=2, help="max synthetic captions appended per image")
     parser.add_argument("--synth_caption_train_mode", type=str, default="append", choices=["append", "off"], help="train-time synthetic caption mode")
+    parser.add_argument("--use_synth_loss_weighting", default=False, action='store_true', help="enable lower per-sample loss weight metadata for synthetic captions")
+    parser.add_argument("--synth_loss_weight", type=float, default=1.0, help="caption_weight assigned to synthetic captions when synth loss weighting is enabled")
+    parser.add_argument("--synth_weight_apply_to_mlm", default=True, action='store_true', help="apply synthetic caption weights to MLM loss")
+    parser.add_argument("--no_synth_weight_apply_to_mlm", dest='synth_weight_apply_to_mlm', action='store_false', help="do not apply synthetic caption weights to MLM loss")
+    parser.add_argument("--synth_weight_apply_to_sdm", default=True, action='store_true', help="apply synthetic caption weights to SDM loss")
+    parser.add_argument("--no_synth_weight_apply_to_sdm", dest='synth_weight_apply_to_sdm', action='store_false', help="do not apply synthetic caption weights to SDM loss")
+    parser.add_argument("--synth_weight_apply_to_unc", default=False, action='store_true', help="apply synthetic caption weights to text-side uncertainty alignment loss")
+    parser.add_argument("--debug_print_synth_weight_stats", default=False, action='store_true', help="print batch synthetic-caption weight stats every log period")
     parser.add_argument("--test", dest='training', default=True, action='store_false')
 
     # Parse CLI args into namespace.

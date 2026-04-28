@@ -120,7 +120,13 @@ def _append_synth_captions_to_train(dataset, args, logger):
     train_mode = str(getattr(args, "synth_caption_train_mode", "append")).lower()
     bank_file = str(getattr(args, "synth_caption_bank_file", ""))
     keep_per_image = int(getattr(args, "synth_caption_keep_per_image", 2))
+    use_synth_loss_weighting = bool(
+        getattr(args, "use_synth_loss_weighting", False)
+    )
+    synth_loss_weight = float(getattr(args, "synth_loss_weight", 1.0))
+    effective_synth_weight = synth_loss_weight if use_synth_loss_weighting else 1.0
 
+    original_train_count = len(dataset.train)
     added_synth_captions = 0
     enabled = use_synth and train_mode == "append"
 
@@ -188,6 +194,21 @@ def _append_synth_captions_to_train(dataset, args, logger):
         "[SYNTH] total_train_captions_after_append=%d",
         len(dataset.train),
     )
+    logger.info("[SYNTH_WEIGHT] enabled=%s", use_synth_loss_weighting)
+    logger.info("[SYNTH_WEIGHT] synth_loss_weight=%.6f", synth_loss_weight)
+    logger.info("[SYNTH_WEIGHT] original_caption_weight=1.0")
+
+    caption_is_synth = [0] * original_train_count + [1] * added_synth_captions
+    caption_weight = (
+        [1.0] * original_train_count
+        + [effective_synth_weight] * added_synth_captions
+    )
+    if len(caption_is_synth) != len(dataset.train) or len(caption_weight) != len(dataset.train):
+        raise RuntimeError(
+            "Synthetic caption metadata length mismatch: "
+            f"metadata={len(caption_weight)}, train={len(dataset.train)}."
+        )
+    return caption_is_synth, caption_weight
 
 
 def build_dataloader(args, tranforms=None):
@@ -199,7 +220,9 @@ def build_dataloader(args, tranforms=None):
     num_classes = len(dataset.train_id_container)
     
     if args.training:
-        _append_synth_captions_to_train(dataset, args, logger)
+        caption_is_synth, caption_weight = _append_synth_captions_to_train(
+            dataset, args, logger
+        )
         # Build transform pipelines for train and validation.
         train_transforms = build_transforms(img_size=args.img_size,
                                             aug=args.img_aug,
@@ -219,6 +242,8 @@ def build_dataloader(args, tranforms=None):
                 mtp_color_drop_mode=str(
                     getattr(args, "mtp_color_drop_mode", "delete")
                 ),
+                caption_is_synth=caption_is_synth,
+                caption_weight=caption_weight,
             )
         else:
             train_set = ImageTextDataset(
@@ -231,6 +256,8 @@ def build_dataloader(args, tranforms=None):
                 mtp_color_drop_mode=str(
                     getattr(args, "mtp_color_drop_mode", "delete")
                 ),
+                caption_is_synth=caption_is_synth,
+                caption_weight=caption_weight,
             )
 
         if args.sampler == 'identity':

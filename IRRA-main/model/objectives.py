@@ -3,7 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def compute_sdm(image_fetures, text_fetures, pid, logit_scale, image_id=None, factor=0.3, epsilon=1e-8):
+def compute_sdm(
+    image_fetures,
+    text_fetures,
+    pid,
+    logit_scale,
+    image_id=None,
+    factor=0.3,
+    epsilon=1e-8,
+    sample_weight=None,
+):
     """
     Similarity Distribution Matching
     """
@@ -41,7 +50,26 @@ def compute_sdm(image_fetures, text_fetures, pid, logit_scale, image_id=None, fa
     t2i_pred = F.softmax(text_proj_image, dim=1)
     t2i_loss = t2i_pred * (F.log_softmax(text_proj_image, dim=1) - torch.log(labels_distribute + epsilon))
 
-    loss = torch.mean(torch.sum(i2t_loss, dim=1)) + torch.mean(torch.sum(t2i_loss, dim=1))
+    i2t_loss = torch.sum(i2t_loss, dim=1)
+    t2i_loss = torch.sum(t2i_loss, dim=1)
+
+    if sample_weight is None:
+        loss = torch.mean(i2t_loss) + torch.mean(t2i_loss)
+    else:
+        sample_weight = sample_weight.to(
+            device=image_fetures.device,
+            dtype=i2t_loss.dtype,
+        ).reshape(-1)
+        if sample_weight.shape[0] != batch_size:
+            raise ValueError(
+                "sample_weight for SDM must have shape [batch_size], got "
+                f"{tuple(sample_weight.shape)} for batch_size={batch_size}."
+            )
+        weight_sum = sample_weight.sum().clamp_min(epsilon)
+        loss = (
+            (i2t_loss * sample_weight).sum() / weight_sum
+            + (t2i_loss * sample_weight).sum() / weight_sum
+        )
 
     return loss
 
@@ -101,7 +129,45 @@ def compute_distribution_sdm_from_distance(
     return loss
 
 
-def compute_mlm(scores, labels):
+def compute_mlm(scores, labels, sample_weight=None, batch_size=None, epsilon=1e-8):
+    if sample_weight is not None:
+        sample_weight = sample_weight.to(
+            device=scores.device,
+            dtype=scores.dtype,
+        ).reshape(-1)
+        if bool(torch.all(sample_weight.eq(1.0)).item()):
+            ce = nn.CrossEntropyLoss(ignore_index=0)
+            return ce(scores, labels)
+        if batch_size is None:
+            batch_size = int(sample_weight.shape[0])
+        if int(batch_size) != int(sample_weight.shape[0]):
+            raise ValueError(
+                "batch_size must match sample_weight length for weighted MLM, got "
+                f"{batch_size} and {sample_weight.shape[0]}."
+            )
+        if scores.shape[0] % int(batch_size) != 0:
+            raise ValueError(
+                "Flattened MLM scores must be divisible by batch_size, got "
+                f"{scores.shape[0]} and {batch_size}."
+            )
+
+        seq_len = scores.shape[0] // int(batch_size)
+        token_loss = F.cross_entropy(
+            scores,
+            labels,
+            ignore_index=0,
+            reduction="none",
+        ).reshape(int(batch_size), seq_len)
+        valid_mask = labels.reshape(int(batch_size), seq_len).ne(0)
+        valid_count = valid_mask.sum(dim=1)
+        valid_sample = valid_count.gt(0)
+        sample_loss = token_loss.sum(dim=1) / valid_count.clamp_min(1).to(
+            token_loss.dtype
+        )
+        effective_weight = sample_weight * valid_sample.to(sample_weight.dtype)
+        weight_sum = effective_weight.sum().clamp_min(epsilon)
+        return (sample_loss * effective_weight).sum() / weight_sum
+
     # label=0 代表非掩码位置，使用 ignore_index=0 忽略这些位置的损失。
     ce = nn.CrossEntropyLoss(ignore_index=0)
     return ce(scores, labels)

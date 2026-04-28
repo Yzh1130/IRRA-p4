@@ -443,6 +443,25 @@ class IRRA(nn.Module):
         self.current_task = [l.strip() for l in loss_names.split("+")]
         print(f"Training Model with {self.current_task} tasks")
 
+    def _get_caption_weight_for_loss(self, batch, apply_flag_name, default=True):
+        if not bool(getattr(self.args, "use_synth_loss_weighting", False)):
+            return None
+        if not bool(getattr(self.args, apply_flag_name, default)):
+            return None
+
+        caption_weight = batch.get("caption_weight", None)
+        if caption_weight is None:
+            return None
+        caption_weight = caption_weight.to(
+            device=batch["caption_ids"].device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        if caption_weight.numel() == 0:
+            return None
+        if bool(torch.all(caption_weight.eq(1.0)).item()):
+            return None
+        return caption_weight
+
     def _init_global_uncertainty_heads(self):
         # Initialize mu head as near-identity projection and logvar head as zeros.
         for head in [self.text_mu_head, self.rgb_mu_head, self.thermal_mu_head]:
@@ -1326,6 +1345,16 @@ class IRRA(nn.Module):
         images = batch["images"]
         thermal_images = batch.get("thermal_images", None)
         caption_ids = batch["caption_ids"]
+        caption_weight_for_sdm = self._get_caption_weight_for_loss(
+            batch,
+            "synth_weight_apply_to_sdm",
+            default=True,
+        )
+        caption_weight_for_mlm = self._get_caption_weight_for_loss(
+            batch,
+            "synth_weight_apply_to_mlm",
+            default=True,
+        )
         caption_ids_full_clean = None
         caption_ids_rgb = None
         caption_ids_th = None
@@ -1495,7 +1524,11 @@ class IRRA(nn.Module):
 
         if "sdm" in self.current_task:
             loss_sdm_prob = objectives.compute_sdm(
-                p_f, p_t, batch["pids"], logit_scale
+                p_f,
+                p_t,
+                batch["pids"],
+                logit_scale,
+                sample_weight=caption_weight_for_sdm,
             )
             ret.update(
                 {
@@ -1508,7 +1541,11 @@ class IRRA(nn.Module):
                 ret.update(
                     {
                         "loss_sdm_det": objectives.compute_sdm(
-                            f_det, t_det, batch["pids"], logit_scale
+                            f_det,
+                            t_det,
+                            batch["pids"],
+                            logit_scale,
+                            sample_weight=caption_weight_for_sdm,
                         )
                     }
                 )
@@ -1561,7 +1598,12 @@ class IRRA(nn.Module):
             mlm_labels = mlm_labels.reshape(-1)  # [B*L_t]
             mlm_label_mask = mlm_labels.ne(0)
             if bool(mlm_label_mask.any()):
-                raw_mlm_loss = objectives.compute_mlm(scores, mlm_labels)
+                raw_mlm_loss = objectives.compute_mlm(
+                    scores,
+                    mlm_labels,
+                    sample_weight=caption_weight_for_mlm,
+                    batch_size=x.shape[0],
+                )
             else:
                 raw_mlm_loss = scores.new_zeros(())
             guided_mtp_scale = (

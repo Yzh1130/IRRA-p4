@@ -104,6 +104,27 @@ if __name__ == "__main__":
         float(getattr(args, "mtp_eval_fusion_beta", 0.10)),
     )
     if args.training:
+        logger.info(
+            "[SYNTH_WEIGHT] use_synth_loss_weighting=%s",
+            bool(getattr(args, "use_synth_loss_weighting", False)),
+        )
+        logger.info(
+            "[SYNTH_WEIGHT] synth_loss_weight=%.6f",
+            float(getattr(args, "synth_loss_weight", 1.0)),
+        )
+        logger.info(
+            "[SYNTH_WEIGHT] apply_to_mlm=%s",
+            bool(getattr(args, "synth_weight_apply_to_mlm", True)),
+        )
+        logger.info(
+            "[SYNTH_WEIGHT] apply_to_sdm=%s",
+            bool(getattr(args, "synth_weight_apply_to_sdm", True)),
+        )
+        logger.info(
+            "[SYNTH_WEIGHT] apply_to_unc=%s",
+            bool(getattr(args, "synth_weight_apply_to_unc", False)),
+        )
+    if args.training:
         save_train_configs(args.output_dir, args)
 
     train_loader, val_img_loader, val_txt_loader, num_classes = (

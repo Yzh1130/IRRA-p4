@@ -67,13 +67,27 @@ class ImageTextDataset(Dataset):
                  text_length: int = 77,
                  truncate: bool = True,
                  use_modality_text_prompt: bool = False,
-                 mtp_color_drop_mode: str = "delete"):
+                 mtp_color_drop_mode: str = "delete",
+                 caption_is_synth=None,
+                 caption_weight=None):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
         self.use_modality_text_prompt = bool(use_modality_text_prompt)
         self.mtp_color_drop_mode = str(mtp_color_drop_mode)
+        self.caption_is_synth = caption_is_synth
+        self.caption_weight = caption_weight
+        if self.caption_is_synth is not None and len(self.caption_is_synth) != len(self.dataset):
+            raise ValueError(
+                "caption_is_synth length must match dataset length, got "
+                f"{len(self.caption_is_synth)} and {len(self.dataset)}."
+            )
+        if self.caption_weight is not None and len(self.caption_weight) != len(self.dataset):
+            raise ValueError(
+                "caption_weight length must match dataset length, got "
+                f"{len(self.caption_weight)} and {len(self.dataset)}."
+            )
         self.tokenizer = SimpleTokenizer()
 
     def __len__(self):
@@ -139,6 +153,8 @@ class ImageTextDataset(Dataset):
             'image_ids': image_id,
             'images': img,
             'caption_ids': tokens,
+            'caption_is_synth': self._get_caption_is_synth(index),
+            'caption_weight': self._get_caption_weight(index),
         }
         if self.use_modality_text_prompt:
             ret['caption_ids_full_clean'] = tokens_full_clean
@@ -148,6 +164,16 @@ class ImageTextDataset(Dataset):
             ret['thermal_images'] = t_img
 
         return ret
+
+    def _get_caption_is_synth(self, index):
+        if self.caption_is_synth is None:
+            return 0
+        return int(self.caption_is_synth[index])
+
+    def _get_caption_weight(self, index):
+        if self.caption_weight is None:
+            return torch.tensor(1.0, dtype=torch.float32)
+        return torch.tensor(float(self.caption_weight[index]), dtype=torch.float32)
 
 
 class ImageDataset(Dataset):
@@ -223,13 +249,27 @@ class ImageTextMLMDataset(Dataset):
                  text_length: int = 77,
                  truncate: bool = True,
                  use_modality_text_prompt: bool = False,
-                 mtp_color_drop_mode: str = "delete"):
+                 mtp_color_drop_mode: str = "delete",
+                 caption_is_synth=None,
+                 caption_weight=None):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
         self.use_modality_text_prompt = bool(use_modality_text_prompt)
         self.mtp_color_drop_mode = str(mtp_color_drop_mode)
+        self.caption_is_synth = caption_is_synth
+        self.caption_weight = caption_weight
+        if self.caption_is_synth is not None and len(self.caption_is_synth) != len(self.dataset):
+            raise ValueError(
+                "caption_is_synth length must match dataset length, got "
+                f"{len(self.caption_is_synth)} and {len(self.dataset)}."
+            )
+        if self.caption_weight is not None and len(self.caption_weight) != len(self.dataset):
+            raise ValueError(
+                "caption_weight length must match dataset length, got "
+                f"{len(self.caption_weight)} and {len(self.dataset)}."
+            )
 
         self.tokenizer = SimpleTokenizer()
 
@@ -299,7 +339,9 @@ class ImageTextMLMDataset(Dataset):
             'images': img,
             'caption_ids': caption_tokens,
             'mlm_ids': mlm_tokens,
-            'mlm_labels': mlm_labels
+            'mlm_labels': mlm_labels,
+            'caption_is_synth': self._get_caption_is_synth(index),
+            'caption_weight': self._get_caption_weight(index),
         }
         if self.use_modality_text_prompt:
             ret['caption_ids_full_clean'] = caption_tokens_full_clean
@@ -309,6 +351,16 @@ class ImageTextMLMDataset(Dataset):
             ret['thermal_images'] = t_img
 
         return ret
+
+    def _get_caption_is_synth(self, index):
+        if self.caption_is_synth is None:
+            return 0
+        return int(self.caption_is_synth[index])
+
+    def _get_caption_weight(self, index):
+        if self.caption_weight is None:
+            return torch.tensor(1.0, dtype=torch.float32)
+        return torch.tensor(float(self.caption_weight[index]), dtype=torch.float32)
 
     def _build_random_masked_tokens_and_labels(self, tokens):
         """
