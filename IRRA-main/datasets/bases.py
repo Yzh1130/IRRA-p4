@@ -60,7 +60,121 @@ def tokenize(caption: str, tokenizer, text_length=77, truncate=True) -> torch.Lo
     return result
 
 
-class ImageTextDataset(Dataset):
+class OfflineHardNegativeMixin:
+    def _init_offline_hardneg(
+        self,
+        offline_hardneg=None,
+        offline_hn_num_neg=1,
+        offline_hn_topk_train=20,
+        offline_hn_sample_mode="random",
+    ):
+        self.offline_hardneg = offline_hardneg
+        if offline_hardneg is None:
+            self.offline_hn_items = {}
+            self.offline_hn_image_lookup = {}
+        else:
+            self.offline_hn_items = offline_hardneg.get("items", {})
+            self.offline_hn_image_lookup = offline_hardneg.get("image_lookup", {})
+        self.offline_hn_num_neg = max(1, int(offline_hn_num_neg))
+        self.offline_hn_topk_train = max(1, int(offline_hn_topk_train))
+        self.offline_hn_sample_mode = str(offline_hn_sample_mode).lower()
+        if self.offline_hn_sample_mode not in {"random", "top1"}:
+            raise ValueError(
+                "offline_hn_sample_mode must be 'random' or 'top1', got "
+                f"{offline_hn_sample_mode}."
+            )
+
+    def _select_offline_hardneg_candidates(self, anchor_key, anchor_pid):
+        if self.offline_hardneg is None:
+            return []
+        candidates = self.offline_hn_items.get(anchor_key, [])
+        candidates = candidates[: self.offline_hn_topk_train]
+        valid_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            neg_key = str(candidate.get("neg_image_key", ""))
+            if neg_key == "":
+                continue
+            neg_record = self.offline_hn_image_lookup.get(neg_key, None)
+            if neg_record is None:
+                continue
+            neg_pid = int(candidate.get("neg_pid", neg_record.get("pid", -1)))
+            if neg_pid == int(anchor_pid):
+                continue
+            valid_candidates.append(
+                {
+                    "neg_key": neg_key,
+                    "neg_pid": neg_pid,
+                    "record": neg_record,
+                }
+            )
+        if self.offline_hn_sample_mode == "top1":
+            return valid_candidates[: self.offline_hn_num_neg]
+        sample_count = min(self.offline_hn_num_neg, len(valid_candidates))
+        if sample_count <= 0:
+            return []
+        return random.sample(valid_candidates, sample_count)
+
+    def _load_offline_hardneg_images(self, neg_record):
+        rgb_img = read_image(neg_record["rgb_path"])
+        if self.transform is not None:
+            rgb_img = self.transform(rgb_img)
+
+        t_path = neg_record.get("t_path", None)
+        t_img = None
+        if t_path is not None:
+            t_img = read_image(t_path)
+            if self.transform is not None:
+                t_img = self.transform(t_img)
+        return rgb_img, t_img
+
+    def _add_offline_hardneg_to_ret(self, ret, pid, img_path):
+        if self.offline_hardneg is None:
+            return ret
+
+        num_neg = self.offline_hn_num_neg
+        anchor_key = osp.basename(str(img_path))
+        selected = self._select_offline_hardneg_candidates(anchor_key, pid)
+
+        zero_rgb = torch.zeros_like(ret["images"])
+        if "thermal_images" in ret:
+            zero_t = torch.zeros_like(ret["thermal_images"])
+        else:
+            zero_t = torch.zeros_like(ret["images"])
+
+        hn_rgb_images = []
+        hn_t_images = []
+        hn_valid_mask = []
+        hn_neg_pid = []
+        hn_neg_key = []
+
+        for candidate in selected:
+            neg_rgb_img, neg_t_img = self._load_offline_hardneg_images(
+                candidate["record"]
+            )
+            hn_rgb_images.append(neg_rgb_img)
+            hn_t_images.append(neg_t_img if neg_t_img is not None else zero_t.clone())
+            hn_valid_mask.append(True)
+            hn_neg_pid.append(int(candidate["neg_pid"]))
+            hn_neg_key.append(candidate["neg_key"])
+
+        while len(hn_rgb_images) < num_neg:
+            hn_rgb_images.append(zero_rgb.clone())
+            hn_t_images.append(zero_t.clone())
+            hn_valid_mask.append(False)
+            hn_neg_pid.append(-1)
+            hn_neg_key.append("")
+
+        ret["hn_rgb_images"] = torch.stack(hn_rgb_images, dim=0)
+        ret["hn_t_images"] = torch.stack(hn_t_images, dim=0)
+        ret["hn_valid_mask"] = torch.tensor(hn_valid_mask, dtype=torch.bool)
+        ret["hn_neg_pid"] = torch.tensor(hn_neg_pid, dtype=torch.long)
+        ret["hn_neg_key"] = hn_neg_key
+        return ret
+
+
+class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
     def __init__(self,
                  dataset,
                  transform=None,
@@ -69,7 +183,11 @@ class ImageTextDataset(Dataset):
                  use_modality_text_prompt: bool = False,
                  mtp_color_drop_mode: str = "delete",
                  caption_is_synth=None,
-                 caption_weight=None):
+                 caption_weight=None,
+                 offline_hardneg=None,
+                 offline_hn_num_neg=1,
+                 offline_hn_topk_train=20,
+                 offline_hn_sample_mode="random"):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -89,6 +207,12 @@ class ImageTextDataset(Dataset):
                 f"{len(self.caption_weight)} and {len(self.dataset)}."
             )
         self.tokenizer = SimpleTokenizer()
+        self._init_offline_hardneg(
+            offline_hardneg=offline_hardneg,
+            offline_hn_num_neg=offline_hn_num_neg,
+            offline_hn_topk_train=offline_hn_topk_train,
+            offline_hn_sample_mode=offline_hn_sample_mode,
+        )
 
     def __len__(self):
         return len(self.dataset)
@@ -163,6 +287,7 @@ class ImageTextDataset(Dataset):
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 
+        self._add_offline_hardneg_to_ret(ret, pid=pid, img_path=img_path)
         return ret
 
     def _get_caption_is_synth(self, index):
@@ -242,7 +367,7 @@ class TextDataset(Dataset):
         return pid, caption
 
 
-class ImageTextMLMDataset(Dataset):
+class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
     def __init__(self,
                  dataset,
                  transform=None,
@@ -251,7 +376,11 @@ class ImageTextMLMDataset(Dataset):
                  use_modality_text_prompt: bool = False,
                  mtp_color_drop_mode: str = "delete",
                  caption_is_synth=None,
-                 caption_weight=None):
+                 caption_weight=None,
+                 offline_hardneg=None,
+                 offline_hn_num_neg=1,
+                 offline_hn_topk_train=20,
+                 offline_hn_sample_mode="random"):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -272,6 +401,12 @@ class ImageTextMLMDataset(Dataset):
             )
 
         self.tokenizer = SimpleTokenizer()
+        self._init_offline_hardneg(
+            offline_hardneg=offline_hardneg,
+            offline_hn_num_neg=offline_hn_num_neg,
+            offline_hn_topk_train=offline_hn_topk_train,
+            offline_hn_sample_mode=offline_hn_sample_mode,
+        )
 
     def __len__(self):
         return len(self.dataset)
@@ -350,6 +485,7 @@ class ImageTextMLMDataset(Dataset):
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 
+        self._add_offline_hardneg_to_ret(ret, pid=pid, img_path=img_path)
         return ret
 
     def _get_caption_is_synth(self, index):

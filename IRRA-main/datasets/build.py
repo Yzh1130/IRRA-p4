@@ -83,6 +83,11 @@ def collate(batch):
         # Stack already-tensor fields along batch dimension.
         elif torch.is_tensor(v[0]):
              batch_tensor_dict.update({k: torch.stack(v)})
+        # Keep metadata strings/lists on CPU; the trainer only moves tensors.
+        elif isinstance(v[0], str):
+            batch_tensor_dict.update({k: v})
+        elif isinstance(v[0], list):
+            batch_tensor_dict.update({k: v})
         else:
             raise TypeError(f"Unexpect data type: {type(v[0])} in a batch.")
 
@@ -113,6 +118,103 @@ def _clone_train_sample_with_caption(sample, caption):
         "Unsupported train sample format for synthetic captions. "
         f"Expected len=4 or len=5, got len={len(sample)}."
     )
+
+
+def _extract_rgbt_paths_from_train_sample(sample):
+    # Legacy: (pid, image_id, img_path, caption)
+    # RGBT:  (pid, image_id, rgb_path, thermal_path, caption)
+    if len(sample) == 5:
+        pid, image_id, rgb_path, t_path, _ = sample
+        return int(pid), int(image_id), str(rgb_path), str(t_path)
+    if len(sample) == 4:
+        pid, image_id, rgb_path, _ = sample
+        return int(pid), int(image_id), str(rgb_path), None
+    raise ValueError(
+        "Unsupported train sample format for offline hard negatives. "
+        f"Expected len=4 or len=5, got len={len(sample)}."
+    )
+
+
+def _build_offline_hardneg_image_lookup(train_samples):
+    image_lookup = {}
+    for sample in train_samples:
+        pid, image_id, rgb_path, t_path = _extract_rgbt_paths_from_train_sample(sample)
+        image_key = op.basename(str(rgb_path))
+        if image_key not in image_lookup:
+            image_lookup[image_key] = {
+                "pid": pid,
+                "image_id": image_id,
+                "rgb_path": rgb_path,
+                "t_path": t_path,
+            }
+    return image_lookup
+
+
+def _load_offline_hardneg_index(dataset, args, logger):
+    if not bool(getattr(args, "use_offline_hardneg", False)):
+        return None
+
+    index_file = str(getattr(args, "offline_hardneg_index_file", ""))
+    if index_file == "":
+        raise ValueError(
+            "use_offline_hardneg=True requires --offline_hardneg_index_file."
+        )
+    if not op.isfile(index_file):
+        raise RuntimeError(
+            f"offline_hardneg_index_file='{index_file}' does not exist."
+        )
+
+    index_data = read_json(index_file)
+    raw_items = index_data.get("items", index_data) if isinstance(index_data, dict) else None
+    if not isinstance(raw_items, dict):
+        raise ValueError(
+            "offline hard-negative index must be a JSON object with an 'items' dict."
+        )
+
+    image_lookup = _build_offline_hardneg_image_lookup(dataset.train)
+    items = {}
+    num_candidates = 0
+    num_missing_neg_keys = 0
+    for anchor_key, candidates in raw_items.items():
+        if not isinstance(candidates, list):
+            continue
+        normalized_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            neg_key = str(candidate.get("neg_image_key", ""))
+            if neg_key == "":
+                continue
+            if neg_key not in image_lookup:
+                num_missing_neg_keys += 1
+                continue
+            normalized_candidates.append(
+                {
+                    "neg_image_key": neg_key,
+                    "neg_pid": int(
+                        candidate.get("neg_pid", image_lookup[neg_key]["pid"])
+                    ),
+                    "score": float(candidate.get("score", 0.0)),
+                }
+            )
+        items[str(anchor_key)] = normalized_candidates
+        num_candidates += len(normalized_candidates)
+
+    logger.info("[OFFHN] enabled=True")
+    logger.info("[OFFHN] index_file=%s", index_file)
+    logger.info("[OFFHN] anchors_in_index=%d", len(items))
+    logger.info("[OFFHN] normalized_candidates=%d", num_candidates)
+    logger.info("[OFFHN] missing_negative_keys=%d", num_missing_neg_keys)
+    logger.info(
+        "[OFFHN] num_neg=%d topk_train=%d sample_mode=%s",
+        int(getattr(args, "offline_hn_num_neg", 1)),
+        int(getattr(args, "offline_hn_topk_train", 20)),
+        str(getattr(args, "offline_hn_sample_mode", "random")),
+    )
+    return {
+        "items": items,
+        "image_lookup": image_lookup,
+    }
 
 
 def _append_synth_captions_to_train(dataset, args, logger):
@@ -223,6 +325,7 @@ def build_dataloader(args, tranforms=None):
         caption_is_synth, caption_weight = _append_synth_captions_to_train(
             dataset, args, logger
         )
+        offline_hardneg = _load_offline_hardneg_index(dataset, args, logger)
         # Build transform pipelines for train and validation.
         train_transforms = build_transforms(img_size=args.img_size,
                                             aug=args.img_aug,
@@ -244,6 +347,14 @@ def build_dataloader(args, tranforms=None):
                 ),
                 caption_is_synth=caption_is_synth,
                 caption_weight=caption_weight,
+                offline_hardneg=offline_hardneg,
+                offline_hn_num_neg=int(getattr(args, "offline_hn_num_neg", 1)),
+                offline_hn_topk_train=int(
+                    getattr(args, "offline_hn_topk_train", 20)
+                ),
+                offline_hn_sample_mode=str(
+                    getattr(args, "offline_hn_sample_mode", "random")
+                ),
             )
         else:
             train_set = ImageTextDataset(
@@ -258,6 +369,14 @@ def build_dataloader(args, tranforms=None):
                 ),
                 caption_is_synth=caption_is_synth,
                 caption_weight=caption_weight,
+                offline_hardneg=offline_hardneg,
+                offline_hn_num_neg=int(getattr(args, "offline_hn_num_neg", 1)),
+                offline_hn_topk_train=int(
+                    getattr(args, "offline_hn_topk_train", 20)
+                ),
+                offline_hn_sample_mode=str(
+                    getattr(args, "offline_hn_sample_mode", "random")
+                ),
             )
 
         if args.sampler == 'identity':

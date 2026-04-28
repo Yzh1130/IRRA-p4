@@ -52,6 +52,16 @@ def get_args():
     parser.add_argument("--hn_direction", type=str, default="both", choices=["t2i", "i2t", "both"], help="hard-negative v2 direction")
     parser.add_argument("--hn_false_neg_margin", type=float, default=0.0, help="optional hard-negative v2 false-negative guard margin")
     parser.add_argument("--debug_hardneg_stats", default=False, action='store_true', help="print extra hard-negative auxiliary stats")
+    parser.add_argument("--use_offline_hardneg", default=False, action='store_true', help="enable offline hard-negative image auxiliary loss")
+    parser.add_argument("--offline_hardneg_index_file", type=str, default="", help="json index file built by tools/build_offline_hardneg_index.py")
+    parser.add_argument("--offline_hn_lambda", type=float, default=0.05, help="weight for offline hard-negative auxiliary loss")
+    parser.add_argument("--offline_hn_margin", type=float, default=0.05, help="margin for offline hard-negative softplus loss")
+    parser.add_argument("--offline_hn_temperature", type=float, default=0.07, help="temperature for offline hard-negative softplus loss")
+    parser.add_argument("--offline_hn_num_neg", type=int, default=1, help="number of offline hard-negative images loaded per sample")
+    parser.add_argument("--offline_hn_topk_train", type=int, default=20, help="candidate pool size used from each offline hard-negative list during training")
+    parser.add_argument("--offline_hn_start_epoch", type=int, default=1, help="1-based epoch index to start offline hard-negative loss")
+    parser.add_argument("--offline_hn_sample_mode", type=str, default="random", choices=["random", "top1"], help="how to sample train-time offline hard negatives")
+    parser.add_argument("--debug_offline_hn_stats", default=False, action='store_true', help="print extra offline hard-negative stats")
 
     ######################## global uncertainty feature settings ########################
     # Feature-level uncertainty modeling over global embeddings only.

@@ -1449,6 +1449,109 @@ def _add_hardneg_aux_to_total_loss(args, total_loss, ret, epoch):
     return total_loss
 
 
+def _compute_offline_hardneg_terms(args, ret, batch, epoch):
+    if not bool(getattr(args, "use_offline_hardneg", False)):
+        return {}
+
+    zero = batch["images"].new_zeros(())
+    lambda_offhn = float(getattr(args, "offline_hn_lambda", 0.05))
+    margin = float(getattr(args, "offline_hn_margin", 0.05))
+    temperature = float(getattr(args, "offline_hn_temperature", 0.07))
+    if temperature <= 0:
+        raise ValueError(
+            f"offline_hn_temperature must be > 0, got {temperature}."
+        )
+
+    def _inactive_offhn_terms():
+        return {
+            "loss_offhn": zero,
+            "loss_offhn_weighted": zero,
+            "offhn_active": False,
+            "offhn_num_valid": 0.0,
+            "offhn_avg_pos_sim": zero,
+            "offhn_avg_neg_sim": zero,
+            "offhn_avg_margin_gap": zero,
+            "offhn_violation_rate": zero,
+            "offhn_lambda": zero.new_tensor(lambda_offhn),
+            "offhn_margin": zero.new_tensor(margin),
+            "offhn_temperature": zero.new_tensor(temperature),
+        }
+
+    if int(epoch) < int(getattr(args, "offline_hn_start_epoch", 1)):
+        return _inactive_offhn_terms()
+
+    text_feat = ret.get("text_det_feat", ret.get("text_prob_feat", None))
+    pos_fused_feat = ret.get("fused_det_feat", ret.get("fused_prob_feat", None))
+    hn_fused_feat = ret.get("hn_fused_det_feat", None)
+    hn_valid_mask = batch.get("hn_valid_mask", None)
+    hn_neg_pid = batch.get("hn_neg_pid", None)
+    pids = batch.get("pids", None)
+    if (
+        text_feat is None
+        or pos_fused_feat is None
+        or hn_fused_feat is None
+        or hn_valid_mask is None
+        or hn_neg_pid is None
+        or pids is None
+    ):
+        return _inactive_offhn_terms()
+
+    if hn_fused_feat.dim() == 2:
+        hn_fused_feat = hn_fused_feat.unsqueeze(1)
+    if hn_valid_mask.dim() == 1:
+        hn_valid_mask = hn_valid_mask.unsqueeze(1)
+    if hn_neg_pid.dim() == 1:
+        hn_neg_pid = hn_neg_pid.unsqueeze(1)
+
+    text_norm = F.normalize(text_feat.float(), p=2, dim=1)
+    pos_norm = F.normalize(pos_fused_feat.float(), p=2, dim=1)
+    hn_norm = F.normalize(hn_fused_feat.float(), p=2, dim=2)
+
+    sim_pos = F.cosine_similarity(text_norm, pos_norm, dim=1).unsqueeze(1)
+    sim_pos = sim_pos.expand_as(hn_valid_mask.float())
+    sim_neg = F.cosine_similarity(text_norm.unsqueeze(1), hn_norm, dim=2)
+
+    valid_mask = hn_valid_mask.bool()
+    valid_mask = valid_mask & hn_neg_pid.ne(pids.reshape(-1, 1))
+    if not valid_mask.any():
+        return _inactive_offhn_terms()
+
+    margin_gap = sim_neg - sim_pos + margin
+    raw = margin_gap / temperature
+    per_pair_loss = F.softplus(raw) * temperature
+    valid_loss = per_pair_loss[valid_mask]
+    loss_offhn = valid_loss.mean()
+    valid_margin_gap = margin_gap[valid_mask]
+
+    return {
+        "loss_offhn": loss_offhn,
+        "loss_offhn_weighted": loss_offhn * lambda_offhn,
+        "offhn_active": True,
+        "offhn_num_valid": float(valid_mask.sum().item()),
+        "offhn_avg_pos_sim": sim_pos[valid_mask].mean(),
+        "offhn_avg_neg_sim": sim_neg[valid_mask].mean(),
+        "offhn_avg_margin_gap": valid_margin_gap.mean(),
+        "offhn_violation_rate": valid_margin_gap.gt(0).float().mean(),
+        "offhn_lambda": zero.new_tensor(lambda_offhn),
+        "offhn_margin": zero.new_tensor(margin),
+        "offhn_temperature": zero.new_tensor(temperature),
+    }
+
+
+def _add_offline_hardneg_to_total_loss(args, total_loss, ret, epoch):
+    if not bool(getattr(args, "use_offline_hardneg", False)):
+        return total_loss
+    if int(epoch) < int(getattr(args, "offline_hn_start_epoch", 1)):
+        return total_loss
+    if "loss_offhn_weighted" in ret:
+        total_loss = total_loss + ret["loss_offhn_weighted"]
+    elif "loss_offhn" in ret:
+        total_loss = total_loss + float(
+            getattr(args, "offline_hn_lambda", 0.05)
+        ) * ret["loss_offhn"]
+    return total_loss
+
+
 def _compute_proto_calibration_terms(args, model, ret, batch):
     if not bool(getattr(args, "use_proto_calib", False)):
         return {}
@@ -1858,6 +1961,17 @@ def do_train(
         "hn_i2t_valid": AverageMeter(),
         "hn_avg_top1_neg_sim": AverageMeter(),
         "hn_avg_topk_neg_sim": AverageMeter(),
+        "loss_offhn": AverageMeter(),
+        "loss_offhn_weighted": AverageMeter(),
+        "offhn_active": AverageMeter(),
+        "offhn_num_valid": AverageMeter(),
+        "offhn_avg_pos_sim": AverageMeter(),
+        "offhn_avg_neg_sim": AverageMeter(),
+        "offhn_avg_margin_gap": AverageMeter(),
+        "offhn_violation_rate": AverageMeter(),
+        "offhn_lambda": AverageMeter(),
+        "offhn_margin": AverageMeter(),
+        "offhn_temperature": AverageMeter(),
         "loss_proto_v": AverageMeter(),
         "loss_proto_t": AverageMeter(),
         "proto_loss_active": AverageMeter(),
@@ -1924,7 +2038,10 @@ def do_train(
         log_mtp_schedule_state(logger, args, epoch)
 
         for n_iter, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {
+                k: v.to(device) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
             if use_modality_text_prompt and (not mtp_text_example_logged):
                 full_clean_example = _decode_caption_token_ids_for_log(
                     batch.get("caption_ids_full_clean", batch["caption_ids"])[0],
@@ -1967,6 +2084,8 @@ def do_train(
             ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))
             if getattr(args, "use_hardneg_aux", False):
                 ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
+            if getattr(args, "use_offline_hardneg", False):
+                ret.update(_compute_offline_hardneg_terms(args, ret, batch, epoch))
             ret.update(_compute_proto_calibration_terms(args, model, ret, batch))
             ret.update(_compute_mtp_text_prompt_terms(args, ret, batch, epoch))
             total_loss = _add_rgbt_moe_adapter_terms_to_total_loss(
@@ -1975,6 +2094,10 @@ def do_train(
             total_loss = _add_proto_calibration_to_total_loss(args, total_loss, ret)
             if getattr(args, "use_hardneg_aux", False):
                 total_loss = _add_hardneg_aux_to_total_loss(
+                    args, total_loss, ret, epoch
+                )
+            if getattr(args, "use_offline_hardneg", False):
+                total_loss = _add_offline_hardneg_to_total_loss(
                     args, total_loss, ret, epoch
                 )
             total_loss = _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch)
@@ -2109,6 +2232,40 @@ def do_train(
                 )
                 meters["hn_avg_topk_neg_sim"].update(
                     _to_scalar(ret.get("hn_avg_topk_neg_sim", 0)), batch_size
+                )
+            if getattr(args, "use_offline_hardneg", False):
+                meters["loss_offhn"].update(
+                    _to_scalar(ret.get("loss_offhn", 0)), batch_size
+                )
+                meters["loss_offhn_weighted"].update(
+                    _to_scalar(ret.get("loss_offhn_weighted", 0)), batch_size
+                )
+                meters["offhn_active"].update(
+                    _to_scalar(ret.get("offhn_active", 0)), 1
+                )
+                meters["offhn_num_valid"].update(
+                    _to_scalar(ret.get("offhn_num_valid", 0)), 1
+                )
+                meters["offhn_avg_pos_sim"].update(
+                    _to_scalar(ret.get("offhn_avg_pos_sim", 0)), batch_size
+                )
+                meters["offhn_avg_neg_sim"].update(
+                    _to_scalar(ret.get("offhn_avg_neg_sim", 0)), batch_size
+                )
+                meters["offhn_avg_margin_gap"].update(
+                    _to_scalar(ret.get("offhn_avg_margin_gap", 0)), batch_size
+                )
+                meters["offhn_violation_rate"].update(
+                    _to_scalar(ret.get("offhn_violation_rate", 0)), batch_size
+                )
+                meters["offhn_lambda"].update(
+                    _to_scalar(ret.get("offhn_lambda", 0)), 1
+                )
+                meters["offhn_margin"].update(
+                    _to_scalar(ret.get("offhn_margin", 0)), 1
+                )
+                meters["offhn_temperature"].update(
+                    _to_scalar(ret.get("offhn_temperature", 0)), 1
                 )
             meters["loss_proto_v"].update(
                 _to_scalar(ret.get("loss_proto_v", 0)), batch_size

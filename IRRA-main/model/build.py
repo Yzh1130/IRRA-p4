@@ -1428,6 +1428,64 @@ class IRRA(nn.Module):
         l_c = text_mu
         f_c = fused_mu
 
+        hn_fused_det_feat = None
+        hn_images = batch.get("hn_rgb_images", None)
+        if hn_images is not None:
+            if hn_images.dim() == 5:
+                hn_batch_size, hn_num_neg = hn_images.shape[:2]
+                hn_images_flat = hn_images.reshape(-1, *hn_images.shape[2:])
+            elif hn_images.dim() == 4:
+                hn_batch_size = hn_images.shape[0]
+                hn_num_neg = 1
+                hn_images_flat = hn_images
+            else:
+                raise ValueError(
+                    "hn_rgb_images must have shape [B, N, C, H, W] or "
+                    f"[B, C, H, W], got {tuple(hn_images.shape)}."
+                )
+
+            hn_t_images = batch.get("hn_t_images", None)
+            if thermal_images is None:
+                hn_t_images = None
+            if hn_t_images is not None:
+                if hn_t_images.dim() == 5:
+                    hn_t_images_flat = hn_t_images.reshape(
+                        -1, *hn_t_images.shape[2:]
+                    )
+                elif hn_t_images.dim() == 4:
+                    hn_t_images_flat = hn_t_images
+                else:
+                    raise ValueError(
+                        "hn_t_images must have shape [B, N, C, H, W] or "
+                        f"[B, C, H, W], got {tuple(hn_t_images.shape)}."
+                    )
+            else:
+                hn_t_images_flat = None
+
+            hn_v_rgb_raw, hn_v_t_raw, _, _, _, _ = self.encode_rgbt_global(
+                hn_images_flat, hn_t_images_flat
+            )
+            (
+                hn_rgb_mu,
+                hn_rgb_logvar,
+                hn_thermal_mu,
+                hn_thermal_logvar,
+            ) = self._encode_visual_global_gaussian(
+                hn_v_rgb_raw,
+                hn_v_t_raw,
+                thermal_available=hn_t_images_flat is not None,
+            )
+            hn_fused_mu, _ = self._fuse_rgbt_global(
+                rgb_mu=hn_rgb_mu,
+                rgb_logvar=hn_rgb_logvar,
+                thermal_mu=hn_thermal_mu,
+                thermal_logvar=hn_thermal_logvar,
+                thermal_available=hn_t_images_flat is not None,
+            )
+            hn_fused_det_feat = hn_fused_mu.reshape(
+                hn_batch_size, hn_num_neg, -1
+            )
+
         # 4) MUM-style uncertainty over deterministic global embeddings.
         if self.use_mum:
             uncertainty_outputs = self.global_uncertainty(
@@ -1493,6 +1551,8 @@ class IRRA(nn.Module):
                 "text_prob_feat": p_t,
             }
         )
+        if hn_fused_det_feat is not None:
+            ret["hn_fused_det_feat"] = hn_fused_det_feat
         if self.use_modality_text_prompt:
             ret.update(
                 {
