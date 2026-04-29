@@ -12,7 +12,7 @@ from .clip_model import (
     build_CLIP_from_openai_pretrained,
     convert_weights,
 )
-from .prototype_bank import IdentityPrototypeBank
+from .prototype_bank import DualIdentityPrototypeBank, IdentityPrototypeBank
 from .text_guided_masking import (
     apply_guided_mask_to_input_ids,
     build_guided_mlm_inputs_and_labels,
@@ -253,12 +253,30 @@ class IRRA(nn.Module):
         # Optional identity prototype bank over fused visual global features.
         # Keep it fully disabled unless use_proto_calib=True.
         self.use_proto_calib = bool(getattr(args, "use_proto_calib", False))
+        self.proto_version = str(getattr(args, "proto_version", "v1")).lower()
         self.lambda_proto_v = float(getattr(args, "lambda_proto_v", 1.0))
         self.lambda_proto_t = float(getattr(args, "lambda_proto_t", 1.0))
+        self.lambda_proto_self_v = getattr(args, "lambda_proto_self_v", None)
+        self.lambda_proto_self_t = getattr(args, "lambda_proto_self_t", None)
+        self.lambda_proto_cross_t2v = float(
+            getattr(args, "lambda_proto_cross_t2v", 0.0)
+        )
+        self.lambda_proto_cross_v2t = float(
+            getattr(args, "lambda_proto_cross_v2t", 0.0)
+        )
+        self.lambda_proto_align = float(getattr(args, "lambda_proto_align", 0.0))
         self.proto_temp = float(getattr(args, "proto_temp", 0.07))
         self.proto_momentum = float(getattr(args, "proto_momentum", 0.9))
         self.proto_warmup_epochs = int(getattr(args, "proto_warmup_epochs", 0))
+        self.proto_update_source = str(
+            getattr(args, "proto_update_source", "detached")
+        ).lower()
+        self.debug_proto_stats = bool(getattr(args, "debug_proto_stats", False))
         self.proto_runtime_epoch = 1
+        if self.proto_version not in {"v1", "v2"}:
+            raise ValueError(
+                f"proto_version must be one of ['v1', 'v2'], got {self.proto_version}."
+            )
         if self.proto_temp <= 0:
             raise ValueError(f"proto_temp must be > 0, got {self.proto_temp}.")
         if self.proto_warmup_epochs < 0:
@@ -266,17 +284,34 @@ class IRRA(nn.Module):
                 "proto_warmup_epochs must be >= 0, "
                 f"got {self.proto_warmup_epochs}."
             )
-        self.prototype_bank = None
-        if self.use_proto_calib:
-            # Default integration uses zero init; the bank module also supports
-            # random-normalized init for later experiments.
-            self.prototype_bank = IdentityPrototypeBank(
-                num_classes=self.num_classes,
-                feat_dim=self.embed_dim,
-                momentum=self.proto_momentum,
-                init_mode="zero",
-                eps=self.uncertainty_eps,
+        if self.proto_update_source not in {"detached", "raw"}:
+            raise ValueError(
+                "proto_update_source must be one of ['detached', 'raw'], "
+                f"got {self.proto_update_source}."
             )
+        self.prototype_bank = None
+        self.dual_prototype_bank = None
+        if self.use_proto_calib:
+            if self.proto_version == "v1":
+                # Default integration uses zero init; the bank module also supports
+                # random-normalized init for later experiments.
+                self.prototype_bank = IdentityPrototypeBank(
+                    num_classes=self.num_classes,
+                    feat_dim=self.embed_dim,
+                    momentum=self.proto_momentum,
+                    init_mode="zero",
+                    eps=self.uncertainty_eps,
+                    update_source=self.proto_update_source,
+                )
+            else:
+                self.dual_prototype_bank = DualIdentityPrototypeBank(
+                    num_classes=self.num_classes,
+                    feat_dim=self.embed_dim,
+                    momentum=self.proto_momentum,
+                    init_mode="zero",
+                    eps=self.uncertainty_eps,
+                    update_source=self.proto_update_source,
+                )
 
         # Optional image-only local filtering over patch tokens.
         self.use_image_local_filter = bool(
@@ -396,7 +431,11 @@ class IRRA(nn.Module):
         self.proto_runtime_epoch = int(epoch)
 
     def _proto_calib_enabled(self):
-        return self.use_proto_calib and self.prototype_bank is not None
+        if not self.use_proto_calib:
+            return False
+        if self.proto_version == "v2":
+            return self.dual_prototype_bank is not None
+        return self.prototype_bank is not None
 
     def should_update_proto_bank(self):
         if not self._proto_calib_enabled():
@@ -412,21 +451,39 @@ class IRRA(nn.Module):
         return int(self.proto_runtime_epoch) > self.proto_warmup_epochs
 
     def _should_update_proto_bank(self):
-        if not self.use_proto_calib or self.prototype_bank is None:
+        if not self._proto_calib_enabled():
             return False
         if not self.training:
             return False
         return True
 
     def get_visual_prototype_matrix(self):
+        if self.proto_version == "v2":
+            if self.dual_prototype_bank is None:
+                return None
+            return self.dual_prototype_bank.get_visual_normalized_prototypes()
         if self.prototype_bank is None:
             return None
         return self.prototype_bank.get_normalized_prototypes()
 
     def get_visual_prototype_initialized_mask(self):
+        if self.proto_version == "v2":
+            if self.dual_prototype_bank is None:
+                return None
+            return self.dual_prototype_bank.get_visual_initialized_mask()
         if self.prototype_bank is None:
             return None
         return self.prototype_bank.get_initialized_mask()
+
+    def get_text_prototype_matrix(self):
+        if self.proto_version != "v2" or self.dual_prototype_bank is None:
+            return None
+        return self.dual_prototype_bank.get_text_normalized_prototypes()
+
+    def get_text_prototype_initialized_mask(self):
+        if self.proto_version != "v2" or self.dual_prototype_bank is None:
+            return None
+        return self.dual_prototype_bank.get_text_initialized_mask()
 
     def update_visual_prototype_bank(self, fused_feats, pids):
         if not self._should_update_proto_bank():
@@ -436,7 +493,36 @@ class IRRA(nn.Module):
                 "num_newly_initialized_pids": 0,
                 "num_initialized_pids": 0,
             }
+        if self.proto_version == "v2":
+            return self.dual_prototype_bank.update(
+                visual_feats=fused_feats,
+                text_feats=None,
+                pids=pids,
+            )
         return self.prototype_bank.update(fused_feats, pids)
+
+    def update_dual_prototype_bank(self, visual_feats, text_feats, pids):
+        if not self._should_update_proto_bank() or self.proto_version != "v2":
+            return {
+                "updated": False,
+                "num_updated_pids": 0,
+                "num_newly_initialized_pids": 0,
+                "num_initialized_pids": 0,
+                "num_updated_visual_pids": 0,
+                "num_updated_text_pids": 0,
+                "num_newly_initialized_visual_pids": 0,
+                "num_newly_initialized_text_pids": 0,
+                "num_visual_initialized_pids": 0,
+                "num_text_initialized_pids": 0,
+                "proto_batch_unique_pids": 0,
+                "proto_v_mean_norm": 0.0,
+                "proto_t_mean_norm": 0.0,
+            }
+        return self.dual_prototype_bank.update(
+            visual_feats=visual_feats,
+            text_feats=text_feats,
+            pids=pids,
+        )
 
     def _set_task(self):
         loss_names = self.args.loss_names

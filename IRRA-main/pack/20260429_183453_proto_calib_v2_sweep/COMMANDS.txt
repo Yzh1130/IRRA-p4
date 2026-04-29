@@ -1,0 +1,23 @@
+From the project root:
+
+  cd /home/IRRA-main/IRRA-main
+
+Launch:
+
+  nohup bash pack/20260429_183453_proto_calib_v2_sweep/run_proto_calib_v2_all.sh > pack/20260429_183453_proto_calib_v2_sweep/launcher.out 2>&1 &
+
+Watch the master log:
+
+  tail -f pack/20260429_183453_proto_calib_v2_sweep/master.log
+
+Check whether it is still running:
+
+  pgrep -af "run_proto_calib_v2_all.sh|train.py.*proto2_"
+
+Build or refresh the summary table:
+
+  python pack/20260429_183453_proto_calib_v2_sweep/summarize_proto_calib_v2.py --runs_root pack/runs --output pack/20260429_183453_proto_calib_v2_sweep/summary.csv
+
+If the warmstart checkpoint is located elsewhere:
+
+  WARMSTART_CKPT=/path/to/best.pth nohup bash pack/20260429_183453_proto_calib_v2_sweep/run_proto_calib_v2_all.sh > pack/20260429_183453_proto_calib_v2_sweep/launcher.out 2>&1 &

@@ -546,8 +546,12 @@ def _get_proto_calib_runtime_state(args, model):
         "proto_loss_active": False,
         "proto_update_active": False,
         "num_initialized_pids": 0,
+        "num_visual_initialized_pids": 0,
+        "num_text_initialized_pids": 0,
+        "num_valid_classes": 0,
         "num_classes": 0,
         "initialized_mask": None,
+        "text_initialized_mask": None,
     }
     if not proto_enabled:
         return state
@@ -562,7 +566,22 @@ def _get_proto_calib_runtime_state(args, model):
         initialized_mask = target_model.get_visual_prototype_initialized_mask()
         if initialized_mask is not None:
             state["initialized_mask"] = initialized_mask
+            state["num_visual_initialized_pids"] = int(initialized_mask.sum().item())
             state["num_initialized_pids"] = int(initialized_mask.sum().item())
+    if hasattr(target_model, "get_text_prototype_initialized_mask"):
+        text_initialized_mask = target_model.get_text_prototype_initialized_mask()
+        if text_initialized_mask is not None:
+            state["text_initialized_mask"] = text_initialized_mask
+            state["num_text_initialized_pids"] = int(
+                text_initialized_mask.sum().item()
+            )
+            if state["initialized_mask"] is not None:
+                visual_mask = state["initialized_mask"].to(
+                    device=text_initialized_mask.device, dtype=torch.bool
+                )
+                text_mask = text_initialized_mask.to(dtype=torch.bool)
+                state["num_valid_classes"] = int((visual_mask & text_mask).sum().item())
+                state["num_initialized_pids"] = state["num_valid_classes"]
     return state
 
 
@@ -1552,13 +1571,272 @@ def _add_offline_hardneg_to_total_loss(args, total_loss, ret, epoch):
     return total_loss
 
 
+def _resolve_proto_version(args):
+    return str(getattr(args, "proto_version", "v1")).lower()
+
+
+def _resolve_lambda_proto_self_v(args):
+    value = getattr(args, "lambda_proto_self_v", None)
+    if value is None:
+        return float(getattr(args, "lambda_proto_v", 1.0))
+    return float(value)
+
+
+def _resolve_lambda_proto_self_t(args):
+    value = getattr(args, "lambda_proto_self_t", None)
+    if value is None:
+        return float(getattr(args, "lambda_proto_t", 1.0))
+    return float(value)
+
+
+def _masked_prototype_ce(feats, prototypes, initialized_mask, pids, proto_temp):
+    if feats is None or prototypes is None or initialized_mask is None or pids is None:
+        if feats is not None:
+            return feats.new_zeros(()), 0
+        if prototypes is not None:
+            return prototypes.new_zeros(()), 0
+        if pids is not None:
+            return torch.zeros((), device=pids.device), 0
+        return torch.zeros(()), 0
+    zero = feats.new_zeros(())
+    if feats.dim() != 2 or prototypes.dim() != 2:
+        raise ValueError(
+            "Prototype CE requires [B, C] features and [K, C] prototypes, "
+            f"got {tuple(feats.shape)} and {tuple(prototypes.shape)}."
+        )
+    if feats.shape[1] != prototypes.shape[1]:
+        raise ValueError(
+            "Prototype CE feature dimension mismatch: "
+            f"{feats.shape[1]} vs {prototypes.shape[1]}."
+        )
+
+    num_classes = prototypes.shape[0]
+    pids = pids.reshape(-1).to(device=feats.device).long()
+    if pids.shape[0] != feats.shape[0]:
+        raise ValueError(
+            f"pids must match feature batch size, got {pids.shape[0]} and {feats.shape[0]}."
+        )
+    initialized_mask = initialized_mask.to(device=feats.device, dtype=torch.bool)
+    valid_pid_mask = (pids >= 0) & (pids < num_classes)
+    if not valid_pid_mask.any() or not initialized_mask.any():
+        return zero, 0
+
+    candidate_pids = pids[valid_pid_mask]
+    candidate_feats = feats[valid_pid_mask]
+    target_initialized = initialized_mask[candidate_pids]
+    if not target_initialized.any():
+        return zero, 0
+
+    valid_feats = candidate_feats[target_initialized]
+    valid_pids = candidate_pids[target_initialized]
+    valid_feats = _safe_l2_normalize(valid_feats.float(), dim=1)
+    prototypes = _safe_l2_normalize(
+        prototypes.to(device=valid_feats.device).float(), dim=1
+    )
+
+    logits = valid_feats @ prototypes.t()
+    logits = logits / float(proto_temp)
+    logits = logits.masked_fill(~initialized_mask.unsqueeze(0), -1e4)
+    return F.cross_entropy(logits, valid_pids), int(valid_pids.numel())
+
+
+def _prototype_alignment_loss(
+    visual_prototypes,
+    text_prototypes,
+    visual_initialized_mask,
+    text_initialized_mask,
+    pids,
+):
+    reference = visual_prototypes if visual_prototypes is not None else text_prototypes
+    if reference is None:
+        if pids is not None:
+            return torch.zeros((), device=pids.device), 0, 0.0
+        return torch.zeros(()), 0, 0.0
+    zero = reference.new_zeros(())
+    if (
+        visual_prototypes is None
+        or text_prototypes is None
+        or visual_initialized_mask is None
+        or text_initialized_mask is None
+        or pids is None
+    ):
+        return zero, 0, 0.0
+
+    num_classes = visual_prototypes.shape[0]
+    pids = pids.reshape(-1).to(device=visual_prototypes.device).long()
+    valid_pid_mask = (pids >= 0) & (pids < num_classes)
+    if not valid_pid_mask.any():
+        return zero, 0, 0.0
+
+    unique_pids = torch.unique(pids[valid_pid_mask])
+    both_initialized = (
+        visual_initialized_mask.to(device=visual_prototypes.device, dtype=torch.bool)
+        & text_initialized_mask.to(device=visual_prototypes.device, dtype=torch.bool)
+    )
+    unique_pids = unique_pids[both_initialized[unique_pids]]
+    if unique_pids.numel() == 0:
+        return zero, 0, 0.0
+
+    visual_proto = _safe_l2_normalize(visual_prototypes.float(), dim=1)[unique_pids]
+    text_proto = _safe_l2_normalize(
+        text_prototypes.to(device=visual_prototypes.device).float(), dim=1
+    )[unique_pids]
+    cos = F.cosine_similarity(visual_proto, text_proto, dim=1)
+    return (1.0 - cos).mean(), int(unique_pids.numel()), float(cos.mean().item())
+
+
+def _compute_proto_calibration_terms_v2(args, model, ret, batch):
+    target_model = _unwrap_runtime_model(model)
+    state = _get_proto_calib_runtime_state(args, model)
+    proto_out = {
+        "proto_version": "v2",
+        "proto_loss_active": float(state["proto_loss_active"]),
+        "proto_num_valid_targets": 0.0,
+    }
+
+    if not (
+        hasattr(target_model, "get_visual_prototype_matrix")
+        and hasattr(target_model, "get_text_prototype_matrix")
+    ):
+        return proto_out
+
+    visual_prototypes = target_model.get_visual_prototype_matrix()
+    text_prototypes = target_model.get_text_prototype_matrix()
+    if visual_prototypes is None or text_prototypes is None:
+        return proto_out
+
+    fused_feat = ret.get("fused_det_feat", None)
+    text_feat = ret.get("text_det_feat", None)
+    pids = batch.get("pids", None)
+    if fused_feat is None or text_feat is None or pids is None:
+        raise KeyError(
+            "Prototype calibration v2 requires 'fused_det_feat', "
+            "'text_det_feat', and batch['pids']."
+        )
+
+    zero = fused_feat.new_zeros(())
+    visual_initialized = target_model.get_visual_prototype_initialized_mask()
+    text_initialized = target_model.get_text_prototype_initialized_mask()
+    if visual_initialized is None:
+        visual_initialized = torch.zeros(
+            visual_prototypes.shape[0], device=visual_prototypes.device, dtype=torch.bool
+        )
+    if text_initialized is None:
+        text_initialized = torch.zeros(
+            text_prototypes.shape[0], device=text_prototypes.device, dtype=torch.bool
+        )
+    visual_initialized = visual_initialized.to(
+        device=visual_prototypes.device, dtype=torch.bool
+    )
+    text_initialized = text_initialized.to(
+        device=text_prototypes.device, dtype=torch.bool
+    )
+    both_initialized = visual_initialized.to(device=text_initialized.device) & text_initialized
+    proto_out.update(
+        {
+            "loss_proto_self_v": zero,
+            "loss_proto_self_t": zero,
+            "loss_proto_cross_t2v": zero,
+            "loss_proto_cross_v2t": zero,
+            "loss_proto_align": zero,
+            "loss_proto_total": zero,
+            "loss_proto_v": zero,
+            "loss_proto_t": zero,
+            "proto_v_initialized_count": float(visual_initialized.sum().item()),
+            "proto_t_initialized_count": float(text_initialized.sum().item()),
+            "proto_valid_classes": float(both_initialized.sum().item()),
+            "proto_batch_unique_pids": 0.0,
+            "proto_v_mean_norm": 0.0,
+            "proto_t_mean_norm": 0.0,
+            "proto_align_cos_mean": 0.0,
+        }
+    )
+
+    flat_pids = pids.reshape(-1).to(device=fused_feat.device).long()
+    valid_pid_mask = (flat_pids >= 0) & (flat_pids < visual_prototypes.shape[0])
+    if valid_pid_mask.any():
+        proto_out["proto_batch_unique_pids"] = float(
+            torch.unique(flat_pids[valid_pid_mask]).numel()
+        )
+    if visual_initialized.any():
+        proto_out["proto_v_mean_norm"] = float(
+            visual_prototypes[visual_initialized].norm(p=2, dim=1).mean().item()
+        )
+    if text_initialized.any():
+        proto_out["proto_t_mean_norm"] = float(
+            text_prototypes[text_initialized].norm(p=2, dim=1).mean().item()
+        )
+
+    if not state["proto_loss_active"]:
+        return proto_out
+
+    proto_temp = float(getattr(args, "proto_temp", 0.07))
+    if proto_temp <= 0:
+        raise ValueError(f"proto_temp must be > 0, got {proto_temp}.")
+
+    loss_self_v, valid_self_v = _masked_prototype_ce(
+        fused_feat, visual_prototypes, visual_initialized, pids, proto_temp
+    )
+    loss_self_t, valid_self_t = _masked_prototype_ce(
+        text_feat, text_prototypes, text_initialized, pids, proto_temp
+    )
+    loss_cross_t2v, valid_cross_t2v = _masked_prototype_ce(
+        text_feat, visual_prototypes, visual_initialized, pids, proto_temp
+    )
+    loss_cross_v2t, valid_cross_v2t = _masked_prototype_ce(
+        fused_feat, text_prototypes, text_initialized, pids, proto_temp
+    )
+    loss_align, _, align_cos_mean = _prototype_alignment_loss(
+        visual_prototypes=visual_prototypes,
+        text_prototypes=text_prototypes,
+        visual_initialized_mask=visual_initialized,
+        text_initialized_mask=text_initialized,
+        pids=pids,
+    )
+
+    lambda_self_v = _resolve_lambda_proto_self_v(args)
+    lambda_self_t = _resolve_lambda_proto_self_t(args)
+    lambda_cross_t2v = float(getattr(args, "lambda_proto_cross_t2v", 0.0))
+    lambda_cross_v2t = float(getattr(args, "lambda_proto_cross_v2t", 0.0))
+    lambda_align = float(getattr(args, "lambda_proto_align", 0.0))
+    loss_total = (
+        lambda_self_v * loss_self_v
+        + lambda_self_t * loss_self_t
+        + lambda_cross_t2v * loss_cross_t2v
+        + lambda_cross_v2t * loss_cross_v2t
+        + lambda_align * loss_align
+    )
+
+    proto_out.update(
+        {
+            "loss_proto_self_v": loss_self_v,
+            "loss_proto_self_t": loss_self_t,
+            "loss_proto_cross_t2v": loss_cross_t2v,
+            "loss_proto_cross_v2t": loss_cross_v2t,
+            "loss_proto_align": loss_align,
+            "loss_proto_total": loss_total,
+            # Legacy meter aliases.
+            "loss_proto_v": loss_self_v,
+            "loss_proto_t": loss_self_t,
+            "proto_num_valid_targets": float(
+                max(valid_self_v, valid_self_t, valid_cross_t2v, valid_cross_v2t)
+            ),
+            "proto_align_cos_mean": align_cos_mean,
+        }
+    )
+    return proto_out
+
+
 def _compute_proto_calibration_terms(args, model, ret, batch):
     if not bool(getattr(args, "use_proto_calib", False)):
         return {}
+    if _resolve_proto_version(args) == "v2":
+        return _compute_proto_calibration_terms_v2(args, model, ret, batch)
 
     target_model = _unwrap_runtime_model(model)
     state = _get_proto_calib_runtime_state(args, model)
     proto_out = {
+        "proto_version": "v1",
         "proto_loss_active": float(state["proto_loss_active"]),
         "proto_num_valid_targets": 0.0,
     }
@@ -1579,19 +1857,6 @@ def _compute_proto_calibration_terms(args, model, ret, batch):
         )
 
     zero = fused_feat.new_zeros(())
-    if not state["proto_loss_active"]:
-        proto_out.update({"loss_proto_v": zero, "loss_proto_t": zero})
-        return proto_out
-
-    fused_feat = _safe_l2_normalize(fused_feat.float(), dim=1)
-    text_feat = _safe_l2_normalize(text_feat.float(), dim=1)
-    prototype_matrix = _safe_l2_normalize(prototype_matrix.float(), dim=1)
-    pids = pids.long()
-
-    proto_temp = float(getattr(args, "proto_temp", 0.07))
-    if proto_temp <= 0:
-        raise ValueError(f"proto_temp must be > 0, got {proto_temp}.")
-
     initialized_mask = state["initialized_mask"]
     if initialized_mask is None:
         initialized_mask = torch.ones(
@@ -1603,11 +1868,53 @@ def _compute_proto_calibration_terms(args, model, ret, batch):
         initialized_mask = initialized_mask.to(
             device=prototype_matrix.device, dtype=torch.bool
         )
+    initialized_count = float(initialized_mask.sum().item())
+    proto_out.update(
+        {
+            "loss_proto_v": zero,
+            "loss_proto_t": zero,
+            "loss_proto_self_v": zero,
+            "loss_proto_self_t": zero,
+            "loss_proto_cross_t2v": zero,
+            "loss_proto_cross_v2t": zero,
+            "loss_proto_align": zero,
+            "loss_proto_total": zero,
+            "proto_v_initialized_count": initialized_count,
+            "proto_t_initialized_count": 0.0,
+            "proto_valid_classes": initialized_count,
+            "proto_batch_unique_pids": 0.0,
+            "proto_v_mean_norm": 0.0,
+            "proto_t_mean_norm": 0.0,
+            "proto_align_cos_mean": 0.0,
+        }
+    )
+    flat_pids = pids.reshape(-1).to(device=fused_feat.device).long()
+    valid_pid_mask_for_stats = (
+        (flat_pids >= 0) & (flat_pids < prototype_matrix.shape[0])
+    )
+    if valid_pid_mask_for_stats.any():
+        proto_out["proto_batch_unique_pids"] = float(
+            torch.unique(flat_pids[valid_pid_mask_for_stats]).numel()
+        )
+    if initialized_mask.any():
+        proto_out["proto_v_mean_norm"] = float(
+            prototype_matrix[initialized_mask].norm(p=2, dim=1).mean().item()
+        )
+    if not state["proto_loss_active"]:
+        return proto_out
+
+    fused_feat = _safe_l2_normalize(fused_feat.float(), dim=1)
+    text_feat = _safe_l2_normalize(text_feat.float(), dim=1)
+    prototype_matrix = _safe_l2_normalize(prototype_matrix.float(), dim=1)
+    pids = pids.long()
+
+    proto_temp = float(getattr(args, "proto_temp", 0.07))
+    if proto_temp <= 0:
+        raise ValueError(f"proto_temp must be > 0, got {proto_temp}.")
 
     valid_target_mask = initialized_mask[pids]
     proto_out["proto_num_valid_targets"] = float(valid_target_mask.sum().item())
     if not valid_target_mask.any():
-        proto_out.update({"loss_proto_v": zero, "loss_proto_t": zero})
         return proto_out
 
     valid_fused_feat = fused_feat[valid_target_mask]
@@ -1623,10 +1930,19 @@ def _compute_proto_calibration_terms(args, model, ret, batch):
     logits_v2p = logits_v2p.masked_fill(~initialized_mask.unsqueeze(0), -1e4)
     logits_t2p = logits_t2p.masked_fill(~initialized_mask.unsqueeze(0), -1e4)
 
+    loss_proto_v = F.cross_entropy(logits_v2p, valid_pids)
+    loss_proto_t = F.cross_entropy(logits_t2p, valid_pids)
+    loss_proto_total = (
+        float(getattr(args, "lambda_proto_v", 1.0)) * loss_proto_v
+        + float(getattr(args, "lambda_proto_t", 1.0)) * loss_proto_t
+    )
     proto_out.update(
         {
-            "loss_proto_v": F.cross_entropy(logits_v2p, valid_pids),
-            "loss_proto_t": F.cross_entropy(logits_t2p, valid_pids),
+            "loss_proto_v": loss_proto_v,
+            "loss_proto_t": loss_proto_t,
+            "loss_proto_self_v": loss_proto_v,
+            "loss_proto_self_t": loss_proto_t,
+            "loss_proto_total": loss_proto_total,
         }
     )
     return proto_out
@@ -1634,6 +1950,10 @@ def _compute_proto_calibration_terms(args, model, ret, batch):
 
 def _add_proto_calibration_to_total_loss(args, total_loss, ret):
     if not bool(getattr(args, "use_proto_calib", False)):
+        return total_loss
+    if _resolve_proto_version(args) == "v2":
+        if "loss_proto_total" in ret:
+            total_loss = total_loss + ret["loss_proto_total"]
         return total_loss
     if "loss_proto_v" in ret:
         total_loss = total_loss + float(getattr(args, "lambda_proto_v", 1.0)) * ret["loss_proto_v"]
@@ -1644,21 +1964,38 @@ def _add_proto_calibration_to_total_loss(args, total_loss, ret):
 
 def update_model_proto_bank_after_step(model, ret, batch):
     target_model = _unwrap_runtime_model(model)
-    if not hasattr(target_model, "update_visual_prototype_bank"):
-        return {
-            "updated": False,
-            "num_updated_pids": 0,
-            "num_newly_initialized_pids": 0,
-            "num_initialized_pids": 0,
-        }
+    empty_info = {
+        "updated": False,
+        "num_updated_pids": 0,
+        "num_newly_initialized_pids": 0,
+        "num_initialized_pids": 0,
+        "num_updated_visual_pids": 0,
+        "num_updated_text_pids": 0,
+        "num_newly_initialized_visual_pids": 0,
+        "num_newly_initialized_text_pids": 0,
+        "num_visual_initialized_pids": 0,
+        "num_text_initialized_pids": 0,
+        "proto_batch_unique_pids": 0,
+        "proto_v_mean_norm": 0.0,
+        "proto_t_mean_norm": 0.0,
+    }
+    proto_version = str(getattr(target_model, "proto_version", "v1")).lower()
     fused_feat = ret.get("fused_det_feat", None)
     if fused_feat is None:
-        return {
-            "updated": False,
-            "num_updated_pids": 0,
-            "num_newly_initialized_pids": 0,
-            "num_initialized_pids": 0,
-        }
+        return empty_info
+    if proto_version == "v2":
+        if not hasattr(target_model, "update_dual_prototype_bank"):
+            return empty_info
+        text_feat = ret.get("text_det_feat", None)
+        if text_feat is None:
+            return empty_info
+        return target_model.update_dual_prototype_bank(
+            visual_feats=fused_feat,
+            text_feats=text_feat,
+            pids=batch.get("pids", None),
+        )
+    if not hasattr(target_model, "update_visual_prototype_bank"):
+        return empty_info
     return target_model.update_visual_prototype_bank(
         fused_feats=fused_feat,
         pids=batch.get("pids", None),
@@ -1974,8 +2311,21 @@ def do_train(
         "offhn_temperature": AverageMeter(),
         "loss_proto_v": AverageMeter(),
         "loss_proto_t": AverageMeter(),
+        "loss_proto_self_v": AverageMeter(),
+        "loss_proto_self_t": AverageMeter(),
+        "loss_proto_cross_t2v": AverageMeter(),
+        "loss_proto_cross_v2t": AverageMeter(),
+        "loss_proto_align": AverageMeter(),
+        "loss_proto_total": AverageMeter(),
         "proto_loss_active": AverageMeter(),
         "proto_num_valid_targets": AverageMeter(),
+        "proto_v_initialized_count": AverageMeter(),
+        "proto_t_initialized_count": AverageMeter(),
+        "proto_valid_classes": AverageMeter(),
+        "proto_batch_unique_pids": AverageMeter(),
+        "proto_v_mean_norm": AverageMeter(),
+        "proto_t_mean_norm": AverageMeter(),
+        "proto_align_cos_mean": AverageMeter(),
         "proto_num_updated_pids": AverageMeter(),
         "proto_num_newly_initialized_pids": AverageMeter(),
         "proto_num_initialized_pids": AverageMeter(),
@@ -2273,6 +2623,25 @@ def do_train(
             meters["loss_proto_t"].update(
                 _to_scalar(ret.get("loss_proto_t", 0)), batch_size
             )
+            if bool(getattr(args, "use_proto_calib", False)):
+                for proto_meter_name in [
+                    "loss_proto_self_v",
+                    "loss_proto_self_t",
+                    "loss_proto_cross_t2v",
+                    "loss_proto_cross_v2t",
+                    "loss_proto_align",
+                    "loss_proto_total",
+                    "proto_v_initialized_count",
+                    "proto_t_initialized_count",
+                    "proto_valid_classes",
+                    "proto_batch_unique_pids",
+                    "proto_v_mean_norm",
+                    "proto_t_mean_norm",
+                    "proto_align_cos_mean",
+                ]:
+                    meters[proto_meter_name].update(
+                        _to_scalar(ret.get(proto_meter_name, 0)), 1
+                    )
             meters["proto_loss_active"].update(
                 _to_scalar(ret.get("proto_loss_active", 0)), 1
             )
@@ -2402,7 +2771,14 @@ def do_train(
                     "hn_avg_top1_neg_sim",
                     "hn_avg_topk_neg_sim",
                 }
+                proto_debug_meter_names = {
+                    "proto_batch_unique_pids",
+                    "proto_v_mean_norm",
+                    "proto_t_mean_norm",
+                    "proto_align_cos_mean",
+                }
                 debug_hardneg_stats = bool(getattr(args, "debug_hardneg_stats", False))
+                debug_proto_stats = bool(getattr(args, "debug_proto_stats", False))
                 for k, v in meters.items():
                     if v.count > 0:
                         if (
@@ -2416,9 +2792,15 @@ def do_train(
                             continue
                         if (not debug_hardneg_stats) and k in hardneg_debug_meter_names:
                             continue
+                        if (not debug_proto_stats) and k in proto_debug_meter_names:
+                            continue
                         info_str += f", {k}: {v.avg:.4f}"
                 active_layers = ret.get("shared_consistency_active_layers", "none")
                 info_str += f", shared_consistency_active_layers: {active_layers}"
+                if bool(getattr(args, "use_proto_calib", False)):
+                    info_str += (
+                        f", proto_version: {ret.get('proto_version', getattr(args, 'proto_version', 'v1'))}"
+                    )
                 if bool(getattr(args, "use_hardneg_aux", False)):
                     info_str += (
                         f", hn_version: {ret.get('hn_version', getattr(args, 'hardneg_version', 'v1'))}"
