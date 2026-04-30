@@ -171,6 +171,17 @@ if __name__ == "__main__":
             )
         )
 
+    if args.training and str(getattr(args, "proto_init_file", "")) != "":
+        target_model = model.module if args.distributed else model
+        if not hasattr(target_model, "load_proto_init_file"):
+            raise AttributeError(
+                "Model does not implement load_proto_init_file(), "
+                "but --proto_init_file was provided."
+            )
+        target_model.load_proto_init_file(args.proto_init_file, logger=logger)
+        if args.distributed:
+            synchronize()
+
     if args.training:
         do_train(
             start_epoch,

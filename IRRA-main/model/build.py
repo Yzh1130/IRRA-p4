@@ -1,4 +1,6 @@
 from collections import OrderedDict
+import logging
+import os.path as op
 
 import torch
 import torch.nn as nn
@@ -271,6 +273,26 @@ class IRRA(nn.Module):
         self.proto_update_source = str(
             getattr(args, "proto_update_source", "detached")
         ).lower()
+        self.proto_init_file = str(getattr(args, "proto_init_file", ""))
+        self.proto_init_strict = bool(getattr(args, "proto_init_strict", False))
+        self.proto_init_load_visual = bool(
+            getattr(args, "proto_init_load_visual", True)
+        )
+        self.proto_init_load_text = bool(getattr(args, "proto_init_load_text", True))
+        self.proto_init_freeze_update_epochs = int(
+            getattr(args, "proto_init_freeze_update_epochs", 0)
+        )
+        self.proto_init_loaded = False
+        self.proto_init_visual_loaded = False
+        self.proto_init_text_loaded = False
+        self.proto_init_load_info = {
+            "visual_loaded": False,
+            "text_loaded": False,
+            "visual_initialized_count": 0,
+            "text_initialized_count": 0,
+            "num_classes": self.num_classes,
+            "feature_dim": self.embed_dim,
+        }
         self.debug_proto_stats = bool(getattr(args, "debug_proto_stats", False))
         self.proto_runtime_epoch = 1
         if self.proto_version not in {"v1", "v2"}:
@@ -288,6 +310,17 @@ class IRRA(nn.Module):
             raise ValueError(
                 "proto_update_source must be one of ['detached', 'raw'], "
                 f"got {self.proto_update_source}."
+            )
+        if self.proto_init_freeze_update_epochs < 0:
+            raise ValueError(
+                "proto_init_freeze_update_epochs must be >= 0, "
+                f"got {self.proto_init_freeze_update_epochs}."
+            )
+        if self.proto_init_file and not (
+            self.proto_init_load_visual or self.proto_init_load_text
+        ):
+            raise ValueError(
+                "proto_init_file was provided, but both visual/text loading are disabled."
             )
         self.prototype_bank = None
         self.dual_prototype_bank = None
@@ -430,6 +463,16 @@ class IRRA(nn.Module):
     def set_proto_runtime_epoch(self, epoch):
         self.proto_runtime_epoch = int(epoch)
 
+    def _proto_init_update_frozen(self):
+        return (
+            self.proto_init_loaded
+            and self.proto_init_freeze_update_epochs > 0
+            and int(self.proto_runtime_epoch) <= self.proto_init_freeze_update_epochs
+        )
+
+    def is_proto_update_frozen(self):
+        return bool(self._proto_init_update_frozen())
+
     def _proto_calib_enabled(self):
         if not self.use_proto_calib:
             return False
@@ -439,6 +482,8 @@ class IRRA(nn.Module):
 
     def should_update_proto_bank(self):
         if not self._proto_calib_enabled():
+            return False
+        if self._proto_init_update_frozen():
             return False
         return self.training
 
@@ -455,7 +500,136 @@ class IRRA(nn.Module):
             return False
         if not self.training:
             return False
+        if self._proto_init_update_frozen():
+            return False
         return True
+
+    def _check_proto_init_metadata(self, init_data, strict, logger):
+        meta = init_data.get("meta", {})
+        if meta is None:
+            meta = {}
+        if not isinstance(meta, dict):
+            if strict:
+                raise ValueError("proto init file 'meta' must be a dict in strict mode.")
+            logger.warning("[PROTO_INIT_LOAD] meta is not a dict; tensor shape checks still apply")
+            return
+
+        meta_num_classes = meta.get("num_classes", None)
+        meta_feature_dim = meta.get("feature_dim", meta.get("feat_dim", None))
+        if strict and (meta_num_classes is None or meta_feature_dim is None):
+            raise ValueError(
+                "proto_init_strict=True requires meta.num_classes and meta.feature_dim."
+            )
+        if meta_num_classes is not None and int(meta_num_classes) != self.num_classes:
+            message = (
+                "proto init metadata num_classes mismatch: "
+                f"file={int(meta_num_classes)}, model={self.num_classes}."
+            )
+            if strict:
+                raise ValueError(message)
+            logger.warning("[PROTO_INIT_LOAD] %s Tensor shape checks still apply.", message)
+        if meta_feature_dim is not None and int(meta_feature_dim) != self.embed_dim:
+            message = (
+                "proto init metadata feature_dim mismatch: "
+                f"file={int(meta_feature_dim)}, model={self.embed_dim}."
+            )
+            if strict:
+                raise ValueError(message)
+            logger.warning("[PROTO_INIT_LOAD] %s Tensor shape checks still apply.", message)
+
+    @torch.no_grad()
+    def load_proto_init_file(self, proto_init_file=None, logger=None):
+        logger = logger or logging.getLogger("IRRA.train")
+        proto_init_file = str(proto_init_file if proto_init_file is not None else self.proto_init_file)
+        info = {
+            "enabled": False,
+            "file": proto_init_file,
+            "proto_version": self.proto_version,
+            "visual_loaded": False,
+            "text_loaded": False,
+            "visual_initialized_count": 0,
+            "text_initialized_count": 0,
+            "feature_dim": self.embed_dim,
+            "num_classes": self.num_classes,
+        }
+        if proto_init_file == "":
+            return info
+        if not self.use_proto_calib:
+            logger.info("[PROTO_INIT_LOAD] enabled=False")
+            logger.info("[PROTO_INIT_LOAD] file=%s", proto_init_file)
+            logger.info("[PROTO_INIT_LOAD] reason=use_proto_calib is False")
+            return info
+        if not self._proto_calib_enabled():
+            raise RuntimeError(
+                "proto_init_file was provided, but prototype calibration bank "
+                "is not initialized."
+            )
+        if not op.isfile(proto_init_file):
+            raise RuntimeError(f"proto_init_file='{proto_init_file}' does not exist.")
+
+        logger.info(
+            "[PROTO_INIT_LOAD] order=after checkpoint/resume load; "
+            "proto_init_file has final prototype-bank priority"
+        )
+        init_data = torch.load(proto_init_file, map_location=torch.device("cpu"))
+        if not isinstance(init_data, dict):
+            raise ValueError(
+                f"proto_init_file must contain a dict, got {type(init_data)}."
+            )
+        self._check_proto_init_metadata(
+            init_data,
+            strict=self.proto_init_strict,
+            logger=logger,
+        )
+
+        if self.proto_version == "v2":
+            load_info = self.dual_prototype_bank.load_offline_init(
+                init_data,
+                load_visual=self.proto_init_load_visual,
+                load_text=self.proto_init_load_text,
+            )
+        else:
+            load_info = self.prototype_bank.load_offline_init(
+                init_data,
+                load_visual=self.proto_init_load_visual,
+                load_text=False,
+            )
+
+        self.proto_init_visual_loaded = bool(load_info.get("visual_loaded", False))
+        self.proto_init_text_loaded = bool(load_info.get("text_loaded", False))
+        self.proto_init_loaded = bool(
+            self.proto_init_visual_loaded or self.proto_init_text_loaded
+        )
+        self.proto_init_load_info = dict(load_info)
+        info.update(load_info)
+        info["enabled"] = True
+
+        logger.info("[PROTO_INIT_LOAD] enabled=True")
+        logger.info("[PROTO_INIT_LOAD] file=%s", proto_init_file)
+        logger.info("[PROTO_INIT_LOAD] proto_version=%s", self.proto_version)
+        logger.info(
+            "[PROTO_INIT_LOAD] visual_loaded=%s",
+            bool(info["visual_loaded"]),
+        )
+        logger.info(
+            "[PROTO_INIT_LOAD] text_loaded=%s",
+            bool(info["text_loaded"]),
+        )
+        logger.info(
+            "[PROTO_INIT_LOAD] visual_initialized_count=%d",
+            int(info["visual_initialized_count"]),
+        )
+        logger.info(
+            "[PROTO_INIT_LOAD] text_initialized_count=%d",
+            int(info["text_initialized_count"]),
+        )
+        logger.info("[PROTO_INIT_LOAD] feature_dim=%d", int(info["feature_dim"]))
+        logger.info("[PROTO_INIT_LOAD] num_classes=%d", int(info["num_classes"]))
+        logger.info(
+            "[PROTO_INIT_LOAD] freeze_update_epochs=%d",
+            int(self.proto_init_freeze_update_epochs),
+        )
+        return info
 
     def get_visual_prototype_matrix(self):
         if self.proto_version == "v2":

@@ -545,6 +545,8 @@ def _get_proto_calib_runtime_state(args, model):
         "proto_enabled": proto_enabled,
         "proto_loss_active": False,
         "proto_update_active": False,
+        "proto_init_loaded": False,
+        "proto_update_frozen": False,
         "num_initialized_pids": 0,
         "num_visual_initialized_pids": 0,
         "num_text_initialized_pids": 0,
@@ -562,6 +564,9 @@ def _get_proto_calib_runtime_state(args, model):
         state["proto_loss_active"] = bool(target_model.should_enable_proto_loss())
     if hasattr(target_model, "should_update_proto_bank"):
         state["proto_update_active"] = bool(target_model.should_update_proto_bank())
+    state["proto_init_loaded"] = bool(getattr(target_model, "proto_init_loaded", False))
+    if hasattr(target_model, "is_proto_update_frozen"):
+        state["proto_update_frozen"] = bool(target_model.is_proto_update_frozen())
     if hasattr(target_model, "get_visual_prototype_initialized_mask"):
         initialized_mask = target_model.get_visual_prototype_initialized_mask()
         if initialized_mask is not None:
@@ -595,6 +600,8 @@ def log_proto_calib_state(logger, args, model, epoch, prefix="Epoch"):
         "proto_update_active=%s, "
         "proto_warmup_mode=%s, "
         "proto_warmup_epochs=%d, "
+        "proto_init_loaded=%s, "
+        "proto_update_frozen=%s, "
         "lambda_proto_v=%.6f, "
         "lambda_proto_t=%.6f, "
         "proto_temp=%.6f, "
@@ -607,6 +614,8 @@ def log_proto_calib_state(logger, args, model, epoch, prefix="Epoch"):
         state["proto_update_active"],
         "disable_loss_only",
         int(getattr(args, "proto_warmup_epochs", 0)),
+        state["proto_init_loaded"],
+        state["proto_update_frozen"],
         float(getattr(args, "lambda_proto_v", 1.0)),
         float(getattr(args, "lambda_proto_t", 1.0)),
         float(getattr(args, "proto_temp", 0.07)),
@@ -1691,6 +1700,8 @@ def _compute_proto_calibration_terms_v2(args, model, ret, batch):
     proto_out = {
         "proto_version": "v2",
         "proto_loss_active": float(state["proto_loss_active"]),
+        "proto_init_loaded": float(state["proto_init_loaded"]),
+        "proto_update_frozen": float(state["proto_update_frozen"]),
         "proto_num_valid_targets": 0.0,
     }
 
@@ -1838,6 +1849,8 @@ def _compute_proto_calibration_terms(args, model, ret, batch):
     proto_out = {
         "proto_version": "v1",
         "proto_loss_active": float(state["proto_loss_active"]),
+        "proto_init_loaded": float(state["proto_init_loaded"]),
+        "proto_update_frozen": float(state["proto_update_frozen"]),
         "proto_num_valid_targets": 0.0,
     }
     if not hasattr(target_model, "get_visual_prototype_matrix"):
@@ -1978,7 +1991,16 @@ def update_model_proto_bank_after_step(model, ret, batch):
         "proto_batch_unique_pids": 0,
         "proto_v_mean_norm": 0.0,
         "proto_t_mean_norm": 0.0,
+        "proto_init_loaded": 0.0,
+        "proto_update_frozen": 0.0,
     }
+    empty_info["proto_init_loaded"] = float(
+        bool(getattr(target_model, "proto_init_loaded", False))
+    )
+    if hasattr(target_model, "is_proto_update_frozen"):
+        empty_info["proto_update_frozen"] = float(
+            bool(target_model.is_proto_update_frozen())
+        )
     proto_version = str(getattr(target_model, "proto_version", "v1")).lower()
     fused_feat = ret.get("fused_det_feat", None)
     if fused_feat is None:
@@ -1989,17 +2011,23 @@ def update_model_proto_bank_after_step(model, ret, batch):
         text_feat = ret.get("text_det_feat", None)
         if text_feat is None:
             return empty_info
-        return target_model.update_dual_prototype_bank(
+        update_info = target_model.update_dual_prototype_bank(
             visual_feats=fused_feat,
             text_feats=text_feat,
             pids=batch.get("pids", None),
         )
+        update_info.setdefault("proto_init_loaded", empty_info["proto_init_loaded"])
+        update_info.setdefault("proto_update_frozen", empty_info["proto_update_frozen"])
+        return update_info
     if not hasattr(target_model, "update_visual_prototype_bank"):
         return empty_info
-    return target_model.update_visual_prototype_bank(
+    update_info = target_model.update_visual_prototype_bank(
         fused_feats=fused_feat,
         pids=batch.get("pids", None),
     )
+    update_info.setdefault("proto_init_loaded", empty_info["proto_init_loaded"])
+    update_info.setdefault("proto_update_frozen", empty_info["proto_update_frozen"])
+    return update_info
 
 
 def _mean_positive_pairwise_distance(dist_matrix, pids=None, sample_weight=None):
@@ -2318,6 +2346,8 @@ def do_train(
         "loss_proto_align": AverageMeter(),
         "loss_proto_total": AverageMeter(),
         "proto_loss_active": AverageMeter(),
+        "proto_init_loaded": AverageMeter(),
+        "proto_update_frozen": AverageMeter(),
         "proto_num_valid_targets": AverageMeter(),
         "proto_v_initialized_count": AverageMeter(),
         "proto_t_initialized_count": AverageMeter(),
@@ -2631,6 +2661,8 @@ def do_train(
                     "loss_proto_cross_v2t",
                     "loss_proto_align",
                     "loss_proto_total",
+                    "proto_init_loaded",
+                    "proto_update_frozen",
                     "proto_v_initialized_count",
                     "proto_t_initialized_count",
                     "proto_valid_classes",

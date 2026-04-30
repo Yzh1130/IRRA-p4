@@ -96,6 +96,75 @@ class IdentityPrototypeBank(nn.Module):
         self.initialized.copy_(init_mask)
         self.init_mode = init_mode
 
+    def _validate_loaded_bank(self, tensor, mask, bank_name):
+        if tensor is None:
+            raise KeyError(f"Missing '{bank_name}' in prototype init file.")
+        if mask is None:
+            raise KeyError(f"Missing '{bank_name}_initialized' in prototype init file.")
+        tensor = torch.as_tensor(tensor).float()
+        mask = torch.as_tensor(mask, dtype=torch.bool)
+        expected_shape = (self.num_classes, self.feat_dim)
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{bank_name} shape mismatch: expected {expected_shape}, "
+                f"got {tuple(tensor.shape)}."
+            )
+        if tuple(mask.shape) != (self.num_classes,):
+            raise ValueError(
+                f"{bank_name}_initialized shape mismatch: expected "
+                f"({self.num_classes},), got {tuple(mask.shape)}."
+            )
+        if not torch.isfinite(tensor).all().item():
+            raise ValueError(f"{bank_name} contains non-finite values.")
+        if mask.any():
+            masked_norm = tensor[mask].norm(p=2, dim=1)
+            if masked_norm.le(self.eps).any().item():
+                raise ValueError(
+                    f"{bank_name} has zero-norm rows marked initialized."
+                )
+        return self._safe_l2_normalize(tensor, dim=1), mask
+
+    @torch.no_grad()
+    def load_offline_init(
+        self,
+        init_data,
+        load_visual=True,
+        load_text=False,
+    ):
+        info = {
+            "visual_loaded": False,
+            "text_loaded": False,
+            "visual_initialized_count": int(self.initialized.sum().item()),
+            "text_initialized_count": 0,
+            "num_classes": self.num_classes,
+            "feature_dim": self.feat_dim,
+        }
+        if not load_visual:
+            return info
+        visual_tensor = init_data.get(
+            "visual_prototypes", init_data.get("prototype_memory", None)
+        )
+        visual_mask = init_data.get(
+            "visual_initialized", init_data.get("initialized", None)
+        )
+        visual_bank, visual_initialized = self._validate_loaded_bank(
+            visual_tensor,
+            visual_mask,
+            "visual_prototypes",
+        )
+        self.prototype_memory.copy_(
+            visual_bank.to(
+                device=self.prototype_memory.device,
+                dtype=self.prototype_memory.dtype,
+            )
+        )
+        self.initialized.copy_(
+            visual_initialized.to(device=self.initialized.device)
+        )
+        info["visual_loaded"] = True
+        info["visual_initialized_count"] = int(self.initialized.sum().item())
+        return info
+
     @torch.no_grad()
     def update(self, fused_feats, pids):
         update_info = {
@@ -286,6 +355,90 @@ class DualIdentityPrototypeBank(nn.Module):
             init_mask.to(device=self.text_initialized.device)
         )
         self.init_mode = init_mode
+
+    def _validate_loaded_bank(self, tensor, mask, bank_name):
+        if tensor is None:
+            raise KeyError(f"Missing '{bank_name}' in prototype init file.")
+        if mask is None:
+            raise KeyError(f"Missing '{bank_name}_initialized' in prototype init file.")
+        tensor = torch.as_tensor(tensor).float()
+        mask = torch.as_tensor(mask, dtype=torch.bool)
+        expected_shape = (self.num_classes, self.feat_dim)
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{bank_name} shape mismatch: expected {expected_shape}, "
+                f"got {tuple(tensor.shape)}."
+            )
+        if tuple(mask.shape) != (self.num_classes,):
+            raise ValueError(
+                f"{bank_name}_initialized shape mismatch: expected "
+                f"({self.num_classes},), got {tuple(mask.shape)}."
+            )
+        if not torch.isfinite(tensor).all().item():
+            raise ValueError(f"{bank_name} contains non-finite values.")
+        if mask.any():
+            masked_norm = tensor[mask].norm(p=2, dim=1)
+            if masked_norm.le(self.eps).any().item():
+                raise ValueError(
+                    f"{bank_name} has zero-norm rows marked initialized."
+                )
+        return self._safe_l2_normalize(tensor, dim=1), mask
+
+    @torch.no_grad()
+    def load_offline_init(
+        self,
+        init_data,
+        load_visual=True,
+        load_text=True,
+    ):
+        info = {
+            "visual_loaded": False,
+            "text_loaded": False,
+            "visual_initialized_count": int(self.visual_initialized.sum().item()),
+            "text_initialized_count": int(self.text_initialized.sum().item()),
+            "num_classes": self.num_classes,
+            "feature_dim": self.feat_dim,
+        }
+        if load_visual:
+            visual_bank, visual_initialized = self._validate_loaded_bank(
+                init_data.get("visual_prototypes", None),
+                init_data.get("visual_initialized", None),
+                "visual_prototypes",
+            )
+            self.visual_prototypes.copy_(
+                visual_bank.to(
+                    device=self.visual_prototypes.device,
+                    dtype=self.visual_prototypes.dtype,
+                )
+            )
+            self.visual_initialized.copy_(
+                visual_initialized.to(device=self.visual_initialized.device)
+            )
+            info["visual_loaded"] = True
+            info["visual_initialized_count"] = int(
+                self.visual_initialized.sum().item()
+            )
+
+        if load_text:
+            text_bank, text_initialized = self._validate_loaded_bank(
+                init_data.get("text_prototypes", None),
+                init_data.get("text_initialized", None),
+                "text_prototypes",
+            )
+            self.text_prototypes.copy_(
+                text_bank.to(
+                    device=self.text_prototypes.device,
+                    dtype=self.text_prototypes.dtype,
+                )
+            )
+            self.text_initialized.copy_(
+                text_initialized.to(device=self.text_initialized.device)
+            )
+            info["text_loaded"] = True
+            info["text_initialized_count"] = int(
+                self.text_initialized.sum().item()
+            )
+        return info
 
     def _empty_update_info(self, prefix):
         return {
