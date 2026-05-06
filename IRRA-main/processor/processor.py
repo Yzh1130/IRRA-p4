@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import time
 
 import torch
@@ -20,6 +22,90 @@ def _to_scalar(value):
             return value.item()
         return value.detach().mean().item()
     return float(value)
+
+
+def _resolve_metric_ckpt_dir(args):
+    metric_ckpt_dir = str(getattr(args, "metric_ckpt_dir", "") or "").strip()
+    if metric_ckpt_dir:
+        return metric_ckpt_dir
+    return os.path.join(args.output_dir, "metric_ckpts")
+
+
+def _json_safe_metadata_value(value):
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _save_metric_checkpoint(
+    checkpointer,
+    args,
+    epoch,
+    r1,
+    metrics,
+    arguments,
+    reason,
+    logger,
+):
+    if reason not in {"epoch", "best"}:
+        raise ValueError(f"Unsupported metric checkpoint reason: {reason}")
+
+    metric_ckpt_dir = _resolve_metric_ckpt_dir(args)
+    os.makedirs(metric_ckpt_dir, exist_ok=True)
+
+    r1 = float(r1)
+    map_value = float(metrics.get("mAP", 0.0)) if isinstance(metrics, dict) else 0.0
+    prefix = "epoch" if reason == "epoch" else "best_epoch"
+    ckpt_name = f"{prefix}_{int(epoch):03d}_R1_{r1:.3f}_mAP_{map_value:.3f}"
+
+    metric_arguments = dict(arguments)
+    metric_arguments["epoch"] = int(epoch)
+
+    metric_checkpointer = type(checkpointer)(
+        checkpointer.model,
+        checkpointer.optimizer,
+        checkpointer.scheduler,
+        metric_ckpt_dir,
+        True,
+        logger=logger,
+    )
+    metric_checkpointer.save(ckpt_name, **metric_arguments)
+
+    ckpt_path = os.path.join(metric_ckpt_dir, f"{ckpt_name}.pth")
+    json_path = os.path.join(metric_ckpt_dir, f"{ckpt_name}.json")
+    metadata = {
+        "path": ckpt_path,
+        "epoch": int(epoch),
+        "reason": str(reason),
+        "R1": r1,
+        "R5": float(metrics.get("R5", 0.0)) if isinstance(metrics, dict) else 0.0,
+        "R10": float(metrics.get("R10", 0.0)) if isinstance(metrics, dict) else 0.0,
+        "mAP": map_value,
+        "mINP": float(metrics.get("mINP", 0.0)) if isinstance(metrics, dict) else 0.0,
+        "output_dir": str(getattr(args, "output_dir", "")),
+        "val_dataset": str(getattr(args, "val_dataset", "")),
+        "batch_size": int(getattr(args, "batch_size", 0)),
+        "test_batch_size": int(getattr(args, "test_batch_size", 0)),
+        "checkpoint_arguments": {
+            str(k): _json_safe_metadata_value(v) for k, v in metric_arguments.items()
+        },
+    }
+    with open(json_path, "w") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+    logger.info(
+        "[METRIC_CKPT_SAVE] path=%s epoch=%d R1=%.3f mAP=%.3f reason=%s",
+        ckpt_path,
+        int(epoch),
+        r1,
+        map_value,
+        reason,
+    )
+    return ckpt_path
 
 
 def _safe_l2_normalize(feats, dim=1, eps=1e-12):
@@ -2917,12 +3003,38 @@ def do_train(
                 top1 = evaluator.eval(model.module.eval())
             else:
                 top1 = evaluator.eval(model.eval())
+            eval_metrics = getattr(evaluator, "last_eval_result", None)
+            if not isinstance(eval_metrics, dict):
+                eval_metrics = {}
+            metric_r1 = float(eval_metrics.get("R1", top1))
 
             torch.cuda.empty_cache()
+            if bool(getattr(args, "save_all_epoch_ckpt", False)):
+                _save_metric_checkpoint(
+                    checkpointer=checkpointer,
+                    args=args,
+                    epoch=epoch,
+                    r1=metric_r1,
+                    metrics=eval_metrics,
+                    arguments=arguments,
+                    reason="epoch",
+                    logger=logger,
+                )
             if best_top1 < top1:
                 best_top1 = top1
                 arguments["epoch"] = epoch
                 checkpointer.save("best", **arguments)
+                if bool(getattr(args, "save_metric_best_ckpt", False)):
+                    _save_metric_checkpoint(
+                        checkpointer=checkpointer,
+                        args=args,
+                        epoch=epoch,
+                        r1=metric_r1,
+                        metrics=eval_metrics,
+                        arguments=arguments,
+                        reason="best",
+                        logger=logger,
+                    )
 
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")

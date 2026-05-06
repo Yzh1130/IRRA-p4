@@ -15,6 +15,9 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--load_ckpt_file", type=str, default="", help="load model weights only from ...")
+    parser.add_argument("--save_all_epoch_ckpt", default=False, action='store_true', help="save an extra metric-named checkpoint after every validation")
+    parser.add_argument("--save_metric_best_ckpt", default=False, action='store_true', help="save an extra non-overwritten metric-named checkpoint when R1 improves")
+    parser.add_argument("--metric_ckpt_dir", type=str, default="", help="directory for extra metric checkpoints; defaults to output_dir/metric_ckpts")
 
     ######################## model general settings ########################
     # pretrain_choice chooses which CLIP checkpoint to initialize.

@@ -61,6 +61,12 @@ if __name__ == "__main__":
         "--config_file", default="logs/CUHK-PEDES/iira/configs.yaml"
     )
     parser.add_argument(
+        "--test_ckpt_file",
+        type=str,
+        default="",
+        help="checkpoint file to evaluate; defaults to output_dir/best.pth",
+    )
+    parser.add_argument(
         "--use_qalr",
         default=None,
         action="store_true",
@@ -146,7 +152,14 @@ if __name__ == "__main__":
     model = build_model(args, num_classes=num_classes)
 
     checkpointer = Checkpointer(model)
-    checkpoint = checkpointer.load(f=op.join(args.output_dir, "best.pth"))
+    ckpt_file = op.join(args.output_dir, "best.pth")
+    if str(cli_args.test_ckpt_file).strip():
+        ckpt_file = op.abspath(cli_args.test_ckpt_file)
+        if not op.isfile(ckpt_file):
+            raise FileNotFoundError(f"--test_ckpt_file does not exist: {ckpt_file}")
+    checkpoint = checkpointer.load(f=ckpt_file)
+    if str(cli_args.test_ckpt_file).strip():
+        logger.info("[TEST_CKPT_LOAD] path=%s", ckpt_file)
     best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
     apply_img_local_filter_stage(
         model, args, best_epoch, logger=None, prefix="INFERENCE"
