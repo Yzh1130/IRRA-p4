@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from model import objectives
+from model import build_model, objectives
 from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
@@ -367,6 +367,160 @@ def _save_full_eval_state_checkpoint(
         r1,
     )
     return ckpt_path
+
+
+def _parse_verify_ckpt_epochs(args):
+    raw_epochs = str(getattr(args, "verify_ckpt_epochs", "") or "").strip()
+    if raw_epochs == "":
+        return None
+    epochs = set()
+    for item in raw_epochs.split(","):
+        item = item.strip()
+        if item == "":
+            continue
+        try:
+            epoch = int(item)
+        except ValueError as exc:
+            raise ValueError(
+                f"--verify_ckpt_epochs must be comma-separated integers, got {raw_epochs!r}"
+            ) from exc
+        if epoch <= 0:
+            raise ValueError(
+                f"--verify_ckpt_epochs entries must be positive, got {epoch}."
+            )
+        epochs.add(epoch)
+    return epochs
+
+
+def _should_verify_ckpt_epoch(args, epoch):
+    if not bool(getattr(args, "verify_ckpt_immediately_after_save", False)):
+        return False
+    verify_epochs = _parse_verify_ckpt_epochs(args)
+    return verify_epochs is None or int(epoch) in verify_epochs
+
+
+def _eval_model_with_existing_evaluator(evaluator, model, args):
+    if bool(getattr(args, "distributed", False)) and hasattr(model, "module"):
+        evaluator.eval(model.module.eval())
+    else:
+        evaluator.eval(model.eval())
+    metrics = getattr(evaluator, "last_eval_result", None)
+    if not isinstance(metrics, dict):
+        metrics = {}
+    return {
+        "R1": float(metrics.get("R1", 0.0)),
+        "R5": float(metrics.get("R5", 0.0)),
+        "R10": float(metrics.get("R10", 0.0)),
+        "mAP": float(metrics.get("mAP", 0.0)),
+        "mINP": float(metrics.get("mINP", 0.0)),
+    }
+
+
+def _log_immediate_reeval_metrics(logger, tag, epoch, metrics, ckpt_path=None):
+    if ckpt_path is None:
+        logger.info(
+            "%s epoch=%d R1=%.3f R5=%.3f R10=%.3f mAP=%.3f mINP=%.3f",
+            tag,
+            int(epoch),
+            float(metrics.get("R1", 0.0)),
+            float(metrics.get("R5", 0.0)),
+            float(metrics.get("R10", 0.0)),
+            float(metrics.get("mAP", 0.0)),
+            float(metrics.get("mINP", 0.0)),
+        )
+        return
+    logger.info(
+        "%s ckpt=%s epoch=%d R1=%.3f R5=%.3f R10=%.3f mAP=%.3f mINP=%.3f",
+        tag,
+        ckpt_path,
+        int(epoch),
+        float(metrics.get("R1", 0.0)),
+        float(metrics.get("R5", 0.0)),
+        float(metrics.get("R10", 0.0)),
+        float(metrics.get("mAP", 0.0)),
+        float(metrics.get("mINP", 0.0)),
+    )
+
+
+def _verify_checkpoint_immediately_after_save(
+    args,
+    model,
+    evaluator,
+    ckpt_path,
+    epoch,
+    original_metrics,
+    epoch_img_local_runtime,
+    logger,
+):
+    if not ckpt_path:
+        logger.warning(
+            "[IMMEDIATE_REEVAL_SKIP] epoch=%d reason=missing_full_state_checkpoint",
+            int(epoch),
+        )
+        return
+
+    second_metrics = _eval_model_with_existing_evaluator(evaluator, model, args)
+    _log_immediate_reeval_metrics(
+        logger,
+        "[IMMEDIATE_REEVAL_ORIGINAL]",
+        epoch,
+        second_metrics,
+    )
+
+    target_model = _unwrap_runtime_model(model)
+    num_classes = int(getattr(target_model, "num_classes", 0))
+    if num_classes <= 0:
+        raise ValueError(
+            "Cannot build immediate verification model because num_classes is missing."
+        )
+
+    device = next(target_model.parameters()).device
+    reloaded_model = build_model(args, num_classes=num_classes)
+    reloaded_model.to(device)
+    checkpoint = load_full_eval_state_checkpoint(
+        reloaded_model,
+        ckpt_path,
+        logger=logger,
+    )
+    apply_img_local_filter_stage(
+        reloaded_model,
+        args,
+        epoch,
+        logger=None,
+        prefix="IMMEDIATE_RELOAD",
+        runtime=epoch_img_local_runtime,
+    )
+    extra_eval_state = checkpoint.get("extra_eval_state", {})
+    restore_eval_extra_state(reloaded_model, extra_eval_state, logger=logger)
+    log_eval_state_summary(
+        logger,
+        reloaded_model,
+        stage="immediate_reloaded_after_load",
+        checkpoint=checkpoint,
+        extra_state=extra_eval_state,
+    )
+
+    reloaded_metrics = _eval_model_with_existing_evaluator(
+        evaluator,
+        reloaded_model,
+        args,
+    )
+    _log_immediate_reeval_metrics(
+        logger,
+        "[IMMEDIATE_REEVAL_RELOADED]",
+        epoch,
+        reloaded_metrics,
+        ckpt_path=ckpt_path,
+    )
+    logger.info(
+        "[IMMEDIATE_REEVAL_COMPARE] epoch=%d original_validation_R1=%.3f original_second_eval_R1=%.3f reloaded_R1=%.3f",
+        int(epoch),
+        float(original_metrics.get("R1", 0.0)),
+        float(second_metrics.get("R1", 0.0)),
+        float(reloaded_metrics.get("R1", 0.0)),
+    )
+    del reloaded_model
+    torch.cuda.empty_cache()
 
 
 def _save_metric_checkpoint(
@@ -3335,6 +3489,7 @@ def do_train(
             if not isinstance(eval_metrics, dict):
                 eval_metrics = {}
             metric_r1 = float(eval_metrics.get("R1", top1))
+            eval_metrics.setdefault("R1", metric_r1)
 
             torch.cuda.empty_cache()
             if bool(getattr(args, "save_all_epoch_ckpt", False)):
@@ -3348,8 +3503,10 @@ def do_train(
                     reason="epoch",
                     logger=logger,
                 )
-            if bool(getattr(args, "save_full_eval_state_ckpt", False)):
-                _save_full_eval_state_checkpoint(
+            should_verify_ckpt = _should_verify_ckpt_epoch(args, epoch)
+            full_epoch_ckpt_path = None
+            if bool(getattr(args, "save_full_eval_state_ckpt", False)) or should_verify_ckpt:
+                full_epoch_ckpt_path = _save_full_eval_state_checkpoint(
                     model=model,
                     args=args,
                     epoch=epoch,
@@ -3381,6 +3538,17 @@ def do_train(
                         reason="best",
                         logger=logger,
                     )
+            if should_verify_ckpt:
+                _verify_checkpoint_immediately_after_save(
+                    args=args,
+                    model=model,
+                    evaluator=evaluator,
+                    ckpt_path=full_epoch_ckpt_path,
+                    epoch=epoch,
+                    original_metrics=eval_metrics,
+                    epoch_img_local_runtime=epoch_img_local_runtime,
+                    logger=logger,
+                )
 
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
