@@ -1,9 +1,18 @@
 import argparse
 import os.path as op
 
+import torch
+
 from datasets import build_dataloader
 from model import build_model
-from processor.processor import apply_img_local_filter_stage, do_inference
+from processor.processor import (
+    apply_img_local_filter_stage,
+    do_inference,
+    is_full_eval_state_checkpoint,
+    load_full_eval_state_checkpoint,
+    log_eval_state_summary,
+    restore_eval_extra_state,
+)
 from utils.checkpoint import Checkpointer
 from utils.iotools import load_train_configs
 from utils.logger import setup_logger
@@ -153,17 +162,45 @@ if __name__ == "__main__":
 
     checkpointer = Checkpointer(model)
     ckpt_file = op.join(args.output_dir, "best.pth")
+    raw_checkpoint = None
+    is_full_state_ckpt = False
     if str(cli_args.test_ckpt_file).strip():
         ckpt_file = op.abspath(cli_args.test_ckpt_file)
         if not op.isfile(ckpt_file):
             raise FileNotFoundError(f"--test_ckpt_file does not exist: {ckpt_file}")
-    checkpoint = checkpointer.load(f=ckpt_file)
+        raw_checkpoint = torch.load(ckpt_file, map_location=torch.device("cpu"))
+        is_full_state_ckpt = is_full_eval_state_checkpoint(raw_checkpoint)
+
+    if is_full_state_ckpt:
+        checkpoint = load_full_eval_state_checkpoint(
+            model,
+            ckpt_file,
+            logger=logger,
+            checkpoint=raw_checkpoint,
+        )
+    else:
+        checkpoint = checkpointer.load(f=ckpt_file)
     if str(cli_args.test_ckpt_file).strip():
         logger.info("[TEST_CKPT_LOAD] path=%s", ckpt_file)
     best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
     apply_img_local_filter_stage(
         model, args, best_epoch, logger=None, prefix="INFERENCE"
     )
+    extra_eval_state = (
+        checkpoint.get("extra_eval_state", {})
+        if is_full_state_ckpt and isinstance(checkpoint, dict)
+        else {}
+    )
+    if is_full_state_ckpt:
+        restore_eval_extra_state(model, extra_eval_state, logger=logger)
+    if str(cli_args.test_ckpt_file).strip():
+        log_eval_state_summary(
+            logger,
+            model,
+            stage="test_after_load",
+            checkpoint=raw_checkpoint if raw_checkpoint is not None else checkpoint,
+            extra_state=extra_eval_state,
+        )
 
     model.to(device)
     do_inference(model, test_img_loader, test_txt_loader)

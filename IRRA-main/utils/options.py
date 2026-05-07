@@ -18,6 +18,7 @@ def get_args():
     parser.add_argument("--save_all_epoch_ckpt", default=False, action='store_true', help="save an extra metric-named checkpoint after every validation")
     parser.add_argument("--save_metric_best_ckpt", default=False, action='store_true', help="save an extra non-overwritten metric-named checkpoint when R1 improves")
     parser.add_argument("--metric_ckpt_dir", type=str, default="", help="directory for extra metric checkpoints; defaults to output_dir/metric_ckpts")
+    parser.add_argument("--save_full_eval_state_ckpt", default=False, action='store_true', help="save full eval-state checkpoints after validation for exact reproduction diagnostics")
 
     ######################## model general settings ########################
     # pretrain_choice chooses which CLIP checkpoint to initialize.

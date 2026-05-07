@@ -8,11 +8,41 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from model import objectives
+from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
+
+
+EVAL_STATE_KEYWORDS = (
+    "proto",
+    "prototype",
+    "unc",
+    "uncertainty",
+    "logvar",
+    "fusion",
+    "fused",
+)
+
+EVAL_RUNTIME_ATTR_NAMES = (
+    "proto_runtime_epoch",
+    "proto_init_loaded",
+    "proto_init_visual_loaded",
+    "proto_init_text_loaded",
+    "proto_init_load_info",
+    "img_local_filter_active",
+    "effective_img_local_fuse_gamma",
+    "eval_use_fused_mu",
+    "eval_use_mu_only",
+    "use_precision_fusion",
+    "use_global_uncertainty",
+    "use_rgbt_add_fusion",
+    "use_batch_uncertainty",
+    "use_id_uncertainty",
+    "use_prob_sampling",
+)
 
 
 def _to_scalar(value):
@@ -36,9 +66,307 @@ def _json_safe_metadata_value(value):
         if value.numel() == 1:
             return value.item()
         return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {
+            str(k): _json_safe_metadata_value(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metadata_value(v) for v in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _args_to_plain_dict(args):
+    if args is None:
+        return {}
+    if hasattr(args, "items"):
+        source = dict(args)
+    elif hasattr(args, "__dict__"):
+        source = vars(args)
+    else:
+        return {}
+    return {
+        str(k): _json_safe_metadata_value(v)
+        for k, v in source.items()
+    }
+
+
+def _has_eval_state_keyword(name):
+    lower_name = str(name).lower()
+    return any(keyword in lower_name for keyword in EVAL_STATE_KEYWORDS)
+
+
+def _keyword_state_keys(state_dict):
+    return [
+        str(k)
+        for k in state_dict.keys()
+        if _has_eval_state_keyword(k)
+    ]
+
+
+def _get_target_state_dict(model):
+    target_model = _unwrap_runtime_model(model)
+    return target_model.state_dict()
+
+
+def _collect_plain_tensor_attrs(model):
+    target_model = _unwrap_runtime_model(model)
+    state_dict_keys = set(target_model.state_dict().keys())
+    plain_tensors = {}
+    plain_tensor_shapes = {}
+    for module_name, module in target_model.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        for attr_name, value in module.__dict__.items():
+            if attr_name.startswith("_"):
+                continue
+            full_name = f"{prefix}{attr_name}"
+            if full_name in state_dict_keys:
+                continue
+            if torch.is_tensor(value):
+                plain_tensors[full_name] = value.detach().cpu()
+                plain_tensor_shapes[full_name] = list(value.shape)
+    return plain_tensors, plain_tensor_shapes
+
+
+def _collect_eval_extra_state(model):
+    target_model = _unwrap_runtime_model(model)
+    runtime_attrs = {}
+    for attr_name in EVAL_RUNTIME_ATTR_NAMES:
+        if hasattr(target_model, attr_name):
+            runtime_attrs[attr_name] = _json_safe_metadata_value(
+                getattr(target_model, attr_name)
+            )
+
+    plain_tensors, plain_tensor_shapes = _collect_plain_tensor_attrs(model)
+    return {
+        "runtime_attrs": runtime_attrs,
+        "plain_tensor_attrs": plain_tensors,
+        "plain_tensor_attr_shapes": plain_tensor_shapes,
+        "keyword_state_dict_keys": _keyword_state_keys(_get_target_state_dict(model)),
+    }
+
+
+def _set_plain_tensor_attr(model, full_name, value):
+    target_model = _unwrap_runtime_model(model)
+    module_name, _, attr_name = str(full_name).rpartition(".")
+    modules = dict(target_model.named_modules())
+    module = modules.get(module_name, None) if module_name else target_model
+    if module is None or not attr_name:
+        return False
+    if not torch.is_tensor(value):
+        return False
+
+    current_value = getattr(module, attr_name, None)
+    restored_value = value.detach().clone()
+    if torch.is_tensor(current_value):
+        restored_value = restored_value.to(
+            device=current_value.device,
+            dtype=current_value.dtype,
+        )
+    setattr(module, attr_name, restored_value)
+    return True
+
+
+def restore_eval_extra_state(model, extra_state, logger=None):
+    if not isinstance(extra_state, dict):
+        return {"runtime_attrs": 0, "plain_tensor_attrs": 0}
+
+    target_model = _unwrap_runtime_model(model)
+    restored_runtime = 0
+    for attr_name, value in extra_state.get("runtime_attrs", {}).items():
+        if attr_name in EVAL_RUNTIME_ATTR_NAMES or hasattr(target_model, attr_name):
+            setattr(target_model, attr_name, value)
+            restored_runtime += 1
+
+    restored_plain_tensors = 0
+    for full_name, value in extra_state.get("plain_tensor_attrs", {}).items():
+        if _set_plain_tensor_attr(model, full_name, value):
+            restored_plain_tensors += 1
+
+    if logger is not None:
+        logger.info(
+            "[FULL_STATE_EXTRA_RESTORE] runtime_attrs=%d plain_tensor_attrs=%d",
+            restored_runtime,
+            restored_plain_tensors,
+        )
+    return {
+        "runtime_attrs": restored_runtime,
+        "plain_tensor_attrs": restored_plain_tensors,
+    }
+
+
+def is_full_eval_state_checkpoint(checkpoint):
+    return (
+        isinstance(checkpoint, dict)
+        and bool(checkpoint.get("full_eval_state_checkpoint", False))
+        and checkpoint.get("checkpoint_type", "") == "full_eval_state"
+    )
+
+
+def _tensor_stats_for_log(tensor):
+    tensor = tensor.detach().float()
+    if tensor.numel() == 0:
+        return "shape={} empty=True".format(list(tensor.shape))
+    return (
+        "shape={} mean={:.6f} std={:.6f} norm={:.6f}".format(
+            list(tensor.shape),
+            float(tensor.mean().item()),
+            float(tensor.std(unbiased=False).item()),
+            float(tensor.norm(p=2).item()),
+        )
+    )
+
+
+def log_eval_state_summary(
+    logger,
+    model,
+    stage,
+    checkpoint=None,
+    extra_state=None,
+):
+    model_state_dict = _get_target_state_dict(model)
+    model_keyword_keys = _keyword_state_keys(model_state_dict)
+    logger.info(
+        "[STATE_SUMMARY] stage=%s model_keyword_key_count=%d",
+        stage,
+        len(model_keyword_keys),
+    )
+    logger.info(
+        "[STATE_SUMMARY] stage=%s model_keyword_keys=%s",
+        stage,
+        model_keyword_keys,
+    )
+
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model", None), dict):
+        checkpoint_keyword_keys = _keyword_state_keys(checkpoint["model"])
+    else:
+        checkpoint_keyword_keys = []
+    logger.info(
+        "[STATE_SUMMARY] stage=%s checkpoint_keyword_key_count=%d",
+        stage,
+        len(checkpoint_keyword_keys),
+    )
+    if checkpoint_keyword_keys:
+        logger.info(
+            "[STATE_SUMMARY] stage=%s checkpoint_keyword_keys=%s",
+            stage,
+            checkpoint_keyword_keys,
+        )
+
+    plain_tensors, plain_tensor_shapes = _collect_plain_tensor_attrs(model)
+    logger.info(
+        "[STATE_SUMMARY] stage=%s plain_tensor_attr_count=%d plain_tensor_attrs=%s",
+        stage,
+        len(plain_tensors),
+        plain_tensor_shapes,
+    )
+
+    proto_keys = [
+        key
+        for key in model_state_dict.keys()
+        if "proto" in str(key).lower() or "prototype" in str(key).lower()
+    ]
+    for key in proto_keys:
+        value = model_state_dict[key]
+        if not torch.is_tensor(value):
+            continue
+        if value.dtype == torch.bool or "initialized" in str(key).lower():
+            logger.info(
+                "[STATE_SUMMARY] stage=%s prototype_state=%s shape=%s initialized_count=%d",
+                stage,
+                key,
+                list(value.shape),
+                int(value.bool().sum().item()),
+            )
+        else:
+            logger.info(
+                "[STATE_SUMMARY] stage=%s prototype_state=%s %s",
+                stage,
+                key,
+                _tensor_stats_for_log(value),
+            )
+
+    if isinstance(extra_state, dict):
+        logger.info(
+            "[STATE_SUMMARY] stage=%s extra_state_keys=%s",
+            stage,
+            list(extra_state.keys()),
+        )
+        logger.info(
+            "[STATE_SUMMARY] stage=%s extra_runtime_keys=%s extra_plain_tensor_keys=%s",
+            stage,
+            list(extra_state.get("runtime_attrs", {}).keys()),
+            list(extra_state.get("plain_tensor_attrs", {}).keys()),
+        )
+
+
+def load_full_eval_state_checkpoint(model, checkpoint_file, logger=None, checkpoint=None):
+    if checkpoint is None:
+        checkpoint = torch.load(checkpoint_file, map_location=torch.device("cpu"))
+    if not is_full_eval_state_checkpoint(checkpoint):
+        raise ValueError(f"Not a full eval state checkpoint: {checkpoint_file}")
+    if "model" not in checkpoint or not isinstance(checkpoint["model"], dict):
+        raise KeyError(f"Full eval state checkpoint has no model state: {checkpoint_file}")
+
+    load_state_dict(model, checkpoint["model"])
+    if logger is not None:
+        logger.info("[FULL_STATE_CKPT_LOAD] path=%s", checkpoint_file)
+    return checkpoint
+
+
+def _save_full_eval_state_checkpoint(
+    model,
+    args,
+    epoch,
+    metrics,
+    reason,
+    logger,
+):
+    if reason not in {"epoch", "best"}:
+        raise ValueError(f"Unsupported full eval checkpoint reason: {reason}")
+
+    metric_ckpt_dir = _resolve_metric_ckpt_dir(args)
+    os.makedirs(metric_ckpt_dir, exist_ok=True)
+
+    r1 = float(metrics.get("R1", 0.0)) if isinstance(metrics, dict) else 0.0
+    map_value = float(metrics.get("mAP", 0.0)) if isinstance(metrics, dict) else 0.0
+    prefix = "full_epoch" if reason == "epoch" else "full_best_epoch"
+    ckpt_name = f"{prefix}_{int(epoch):03d}_R1_{r1:.3f}_mAP_{map_value:.3f}"
+    ckpt_path = os.path.join(metric_ckpt_dir, f"{ckpt_name}.pth")
+
+    extra_state = _collect_eval_extra_state(model)
+    checkpoint = {
+        "checkpoint_type": "full_eval_state",
+        "full_eval_state_checkpoint": True,
+        "model": model.state_dict(),
+        "epoch": int(epoch),
+        "metrics": {
+            "R1": r1,
+            "R5": float(metrics.get("R5", 0.0)) if isinstance(metrics, dict) else 0.0,
+            "R10": float(metrics.get("R10", 0.0)) if isinstance(metrics, dict) else 0.0,
+            "mAP": map_value,
+            "mINP": float(metrics.get("mINP", 0.0)) if isinstance(metrics, dict) else 0.0,
+        },
+        "args": _args_to_plain_dict(args),
+        "extra_eval_state": extra_state,
+    }
+    log_eval_state_summary(
+        logger,
+        model,
+        stage="train_validation_before_save",
+        checkpoint=checkpoint,
+        extra_state=extra_state,
+    )
+    torch.save(checkpoint, ckpt_path)
+    logger.info(
+        "[FULL_STATE_CKPT_SAVE] path=%s epoch=%d R1=%.3f",
+        ckpt_path,
+        int(epoch),
+        r1,
+    )
+    return ckpt_path
 
 
 def _save_metric_checkpoint(
@@ -3020,6 +3348,15 @@ def do_train(
                     reason="epoch",
                     logger=logger,
                 )
+            if bool(getattr(args, "save_full_eval_state_ckpt", False)):
+                _save_full_eval_state_checkpoint(
+                    model=model,
+                    args=args,
+                    epoch=epoch,
+                    metrics=eval_metrics,
+                    reason="epoch",
+                    logger=logger,
+                )
             if best_top1 < top1:
                 best_top1 = top1
                 arguments["epoch"] = epoch
@@ -3032,6 +3369,15 @@ def do_train(
                         r1=metric_r1,
                         metrics=eval_metrics,
                         arguments=arguments,
+                        reason="best",
+                        logger=logger,
+                    )
+                if bool(getattr(args, "save_full_eval_state_ckpt", False)):
+                    _save_full_eval_state_checkpoint(
+                        model=model,
+                        args=args,
+                        epoch=epoch,
+                        metrics=eval_metrics,
                         reason="best",
                         logger=logger,
                     )
