@@ -1,4 +1,6 @@
 from prettytable import PrettyTable
+import hashlib
+import json
 import torch
 import numpy as np
 import os
@@ -9,6 +11,15 @@ from utils.query_adaptive_rerank import QueryAdaptiveLocalReranker
 from utils.transport_rerank import build_transport_reranker
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
+
+
+def _stable_hash(value):
+    encoded = json.dumps(value, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
+def _tensor_shape(tensor):
+    return list(tensor.shape) if torch.is_tensor(tensor) else []
 
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
@@ -52,12 +63,13 @@ def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
 
 
 class Evaluator():
-    def __init__(self, img_loader, txt_loader):
+    def __init__(self, img_loader, txt_loader, source="eval"):
         self.img_loader = img_loader # gallery
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("IRRA.eval")
         self.last_eval_result = None
         self._mtp_tokenizer = None
+        self.source = source
 
     def _get_mtp_tokenizer(self):
         if self._mtp_tokenizer is None:
@@ -389,6 +401,37 @@ class Evaluator():
     def _compute_embedding_with_local(self, model):
         # Backward-compatible wrapper for existing local-rerank callers.
         return self._compute_embedding(model, return_local_tokens=True)
+
+    def _log_feature_summary(self, qfeats, gfeats):
+        qfeats_float = qfeats.detach().float()
+        gfeats_float = gfeats.detach().float()
+        self.logger.info(
+            "[EVAL_FEATURE_SUMMARY] source=%s image_features_shape=%s text_features_shape=%s image_features_norm_mean=%.6f text_features_norm_mean=%.6f",
+            self.source,
+            _tensor_shape(gfeats),
+            _tensor_shape(qfeats),
+            float(gfeats_float.norm(p=2, dim=1).mean().item()) if gfeats_float.numel() else 0.0,
+            float(qfeats_float.norm(p=2, dim=1).mean().item()) if qfeats_float.numel() else 0.0,
+        )
+
+    def _log_score_summary(self, similarity):
+        sim_float = similarity.detach().float()
+        if sim_float.numel():
+            top1 = torch.argmax(sim_float, dim=1).detach().cpu().tolist()
+            sim_mean = float(sim_float.mean().item())
+            sim_std = float(sim_float.std(unbiased=False).item())
+        else:
+            top1 = []
+            sim_mean = 0.0
+            sim_std = 0.0
+        self.logger.info(
+            "[EVAL_SCORE_SUMMARY] source=%s sim_shape=%s sim_mean=%.6f sim_std=%.6f sim_top1_hash=%s",
+            self.source,
+            _tensor_shape(similarity),
+            sim_mean,
+            sim_std,
+            _stable_hash(top1),
+        )
     
     def eval(self, model, i2t_metric=False, return_local_tokens=False):
         use_qalr = bool(getattr(getattr(model, "args", None), "use_qalr", False))
@@ -400,6 +443,23 @@ class Evaluator():
         )
         return_local_tokens = bool(
             return_local_tokens or use_qalr or use_transport_rerank
+        )
+        model_args = getattr(model, "args", None)
+        self.logger.info(
+            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_transport_rerank=%s use_modality_text_prompt=%s",
+            self.source,
+            bool(getattr(model, "training", False)),
+            bool(getattr(model_args, "training", False)),
+            bool(getattr(model_args, "eval_use_fused_mu", True)),
+            bool(getattr(model_args, "eval_use_mu_only", False)),
+            getattr(model_args, "use_precision_fusion", None),
+            bool(getattr(model_args, "use_global_uncertainty", False)),
+            bool(getattr(model_args, "use_rgbt_add_fusion", True)),
+            bool(getattr(model_args, "use_batch_uncertainty", True)),
+            bool(getattr(model_args, "use_id_uncertainty", True)),
+            use_qalr,
+            use_transport_rerank,
+            use_mtp_eval_fusion,
         )
 
         # 1) Get embeddings.
@@ -415,6 +475,8 @@ class Evaluator():
             gids = embedding_outputs["gids"]
         else:
             qfeats, gfeats, qids, gids = self._compute_embedding(model)
+
+        self._log_feature_summary(qfeats, gfeats)
 
         # 2) L2 normalize before cosine similarity.
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
@@ -596,6 +658,8 @@ class Evaluator():
                 int(transport_stats.get("precision_used_pairs", 0)),
                 int(transport_stats.get("precision_fallback_pairs", 0)),
             )
+
+        self._log_score_summary(similarity)
 
         # 4) Compute retrieval metrics.
         t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)

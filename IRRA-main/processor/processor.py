@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -78,6 +79,15 @@ def _json_safe_metadata_value(value):
     return str(value)
 
 
+def _stable_hash(value):
+    encoded = json.dumps(
+        _json_safe_metadata_value(value),
+        ensure_ascii=True,
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
 def _args_to_plain_dict(args):
     if args is None:
         return {}
@@ -91,6 +101,109 @@ def _args_to_plain_dict(args):
         str(k): _json_safe_metadata_value(v)
         for k, v in source.items()
     }
+
+
+def _loader_drop_last(loader):
+    if hasattr(loader, "drop_last"):
+        return bool(loader.drop_last)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if hasattr(batch_sampler, "drop_last"):
+        return bool(batch_sampler.drop_last)
+    return False
+
+
+def _loader_shuffle(loader):
+    sampler = getattr(loader, "sampler", None)
+    sampler_name = sampler.__class__.__name__ if sampler is not None else "None"
+    return sampler_name in {"RandomSampler", "RandomIdentitySampler", "RandomIdentitySampler_DDP"}
+
+
+def _dataset_image_paths(dataset):
+    if hasattr(dataset, "img_paths"):
+        return list(getattr(dataset, "img_paths"))
+    paths = []
+    if hasattr(dataset, "img_paths_rgb"):
+        paths.extend(list(getattr(dataset, "img_paths_rgb")))
+    if hasattr(dataset, "img_paths_t"):
+        paths.extend(list(getattr(dataset, "img_paths_t")))
+    return paths
+
+
+def _eval_order_hashes(img_loader, txt_loader):
+    img_dataset = getattr(img_loader, "dataset", None)
+    txt_dataset = getattr(txt_loader, "dataset", None)
+    image_pids = list(getattr(img_dataset, "image_pids", []))
+    caption_pids = list(getattr(txt_dataset, "caption_pids", []))
+    img_paths = _dataset_image_paths(img_dataset)
+    captions = list(getattr(txt_dataset, "captions", []))
+    return {
+        "image_ids_hash": _stable_hash(image_pids),
+        "caption_ids_hash": _stable_hash(caption_pids),
+        "pid_hash": _stable_hash({"image_pids": image_pids, "caption_pids": caption_pids}),
+        "img_path_hash": _stable_hash(img_paths),
+        "caption_text_hash": _stable_hash(captions),
+    }
+
+
+def log_eval_pipeline_summary(logger, source, function, img_loader, txt_loader, args):
+    img_dataset = getattr(img_loader, "dataset", None)
+    txt_dataset = getattr(txt_loader, "dataset", None)
+    img_sampler = getattr(img_loader, "sampler", None)
+    txt_sampler = getattr(txt_loader, "sampler", None)
+    image_pids = list(getattr(img_dataset, "image_pids", []))
+    caption_pids = list(getattr(txt_dataset, "caption_pids", []))
+    split = (
+        str(getattr(args, "val_dataset", "test"))
+        if source == "train_validation"
+        else str(getattr(args, "eval_dataset", "test"))
+    )
+    num_ids = len(set(image_pids) | set(caption_pids))
+    logger.info(
+        "[EVAL_PIPELINE] source=%s function=%s split=%s loader_len=%s/%s batch_size=%s/%s shuffle=%s/%s drop_last=%s/%s sampler=%s/%s dataset_class=%s/%s num_images=%d num_captions=%d num_ids=%d",
+        source,
+        function,
+        split,
+        len(img_loader),
+        len(txt_loader),
+        getattr(img_loader, "batch_size", None),
+        getattr(txt_loader, "batch_size", None),
+        _loader_shuffle(img_loader),
+        _loader_shuffle(txt_loader),
+        _loader_drop_last(img_loader),
+        _loader_drop_last(txt_loader),
+        img_sampler.__class__.__name__ if img_sampler is not None else "None",
+        txt_sampler.__class__.__name__ if txt_sampler is not None else "None",
+        img_dataset.__class__.__name__ if img_dataset is not None else "None",
+        txt_dataset.__class__.__name__ if txt_dataset is not None else "None",
+        len(image_pids),
+        len(caption_pids),
+        num_ids,
+    )
+    logger.info(
+        "[EVAL_PIPELINE_FLAGS] source=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_transport_rerank=%s use_modality_text_prompt=%s",
+        source,
+        bool(getattr(args, "training", False)),
+        bool(getattr(args, "eval_use_fused_mu", True)),
+        bool(getattr(args, "eval_use_mu_only", False)),
+        getattr(args, "use_precision_fusion", None),
+        bool(getattr(args, "use_global_uncertainty", False)),
+        bool(getattr(args, "use_rgbt_add_fusion", True)),
+        bool(getattr(args, "use_batch_uncertainty", True)),
+        bool(getattr(args, "use_id_uncertainty", True)),
+        bool(getattr(args, "use_qalr", False)),
+        bool(getattr(args, "use_transport_rerank", False)),
+        bool(getattr(args, "use_modality_text_prompt", False)),
+    )
+    hashes = _eval_order_hashes(img_loader, txt_loader)
+    logger.info(
+        "[EVAL_ORDER_HASH] source=%s image_ids_hash=%s caption_ids_hash=%s pid_hash=%s img_path_hash=%s caption_text_hash=%s",
+        source,
+        hashes["image_ids_hash"],
+        hashes["caption_ids_hash"],
+        hashes["pid_hash"],
+        hashes["img_path_hash"],
+        hashes["caption_text_hash"],
+    )
 
 
 def _has_eval_state_keyword(name):
@@ -3481,6 +3594,15 @@ def do_train(
                 float(getattr(args, "mtp_eval_fusion_beta", 0.00)),
             )
             logger.info("Validation Results - Epoch: {}".format(epoch))
+            evaluator.source = "train_validation"
+            log_eval_pipeline_summary(
+                logger,
+                source="train_validation",
+                function="Evaluator.eval",
+                img_loader=evaluator.img_loader,
+                txt_loader=evaluator.txt_loader,
+                args=args,
+            )
             if args.distributed:
                 top1 = evaluator.eval(model.module.eval())
             else:
@@ -3554,7 +3676,7 @@ def do_train(
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
 
 
-def do_inference(model, test_img_loader, test_txt_loader):
+def do_inference(model, test_img_loader, test_txt_loader, eval_source="test_py"):
     logger = logging.getLogger("IRRA.test")
     logger.info("Enter inferencing")
     model_args = getattr(model, "args", None)
@@ -3571,5 +3693,13 @@ def do_inference(model, test_img_loader, test_txt_loader):
         float(getattr(model_args, "mtp_eval_fusion_beta", 0.00)),
     )
     log_img_local_filter_eval_state(logger, model, prefix="INFERENCE")
-    evaluator = Evaluator(test_img_loader, test_txt_loader)
+    log_eval_pipeline_summary(
+        logger,
+        source=eval_source,
+        function="do_inference->Evaluator.eval",
+        img_loader=test_img_loader,
+        txt_loader=test_txt_loader,
+        args=model_args,
+    )
+    evaluator = Evaluator(test_img_loader, test_txt_loader, source=eval_source)
     evaluator.eval(model.eval())

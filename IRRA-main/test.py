@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os.path as op
 
 import torch
@@ -74,6 +75,12 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="checkpoint file to evaluate; defaults to output_dir/best.pth",
+    )
+    parser.add_argument(
+        "--use_train_validation_pipeline",
+        default=False,
+        action="store_true",
+        help="build eval dataloaders through the same training validation branch used by train.py",
     )
     parser.add_argument(
         "--use_qalr",
@@ -157,7 +164,19 @@ if __name__ == "__main__":
     logger.info(args)
     device = "cuda"
 
-    test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
+    if cli_args.use_train_validation_pipeline:
+        loader_args = copy.deepcopy(args)
+        loader_args.training = True
+        loader_args.distributed = False
+        args.eval_dataset = str(getattr(args, "val_dataset", "test"))
+        _, test_img_loader, test_txt_loader, num_classes = build_dataloader(loader_args)
+        logger.info(
+            "[TEST_PIPELINE] use_train_validation_pipeline=True val_dataset=%s batch_size=%s",
+            getattr(loader_args, "val_dataset", "test"),
+            getattr(loader_args, "batch_size", None),
+        )
+    else:
+        test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes=num_classes)
 
     checkpointer = Checkpointer(model)
@@ -203,4 +222,4 @@ if __name__ == "__main__":
         )
 
     model.to(device)
-    do_inference(model, test_img_loader, test_txt_loader)
+    do_inference(model, test_img_loader, test_txt_loader, eval_source="test_py")
