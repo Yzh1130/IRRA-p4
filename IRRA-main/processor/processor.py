@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets.bases import tokenize
 from model import build_model, objectives
+from model.objectives import compute_uspc_loss
 from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
@@ -892,6 +893,37 @@ def _log_uspc_debug_examples(logger, raw_captions, uspc_inputs=None):
         torch.is_tensor(uspc_inputs.get("rgb_logvar")),
         torch.is_tensor(uspc_inputs.get("thermal_logvar")),
         torch.is_tensor(uspc_inputs.get("fused_logvar")),
+    )
+
+
+def _log_uspc_debug_status(logger, args, uspc_terms=None):
+    lambda_uspc = float(getattr(args, "lambda_uspc", 0.0))
+    if uspc_terms is None:
+        logger.info(
+            "[USPC][LOSS_STATUS] active=0 lambda_uspc=%.6f loss_uspc=0.000000 "
+            "loss_uspc_raw=0.000000 loss_uspc_color=0.000000 "
+            "loss_uspc_struct=0.000000 loss_uspc_full=0.000000 "
+            "uspc_rgb_conf_mean=1.000000 uspc_thermal_conf_mean=1.000000 "
+            "uspc_fused_conf_mean=1.000000",
+            lambda_uspc,
+        )
+        return
+
+    logger.info(
+        "[USPC][LOSS_STATUS] active=%d lambda_uspc=%.6f loss_uspc=%.6f "
+        "loss_uspc_raw=%.6f loss_uspc_color=%.6f loss_uspc_struct=%.6f "
+        "loss_uspc_full=%.6f uspc_rgb_conf_mean=%.6f "
+        "uspc_thermal_conf_mean=%.6f uspc_fused_conf_mean=%.6f",
+        int(round(_to_scalar(uspc_terms.get("uspc_active", 0)))),
+        lambda_uspc,
+        _to_scalar(uspc_terms.get("loss_uspc", 0)),
+        _to_scalar(uspc_terms.get("loss_uspc_raw", 0)),
+        _to_scalar(uspc_terms.get("loss_uspc_color", 0)),
+        _to_scalar(uspc_terms.get("loss_uspc_struct", 0)),
+        _to_scalar(uspc_terms.get("loss_uspc_full", 0)),
+        _to_scalar(uspc_terms.get("uspc_rgb_conf_mean", 1)),
+        _to_scalar(uspc_terms.get("uspc_thermal_conf_mean", 1)),
+        _to_scalar(uspc_terms.get("uspc_fused_conf_mean", 1)),
     )
 
 
@@ -3134,6 +3166,15 @@ def do_train(
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
         "loss_mlm": AverageMeter(),
+        "loss_uspc": AverageMeter(),
+        "loss_uspc_raw": AverageMeter(),
+        "loss_uspc_color": AverageMeter(),
+        "loss_uspc_struct": AverageMeter(),
+        "loss_uspc_full": AverageMeter(),
+        "uspc_rgb_conf_mean": AverageMeter(),
+        "uspc_thermal_conf_mean": AverageMeter(),
+        "uspc_fused_conf_mean": AverageMeter(),
+        "uspc_active": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
         "loss_th_txt": AverageMeter(),
         "loss_txt_cons": AverageMeter(),
@@ -3306,6 +3347,12 @@ def do_train(
                 mtp_text_example_logged = True
 
             ret = model(batch)
+            uspc_debug_should_log = (
+                use_uspc
+                and bool(getattr(args, "debug_uspc", False))
+                and n_iter == 0
+                and (not uspc_debug_logged_this_epoch)
+            )
             uspc_inputs = None
             if _uspc_should_encode_views(args):
                 uspc_inputs = _build_uspc_forward_inputs(
@@ -3315,26 +3362,6 @@ def do_train(
                     ret,
                     tokenizer=uspc_text_tokenizer,
                 )
-            if (
-                use_uspc
-                and bool(getattr(args, "debug_uspc", False))
-                and n_iter == 0
-                and (not uspc_debug_logged_this_epoch)
-            ):
-                if uspc_inputs is None:
-                    _log_uspc_debug_examples(
-                        logger,
-                        _uspc_normalize_raw_captions(batch.get("raw_captions", [])),
-                        uspc_inputs=None,
-                    )
-                else:
-                    _log_uspc_debug_examples(
-                        logger,
-                        uspc_inputs["raw_captions"],
-                        uspc_inputs=uspc_inputs,
-                    )
-                uspc_debug_logged_this_epoch = True
-            del uspc_inputs
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
             ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))
@@ -3357,6 +3384,45 @@ def do_train(
                     args, total_loss, ret, epoch
                 )
             total_loss = _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch)
+            uspc_terms = None
+            if _uspc_should_encode_views(args):
+                if uspc_inputs is None:
+                    raise RuntimeError(
+                        "USPC loss is requested but semantic text view inputs were "
+                        "not built."
+                    )
+                uspc_terms = compute_uspc_loss(
+                    rgb_feat=uspc_inputs["rgb_feat"],
+                    thermal_feat=uspc_inputs["thermal_feat"],
+                    fused_feat=uspc_inputs["fused_feat"],
+                    full_text_feat=uspc_inputs["full_text_feat"],
+                    color_text_feat=uspc_inputs["color_text_feat"],
+                    struct_text_feat=uspc_inputs["struct_text_feat"],
+                    pids=batch.get("pids", None),
+                    rgb_logvar=uspc_inputs.get("rgb_logvar", None),
+                    thermal_logvar=uspc_inputs.get("thermal_logvar", None),
+                    fused_logvar=uspc_inputs.get("fused_logvar", None),
+                    args=args,
+                    epoch=epoch,
+                )
+                # compute_uspc_loss already applies lambda_uspc internally.
+                total_loss = total_loss + uspc_terms["loss_uspc"]
+
+            if uspc_debug_should_log:
+                if uspc_inputs is None:
+                    _log_uspc_debug_examples(
+                        logger,
+                        _uspc_normalize_raw_captions(batch.get("raw_captions", [])),
+                        uspc_inputs=None,
+                    )
+                else:
+                    _log_uspc_debug_examples(
+                        logger,
+                        uspc_inputs["raw_captions"],
+                        uspc_inputs=uspc_inputs,
+                    )
+                _log_uspc_debug_status(logger, args, uspc_terms=uspc_terms)
+                uspc_debug_logged_this_epoch = True
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
@@ -3375,6 +3441,28 @@ def do_train(
             meters["loss_mlm"].update(
                 _to_scalar(ret.get("loss_mlm", ret.get("mlm_loss", 0))), batch_size
             )
+            if uspc_terms is not None:
+                for uspc_loss_name in [
+                    "loss_uspc",
+                    "loss_uspc_raw",
+                    "loss_uspc_color",
+                    "loss_uspc_struct",
+                    "loss_uspc_full",
+                ]:
+                    meters[uspc_loss_name].update(
+                        _to_scalar(uspc_terms.get(uspc_loss_name, 0)),
+                        batch_size,
+                    )
+                for uspc_stat_name in [
+                    "uspc_rgb_conf_mean",
+                    "uspc_thermal_conf_mean",
+                    "uspc_fused_conf_mean",
+                    "uspc_active",
+                ]:
+                    meters[uspc_stat_name].update(
+                        _to_scalar(uspc_terms.get(uspc_stat_name, 0)),
+                        1,
+                    )
             if "loss_rgb_txt" in ret:
                 meters["loss_rgb_txt"].update(
                     _to_scalar(ret["loss_rgb_txt"]), batch_size
