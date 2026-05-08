@@ -35,6 +35,7 @@ COMMON_ARGS=(
   --test_batch_size 512
   --num_workers 8
   --num_epoch 5
+  --warmup_epochs 1
   --eval_period 1
   --log_period 200
   --output_dir "${RUNS_DIR}"
