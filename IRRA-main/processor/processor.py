@@ -3421,7 +3421,8 @@ def do_train(
                         uspc_inputs["raw_captions"],
                         uspc_inputs=uspc_inputs,
                     )
-                _log_uspc_debug_status(logger, args, uspc_terms=uspc_terms)
+                if uspc_terms is not None:
+                    _log_uspc_debug_status(logger, args, uspc_terms=uspc_terms)
                 uspc_debug_logged_this_epoch = True
 
             batch_size = batch["images"].shape[0]
