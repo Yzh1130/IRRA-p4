@@ -60,6 +60,14 @@ def tokenize(caption: str, tokenizer, text_length=77, truncate=True) -> torch.Lo
     return result
 
 
+def _safe_raw_caption(caption):
+    if caption is None:
+        return ""
+    if isinstance(caption, str):
+        return caption
+    return str(caption)
+
+
 class OfflineHardNegativeMixin:
     def _init_offline_hardneg(
         self,
@@ -277,6 +285,7 @@ class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
             'image_ids': image_id,
             'images': img,
             'caption_ids': tokens,
+            'raw_captions': _safe_raw_caption(caption),
             'caption_is_synth': self._get_caption_is_synth(index),
             'caption_weight': self._get_caption_weight(index),
         }
@@ -475,6 +484,7 @@ class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
             'caption_ids': caption_tokens,
             'mlm_ids': mlm_tokens,
             'mlm_labels': mlm_labels,
+            'raw_captions': _safe_raw_caption(caption),
             'caption_is_synth': self._get_caption_is_synth(index),
             'caption_weight': self._get_caption_weight(index),
         }

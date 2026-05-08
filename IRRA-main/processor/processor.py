@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from datasets.bases import tokenize
 from model import build_model, objectives
 from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
@@ -15,6 +16,7 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
+from utils.uspc_text_views import build_uspc_text_views
 
 
 EVAL_STATE_KEYWORDS = (
@@ -730,6 +732,167 @@ def _decode_caption_token_ids_for_log(caption_ids, tokenizer):
     if not filtered:
         return ""
     return " ".join(tokenizer.decode(filtered).split())
+
+
+def _uspc_enabled(args):
+    return bool(getattr(args, "use_uspc", False))
+
+
+def _uspc_should_encode_views(args):
+    return _uspc_enabled(args) and float(getattr(args, "lambda_uspc", 0.0)) > 0.0
+
+
+def _uspc_normalize_raw_captions(raw_captions):
+    if isinstance(raw_captions, str):
+        return [raw_captions]
+    if raw_captions is None:
+        return []
+    return ["" if caption is None else str(caption) for caption in list(raw_captions)]
+
+
+def _uspc_tokenize_text_batch(texts, tokenizer, text_length, device):
+    token_tensors = [
+        tokenize(text, tokenizer=tokenizer, text_length=text_length)
+        for text in texts
+    ]
+    if not token_tensors:
+        raise ValueError("USPC text view tokenization received an empty text list.")
+    return torch.stack(token_tensors, dim=0).to(device)
+
+
+def _uspc_encode_text_tokens(model, token_ids):
+    target_model = _unwrap_runtime_model(model)
+    if hasattr(target_model, "encode_text_deterministic"):
+        return target_model.encode_text_deterministic(token_ids)
+    if hasattr(target_model, "encode_text"):
+        return target_model.encode_text(token_ids)
+    raise AttributeError(
+        "USPC text view encoding requires model.encode_text_deterministic() "
+        "or model.encode_text()."
+    )
+
+
+def _uspc_select_ret_feature(ret, primary_key, fallback_key, display_name):
+    feature = ret.get(primary_key, None)
+    if feature is None:
+        feature = ret.get(fallback_key, None)
+    if feature is None:
+        raise KeyError(
+            f"USPC requires {display_name}; tried ret['{primary_key}'] "
+            f"then ret['{fallback_key}']."
+        )
+    return feature
+
+
+def _uspc_shape_string(value):
+    if torch.is_tensor(value):
+        return str(list(value.shape))
+    return "None"
+
+
+def _build_uspc_forward_inputs(args, model, batch, ret, tokenizer):
+    if "raw_captions" not in batch:
+        raise KeyError(
+            "USPC is enabled with lambda_uspc > 0, but batch['raw_captions'] "
+            "is missing. Ensure the training dataset returns raw captions."
+        )
+    raw_captions = _uspc_normalize_raw_captions(batch["raw_captions"])
+    if not raw_captions:
+        raise ValueError("USPC is enabled with lambda_uspc > 0, but raw_captions is empty.")
+
+    try:
+        views = build_uspc_text_views(
+            raw_captions,
+            mode=str(getattr(args, "uspc_text_view_mode", "rule")),
+        )
+        device = batch["caption_ids"].device
+        text_length = int(getattr(args, "text_length", batch["caption_ids"].shape[1]))
+        color_ids = _uspc_tokenize_text_batch(
+            views["color"],
+            tokenizer=tokenizer,
+            text_length=text_length,
+            device=device,
+        )
+        struct_ids = _uspc_tokenize_text_batch(
+            views["struct"],
+            tokenizer=tokenizer,
+            text_length=text_length,
+            device=device,
+        )
+        color_text_feat = _uspc_encode_text_tokens(model, color_ids)
+        struct_text_feat = _uspc_encode_text_tokens(model, struct_ids)
+
+        full_text_feat = ret.get("text_mu", None)
+        if full_text_feat is None:
+            full_text_feat = ret.get("text_det_feat", None)
+        if full_text_feat is None:
+            full_ids = _uspc_tokenize_text_batch(
+                views["full"],
+                tokenizer=tokenizer,
+                text_length=text_length,
+                device=device,
+            )
+            full_text_feat = _uspc_encode_text_tokens(model, full_ids)
+
+        return {
+            "raw_captions": raw_captions,
+            "views": views,
+            "rgb_feat": _uspc_select_ret_feature(ret, "rgb_mu", "v_rgb_c", "rgb_feat"),
+            "thermal_feat": _uspc_select_ret_feature(
+                ret, "thermal_mu", "v_t_c", "thermal_feat"
+            ),
+            "fused_feat": _uspc_select_ret_feature(
+                ret, "fused_mu", "fused_det_feat", "fused_feat"
+            ),
+            "full_text_feat": full_text_feat,
+            "color_text_feat": color_text_feat,
+            "struct_text_feat": struct_text_feat,
+            "rgb_logvar": ret.get("rgb_logvar", None),
+            "thermal_logvar": ret.get("thermal_logvar", None),
+            "fused_logvar": ret.get("fused_logvar", None),
+        }
+    except Exception as exc:
+        raise RuntimeError(f"Failed to build/encode USPC semantic text views: {exc}") from exc
+
+
+def _log_uspc_debug_examples(logger, raw_captions, uspc_inputs=None):
+    for idx, raw_caption in enumerate(list(raw_captions)[:2]):
+        logger.info(
+            "[USPC][RAW_CAPTION_EXAMPLE] idx=%d raw=%s",
+            idx,
+            _truncate_log_text(raw_caption),
+        )
+    if uspc_inputs is None:
+        return
+
+    views = uspc_inputs["views"]
+    for idx, color_view in enumerate(list(views.get("color", []))[:2]):
+        logger.info(
+            "[USPC][COLOR_VIEW_EXAMPLE] idx=%d color=%s",
+            idx,
+            _truncate_log_text(color_view),
+        )
+    for idx, struct_view in enumerate(list(views.get("struct", []))[:2]):
+        logger.info(
+            "[USPC][STRUCT_VIEW_EXAMPLE] idx=%d struct=%s",
+            idx,
+            _truncate_log_text(struct_view),
+        )
+    logger.info(
+        "[USPC][FEATURE_SHAPES] rgb_feat=%s thermal_feat=%s fused_feat=%s full_text_feat=%s color_text_feat=%s struct_text_feat=%s",
+        _uspc_shape_string(uspc_inputs.get("rgb_feat")),
+        _uspc_shape_string(uspc_inputs.get("thermal_feat")),
+        _uspc_shape_string(uspc_inputs.get("fused_feat")),
+        _uspc_shape_string(uspc_inputs.get("full_text_feat")),
+        _uspc_shape_string(uspc_inputs.get("color_text_feat")),
+        _uspc_shape_string(uspc_inputs.get("struct_text_feat")),
+    )
+    logger.info(
+        "[USPC][LOGVAR_AVAILABLE] rgb_logvar=%s thermal_logvar=%s fused_logvar=%s",
+        torch.is_tensor(uspc_inputs.get("rgb_logvar")),
+        torch.is_tensor(uspc_inputs.get("thermal_logvar")),
+        torch.is_tensor(uspc_inputs.get("fused_logvar")),
+    )
 
 
 def _compute_batch_mean_shared_consistency_layer_loss(rgb_feat, thermal_feat):
@@ -3072,6 +3235,8 @@ def do_train(
     tb_writer = SummaryWriter(log_dir=args.output_dir)
     best_top1 = 0.0
     mtp_text_example_logged = False
+    use_uspc = _uspc_enabled(args)
+    uspc_text_tokenizer = SimpleTokenizer() if use_uspc else None
     use_modality_text_prompt = bool(
         getattr(args, "use_modality_text_prompt", False)
     )
@@ -3081,6 +3246,7 @@ def do_train(
 
     for epoch in range(start_epoch, num_epoch + 1):
         start_time = time.time()
+        uspc_debug_logged_this_epoch = False
         for meter in meters.values():
             meter.reset()
         epoch_img_local_runtime = resolve_img_local_runtime(args, epoch)
@@ -3140,6 +3306,35 @@ def do_train(
                 mtp_text_example_logged = True
 
             ret = model(batch)
+            uspc_inputs = None
+            if _uspc_should_encode_views(args):
+                uspc_inputs = _build_uspc_forward_inputs(
+                    args,
+                    model,
+                    batch,
+                    ret,
+                    tokenizer=uspc_text_tokenizer,
+                )
+            if (
+                use_uspc
+                and bool(getattr(args, "debug_uspc", False))
+                and n_iter == 0
+                and (not uspc_debug_logged_this_epoch)
+            ):
+                if uspc_inputs is None:
+                    _log_uspc_debug_examples(
+                        logger,
+                        _uspc_normalize_raw_captions(batch.get("raw_captions", [])),
+                        uspc_inputs=None,
+                    )
+                else:
+                    _log_uspc_debug_examples(
+                        logger,
+                        uspc_inputs["raw_captions"],
+                        uspc_inputs=uspc_inputs,
+                    )
+                uspc_debug_logged_this_epoch = True
+            del uspc_inputs
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
             ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))

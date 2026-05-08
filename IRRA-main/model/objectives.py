@@ -783,3 +783,281 @@ def compute_w2_diag_pairwise_matrix(
         logvar_min=logvar_min,
         logvar_max=logvar_max,
     )
+
+
+def _uspc_get_arg(args, name, default):
+    if args is None:
+        return default
+    return getattr(args, name, default)
+
+
+def _uspc_reference_tensor(*values):
+    for value in values:
+        if torch.is_tensor(value):
+            return value
+    return torch.zeros(())
+
+
+def _uspc_zero_output(reference):
+    zero = reference.new_zeros(())
+    one = reference.new_ones(())
+    return {
+        "loss_uspc": zero,
+        "loss_uspc_raw": zero,
+        "loss_uspc_color": zero,
+        "loss_uspc_struct": zero,
+        "loss_uspc_full": zero,
+        "uspc_rgb_conf_mean": one,
+        "uspc_thermal_conf_mean": one,
+        "uspc_fused_conf_mean": one,
+        "uspc_active": zero,
+    }
+
+
+def _uspc_require_feature(name, value):
+    if not torch.is_tensor(value):
+        raise KeyError(
+            "USPC is active but required feature is missing or not a tensor: "
+            f"{name}."
+        )
+    if value.dim() != 2:
+        raise ValueError(
+            f"USPC expects {name} to have shape [B, C], got {tuple(value.shape)}."
+        )
+
+
+def _uspc_clean_normalize(feat, eps=1e-12):
+    feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return F.normalize(feat, p=2, dim=1, eps=eps)
+
+
+def _uspc_weighted_mean(loss_per_sample, sample_weight, eps=1e-6):
+    if sample_weight is None:
+        return loss_per_sample.mean()
+    sample_weight = sample_weight.to(
+        device=loss_per_sample.device,
+        dtype=loss_per_sample.dtype,
+    ).reshape(-1)
+    if sample_weight.shape[0] != loss_per_sample.shape[0]:
+        raise ValueError(
+            "USPC sample weight must match batch size, got "
+            f"{sample_weight.shape[0]} and {loss_per_sample.shape[0]}."
+        )
+    sample_weight = torch.nan_to_num(
+        sample_weight, nan=1.0, posinf=1.0, neginf=1.0
+    ).clamp_min(0.0)
+    return (loss_per_sample * sample_weight).sum() / sample_weight.sum().clamp_min(eps)
+
+
+def _uspc_alignment_loss(
+    image_feat,
+    text_feat,
+    pids=None,
+    temperature=0.02,
+    sample_weight=None,
+    eps=1e-8,
+):
+    if image_feat.shape != text_feat.shape:
+        raise ValueError(
+            "USPC alignment expects paired image/text features with same shape, "
+            f"got {tuple(image_feat.shape)} and {tuple(text_feat.shape)}."
+        )
+    if temperature <= 0:
+        raise ValueError(f"USPC temperature must be > 0, got {temperature}.")
+
+    image_feat = _uspc_clean_normalize(image_feat)
+    text_feat = _uspc_clean_normalize(text_feat)
+    batch_size = image_feat.shape[0]
+    sim = image_feat @ text_feat.t()
+    sim = sim / float(temperature)
+
+    if pids is not None:
+        pids = pids.reshape(-1).to(device=sim.device)
+        if pids.shape[0] != batch_size:
+            raise ValueError(
+                "USPC pids must match batch size, got "
+                f"{pids.shape[0]} and {batch_size}."
+            )
+        labels = pids.unsqueeze(1).eq(pids.unsqueeze(0)).float()
+        labels = labels / labels.sum(dim=1, keepdim=True).clamp_min(eps)
+        per_i2t = -(labels * F.log_softmax(sim, dim=1)).sum(dim=1)
+        per_t2i = -(labels.t() * F.log_softmax(sim.t(), dim=1)).sum(dim=1)
+    else:
+        target = torch.arange(batch_size, device=sim.device)
+        per_i2t = F.cross_entropy(sim, target, reduction="none")
+        per_t2i = F.cross_entropy(sim.t(), target, reduction="none")
+
+    loss_i2t = _uspc_weighted_mean(per_i2t, sample_weight)
+    # The first USPC version uses the same image-side confidence for the reverse
+    # direction because batch rows are paired image/text samples.
+    loss_t2i = _uspc_weighted_mean(per_t2i, sample_weight)
+    return 0.5 * (loss_i2t + loss_t2i)
+
+
+def _uspc_confidence_from_logvar(
+    logvar,
+    reference_feat,
+    uncertainty_weighting=False,
+    detach_weight=True,
+    eps=1e-6,
+):
+    batch_size = reference_feat.shape[0]
+    if (not uncertainty_weighting) or logvar is None:
+        return reference_feat.new_ones(batch_size), reference_feat.new_ones(())
+    if not torch.is_tensor(logvar):
+        return reference_feat.new_ones(batch_size), reference_feat.new_ones(())
+    if logvar.shape[0] != batch_size:
+        raise ValueError(
+            "USPC logvar batch size mismatch: "
+            f"{logvar.shape[0]} vs {batch_size}."
+        )
+
+    logvar = torch.nan_to_num(logvar.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if logvar.dim() == 1:
+        mean_logvar = logvar
+    else:
+        mean_logvar = logvar.reshape(batch_size, -1).mean(dim=1)
+    mean_logvar = torch.clamp(mean_logvar, min=-30.0, max=30.0)
+    conf = torch.exp(-mean_logvar)
+    conf = torch.nan_to_num(conf, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(eps)
+    conf = conf / (conf.mean().detach() + eps)
+    if detach_weight:
+        conf = conf.detach()
+    return conf, conf.detach().mean()
+
+
+def compute_uspc_loss(
+    rgb_feat,
+    thermal_feat,
+    fused_feat,
+    full_text_feat,
+    color_text_feat,
+    struct_text_feat,
+    pids=None,
+    rgb_logvar=None,
+    thermal_logvar=None,
+    fused_logvar=None,
+    args=None,
+    epoch=0,
+):
+    """
+    Compute USPC v1 feature-level semantic alignment loss.
+
+    USPC v1 aligns:
+      RGB feature     <-> color text view
+      Thermal feature <-> structure/color-free text view
+      Fused feature   <-> full text view
+
+    This pure function is intentionally not connected to the training loop.
+    """
+    reference = _uspc_reference_tensor(
+        rgb_feat,
+        thermal_feat,
+        fused_feat,
+        full_text_feat,
+        color_text_feat,
+        struct_text_feat,
+    )
+    use_uspc = bool(_uspc_get_arg(args, "use_uspc", False))
+    lambda_uspc = float(_uspc_get_arg(args, "lambda_uspc", 0.0))
+    warmup_epochs = int(_uspc_get_arg(args, "uspc_warmup_epochs", 0))
+    if (not use_uspc) or lambda_uspc <= 0.0 or int(epoch) <= warmup_epochs:
+        return _uspc_zero_output(reference)
+
+    version = str(_uspc_get_arg(args, "uspc_version", "v1")).lower()
+    if version != "v1":
+        raise ValueError(f"Unsupported USPC version: {version}. Expected 'v1'.")
+    loss_type = str(_uspc_get_arg(args, "uspc_loss_type", "sdm")).lower()
+    if loss_type != "sdm":
+        raise NotImplementedError(
+            "USPC loss_type='ce' is reserved but not implemented in v1."
+        )
+
+    required = {
+        "rgb_feat": rgb_feat,
+        "thermal_feat": thermal_feat,
+        "fused_feat": fused_feat,
+        "full_text_feat": full_text_feat,
+        "color_text_feat": color_text_feat,
+        "struct_text_feat": struct_text_feat,
+    }
+    for name, value in required.items():
+        _uspc_require_feature(name, value)
+
+    batch_size = rgb_feat.shape[0]
+    feat_dim = rgb_feat.shape[1]
+    for name, value in required.items():
+        if value.shape[0] != batch_size or value.shape[1] != feat_dim:
+            raise ValueError(
+                "USPC feature shapes must all match [B, C]; "
+                f"rgb_feat={tuple(rgb_feat.shape)}, {name}={tuple(value.shape)}."
+            )
+
+    temperature = float(_uspc_get_arg(args, "temperature", 0.02))
+    uncertainty_weighting = bool(
+        _uspc_get_arg(args, "uspc_uncertainty_weighting", False)
+    )
+    weight_detach = bool(_uspc_get_arg(args, "uspc_weight_detach", True))
+
+    rgb_conf, rgb_conf_mean = _uspc_confidence_from_logvar(
+        rgb_logvar,
+        rgb_feat,
+        uncertainty_weighting=uncertainty_weighting,
+        detach_weight=weight_detach,
+    )
+    thermal_conf, thermal_conf_mean = _uspc_confidence_from_logvar(
+        thermal_logvar,
+        thermal_feat,
+        uncertainty_weighting=uncertainty_weighting,
+        detach_weight=weight_detach,
+    )
+    fused_conf, fused_conf_mean = _uspc_confidence_from_logvar(
+        fused_logvar,
+        fused_feat,
+        uncertainty_weighting=uncertainty_weighting,
+        detach_weight=weight_detach,
+    )
+
+    loss_color = _uspc_alignment_loss(
+        rgb_feat,
+        color_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=rgb_conf,
+    )
+    loss_struct = _uspc_alignment_loss(
+        thermal_feat,
+        struct_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=thermal_conf,
+    )
+    loss_full = _uspc_alignment_loss(
+        fused_feat,
+        full_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=fused_conf,
+    )
+
+    color_weight = float(_uspc_get_arg(args, "uspc_color_weight", 1.0))
+    struct_weight = float(_uspc_get_arg(args, "uspc_struct_weight", 1.0))
+    full_weight = float(_uspc_get_arg(args, "uspc_full_weight", 1.0))
+    loss_raw = (
+        color_weight * loss_color
+        + struct_weight * loss_struct
+        + full_weight * loss_full
+    )
+    loss_uspc = lambda_uspc * loss_raw
+
+    return {
+        "loss_uspc": loss_uspc,
+        "loss_uspc_raw": loss_raw,
+        "loss_uspc_color": loss_color,
+        "loss_uspc_struct": loss_struct,
+        "loss_uspc_full": loss_full,
+        "uspc_rgb_conf_mean": rgb_conf_mean,
+        "uspc_thermal_conf_mean": thermal_conf_mean,
+        "uspc_fused_conf_mean": fused_conf_mean,
+        "uspc_active": loss_uspc.new_ones(()),
+    }
