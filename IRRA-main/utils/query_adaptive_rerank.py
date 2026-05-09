@@ -159,11 +159,14 @@ class QueryAdaptiveLocalReranker(object):
                 f"{self.score_norm_type}. Only 'zscore' is currently supported."
             )
 
-        local_mean = local_scores.mean(dim=1, keepdim=True)
-        local_std = local_scores.std(dim=1, unbiased=False, keepdim=True)
-        safe_local_std = local_std.clamp_min(self.score_norm_eps)
-        local_scores = (local_scores - local_mean) / safe_local_std
+        local_scores, safe_local_std = self._zscore_querywise(local_scores)
         return local_scores, safe_local_std
+
+    def _zscore_querywise(self, scores):
+        score_mean = scores.mean(dim=1, keepdim=True)
+        score_std = scores.std(dim=1, unbiased=False, keepdim=True)
+        safe_score_std = score_std.clamp_min(self.score_norm_eps)
+        return (scores - score_mean) / safe_score_std, safe_score_std
 
     def _build_query_gate_mask(self, global_similarity):
         num_query, num_gallery = global_similarity.shape
@@ -261,20 +264,16 @@ class QueryAdaptiveLocalReranker(object):
 
         effective_topk = min(self.topk, num_gallery)
         effective_patch_topr = min(self.patch_topr, patch_pool.shape[1])
-        topk_scores, topk_indices = torch.topk(
-            global_similarity,
-            k=effective_topk,
-            dim=1,
-            largest=True,
-            sorted=False,
-        )
+        original_order = torch.argsort(global_similarity, dim=1, descending=True)
+        topk_indices = original_order[:, :effective_topk]
+        topk_scores = torch.gather(global_similarity, dim=1, index=topk_indices)
         query_gate_mask, top12_margin = self._build_query_gate_mask(global_similarity)
         focus_candidate_mask, effective_focus_topn = self._build_focus_candidate_mask(
             global_similarity=global_similarity,
             topk_indices=topk_indices,
             effective_topk=effective_topk,
         )
-        reranked_similarity = global_similarity.clone()
+        ranking_order = original_order.clone()
         raw_local_means = []
         raw_local_stds = []
         used_local_means = []
@@ -288,7 +287,8 @@ class QueryAdaptiveLocalReranker(object):
             topk_indices_chunk = topk_indices[q_start:q_end]
             query_gate_mask_chunk = query_gate_mask[q_start:q_end]
             focus_candidate_mask_chunk = focus_candidate_mask[q_start:q_end]
-            local_scores_chunk = torch.zeros_like(topk_scores[q_start:q_end])
+            topk_scores_chunk = topk_scores[q_start:q_end]
+            local_scores_chunk = torch.zeros_like(topk_scores_chunk)
 
             for c_start in range(0, effective_topk, self.candidate_chunk_size):
                 c_end = min(c_start + self.candidate_chunk_size, effective_topk)
@@ -329,24 +329,82 @@ class QueryAdaptiveLocalReranker(object):
                 )
                 safe_local_std_mins.append(safe_local_std.min().detach().cpu())
 
-            final_topk_scores = topk_scores[q_start:q_end] + self.alpha * fused_local_scores_chunk
+            if self.use_score_norm:
+                base_topk_scores_chunk, _ = self._zscore_querywise(topk_scores_chunk)
+            else:
+                base_topk_scores_chunk = topk_scores_chunk
+            final_topk_scores = (
+                base_topk_scores_chunk + self.alpha * fused_local_scores_chunk
+            )
             if self.use_focus_topn:
                 final_topk_scores = torch.where(
                     focus_candidate_mask_chunk,
                     final_topk_scores,
-                    topk_scores[q_start:q_end],
+                    base_topk_scores_chunk,
                 )
             if self.use_query_gate:
                 final_topk_scores = torch.where(
                     query_gate_mask_chunk.unsqueeze(1),
                     final_topk_scores,
-                    topk_scores[q_start:q_end],
+                    base_topk_scores_chunk,
                 )
-            reranked_similarity[q_start:q_end].scatter_(
-                dim=1,
-                index=topk_indices_chunk,
-                src=final_topk_scores,
+            topk_rerank_order = torch.argsort(
+                final_topk_scores, dim=1, descending=True, stable=True
             )
+            reranked_topk_indices = torch.gather(
+                topk_indices_chunk, dim=1, index=topk_rerank_order
+            )
+            if self.use_query_gate:
+                reranked_topk_indices = torch.where(
+                    query_gate_mask_chunk.unsqueeze(1),
+                    reranked_topk_indices,
+                    topk_indices_chunk,
+                )
+            ranking_order[q_start:q_end, :effective_topk] = reranked_topk_indices
+
+        rank_scores = torch.arange(
+            num_gallery,
+            0,
+            -1,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        ).unsqueeze(0).expand(num_query, -1)
+        reranked_similarity = torch.empty(
+            global_similarity.shape,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        )
+        reranked_similarity.scatter_(
+            dim=1,
+            index=ranking_order,
+            src=rank_scores,
+        )
+        reranked_query_mask = (
+            ranking_order[:, :effective_topk] != original_order[:, :effective_topk]
+        ).any(dim=1)
+        changed_top1_mask = ranking_order[:, 0] != original_order[:, 0]
+        if self.use_query_gate:
+            gated_query_count = int(query_gate_mask.sum().item())
+        else:
+            gated_query_count = int(num_query)
+        reranked_query_count = int(reranked_query_mask.sum().item())
+        changed_top1_count = int(changed_top1_mask.sum().item())
+
+        topk_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, :effective_topk], dim=1).values,
+            torch.sort(original_order[:, :effective_topk], dim=1).values,
+        )
+        tail_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, effective_topk:], dim=1).values,
+            torch.sort(original_order[:, effective_topk:], dim=1).values,
+        )
+        topk_boundary_safe = bool(topk_membership_safe and tail_membership_safe)
+        if self.use_query_gate and (~query_gate_mask).any():
+            ungated_order_safe = torch.equal(
+                ranking_order[~query_gate_mask],
+                original_order[~query_gate_mask],
+            )
+            topk_boundary_safe = bool(topk_boundary_safe and ungated_order_safe)
 
         if not return_stats:
             return reranked_similarity
@@ -356,6 +414,16 @@ class QueryAdaptiveLocalReranker(object):
         stats = {
             "raw_local_mean": self._summarize_querywise_tensor(raw_local_means),
             "raw_local_std": self._summarize_querywise_tensor(raw_local_stds),
+            "effective_topk": float(effective_topk),
+            "reranked_query_count": reranked_query_count,
+            "gated_query_count": gated_query_count,
+            "changed_top1_count": changed_top1_count,
+            "topk_boundary_safe": topk_boundary_safe,
+            "fusion_norm": (
+                "querywise_global_local_zscore"
+                if self.use_score_norm
+                else "legacy_raw_global_plus_local"
+            ),
         }
         if self.use_score_norm:
             used_local_means = torch.cat(used_local_means, dim=0)
@@ -379,6 +447,5 @@ class QueryAdaptiveLocalReranker(object):
         stats["gated_query_ratio"] = query_gate_mask.float().mean().item()
         stats["focused_candidate_ratio"] = focus_candidate_mask.float().mean().item()
         stats["effective_focus_topn"] = float(effective_focus_topn)
-        stats["effective_topk"] = float(effective_topk)
 
         return reranked_similarity, stats

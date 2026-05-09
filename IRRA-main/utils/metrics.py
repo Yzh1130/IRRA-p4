@@ -598,6 +598,19 @@ class Evaluator():
                         rerank_stats.get("effective_topk", 0.0),
                     ]
                 )
+            log_msg += (
+                ", reranked_query_count=%d, gated_query_count=%d, "
+                "changed_top1_count=%d, topk_boundary_safe=%s, fusion_norm=%s"
+            )
+            log_args.extend(
+                [
+                    int(rerank_stats.get("reranked_query_count", 0)),
+                    int(rerank_stats.get("gated_query_count", 0)),
+                    int(rerank_stats.get("changed_top1_count", 0)),
+                    str(rerank_stats.get("topk_boundary_safe", False)),
+                    str(rerank_stats.get("fusion_norm", "unknown")),
+                ]
+            )
             self.logger.info(log_msg, *log_args)
 
         if use_transport_rerank:

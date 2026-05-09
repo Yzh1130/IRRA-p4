@@ -89,6 +89,13 @@ if __name__ == "__main__":
         help="enable inference-only query-adaptive local reranking",
     )
     parser.add_argument(
+        "--no_use_qalr",
+        dest="use_qalr",
+        default=None,
+        action="store_false",
+        help="disable inference-only query-adaptive local reranking",
+    )
+    parser.add_argument(
         "--rerank_topk",
         type=int,
         default=None,
@@ -119,6 +126,13 @@ if __name__ == "__main__":
         help="enable query-wise local score normalization inside QALR",
     )
     parser.add_argument(
+        "--no_use_qalr_score_norm",
+        dest="use_qalr_score_norm",
+        default=None,
+        action="store_false",
+        help="disable query-wise local score normalization inside QALR",
+    )
+    parser.add_argument(
         "--qalr_score_norm_type",
         type=str,
         default=None,
@@ -129,6 +143,13 @@ if __name__ == "__main__":
         default=None,
         action="store_true",
         help="enable hard-query gating that decides whether each query uses QALR",
+    )
+    parser.add_argument(
+        "--no_use_qalr_query_gate",
+        dest="use_qalr_query_gate",
+        default=None,
+        action="store_false",
+        help="disable hard-query gating for QALR",
     )
     parser.add_argument(
         "--qalr_query_gate_type",
@@ -147,6 +168,13 @@ if __name__ == "__main__":
         default=None,
         action="store_true",
         help="enable focus top-n rerank inside the selected global top-K candidates",
+    )
+    parser.add_argument(
+        "--no_use_qalr_focus_topn",
+        dest="use_qalr_focus_topn",
+        default=None,
+        action="store_false",
+        help="disable focus top-n rerank inside the selected global top-K candidates",
     )
     parser.add_argument(
         "--qalr_focus_topn",
