@@ -798,18 +798,18 @@ def _uspc_reference_tensor(*values):
     return torch.zeros(())
 
 
-def _uspc_zero_output(reference):
+def _uspc_zero_output(reference, confidence_value=1.0):
     zero = reference.new_zeros(())
-    one = reference.new_ones(())
+    confidence = reference.new_full((), float(confidence_value))
     return {
         "loss_uspc": zero,
         "loss_uspc_raw": zero,
         "loss_uspc_color": zero,
         "loss_uspc_struct": zero,
         "loss_uspc_full": zero,
-        "uspc_rgb_conf_mean": one,
-        "uspc_thermal_conf_mean": one,
-        "uspc_fused_conf_mean": one,
+        "uspc_rgb_conf_mean": confidence,
+        "uspc_thermal_conf_mean": confidence,
+        "uspc_fused_conf_mean": confidence,
         "uspc_active": zero,
     }
 
@@ -961,8 +961,16 @@ def compute_uspc_loss(
     use_uspc = bool(_uspc_get_arg(args, "use_uspc", False))
     lambda_uspc = float(_uspc_get_arg(args, "lambda_uspc", 0.0))
     warmup_epochs = int(_uspc_get_arg(args, "uspc_warmup_epochs", 0))
-    if (not use_uspc) or lambda_uspc <= 0.0 or int(epoch) <= warmup_epochs:
+    cur_epoch = int(epoch)
+    active_until_epoch = int(_uspc_get_arg(args, "uspc_active_until_epoch", -1))
+    if (
+        (not use_uspc)
+        or lambda_uspc <= 0.0
+        or cur_epoch <= warmup_epochs
+    ):
         return _uspc_zero_output(reference)
+    if active_until_epoch > 0 and cur_epoch > active_until_epoch:
+        return _uspc_zero_output(reference, confidence_value=0.0)
 
     version = str(_uspc_get_arg(args, "uspc_version", "v1")).lower()
     if version != "v1":

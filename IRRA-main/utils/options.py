@@ -74,6 +74,7 @@ def get_args():
     parser.add_argument("--uspc_weight_detach", dest="uspc_weight_detach", action='store_true', help="detach uncertainty weights used by USPC")
     parser.add_argument("--no_uspc_weight_detach", dest="uspc_weight_detach", action='store_false', help="do not detach uncertainty weights used by USPC")
     parser.add_argument("--uspc_warmup_epochs", type=int, default=0, help="number of warmup epochs before enabling USPC loss")
+    parser.add_argument("--uspc_active_until_epoch", default=-1, type=int, help="If >0, use USPC only for 1-based epochs <= this value; disable USPC afterwards.")
     parser.add_argument("--uspc_text_view_mode", type=str, default="rule", choices=["rule"], help="USPC text semantic view construction mode")
     parser.add_argument("--uspc_loss_type", type=str, default="sdm", choices=["sdm", "ce"], help="USPC internal alignment loss type")
     parser.add_argument("--debug_uspc", default=False, action='store_true', help="print extra USPC debug information")
