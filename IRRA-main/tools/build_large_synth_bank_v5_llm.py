@@ -30,13 +30,7 @@ for path in (PROJECT_ROOT, TOOL_ROOT):
         sys.path.insert(0, path)
 
 # Keep the same dataset/key conventions as the older synthetic bank builders.
-from build_large_synth_bank_v2 import (  # noqa: E402
-    ACCESSORY_TERMS,
-    COLOR_WORDS,
-    DATASET_FACTORY,
-    GENDER_WORDS,
-    _choose_canonical_source,
-)
+from build_large_synth_bank_v2 import DATASET_FACTORY  # noqa: E402
 
 
 SYSTEM_PROMPT = (
@@ -53,8 +47,13 @@ SYSTEM_PROMPT = (
 USER_PROMPT_TEMPLATE = """Given the original person caption below, generate concise rewritten captions for training.
 
 Rules:
+- Only rewrite the original caption.
 - Preserve the original meaning.
-- Do not add any detail absent from the original caption.
+- Do not add any attribute absent from this single original caption.
+- Do not use synonyms that change color meaning.
+- If the original says yellow bag, do not change it to beige bag.
+- If the original says gray jeans, do not change it to blue jeans.
+- If the original says black sneakers, do not change them to white shoes.
 - If a color is not mentioned, do not invent one.
 - If gender is not mentioned, do not infer it.
 - If bag, backpack, hat, umbrella, or carried item is not mentioned, do not add it.
@@ -62,19 +61,24 @@ Rules:
 - Each caption must be one sentence.
 - Each caption should be 8 to 25 words.
 
-Output exactly this JSON schema:
-{{
-  "captions": [
-    "...",
-    "...",
-    "..."
-  ]
-}}
+Output exactly:
+{{"captions":["...","...","..."]}}
 
 The three captions should be:
 1. a natural complete rewrite;
 2. a clothing/color-focused rewrite using only attributes in the original;
 3. a structure/silhouette-friendly rewrite using only attributes in the original.
+
+Original caption:
+"{caption}"
+"""
+
+SIMPLE_USER_PROMPT_TEMPLATE = """Return valid JSON only:
+{{"captions":["caption 1","caption 2","caption 3"]}}
+
+Rewrite only this original caption into exactly three concise captions.
+Do not add or change colors, clothing, carried items, gender, hair, shoes, or bags.
+Each caption must be one sentence and 8 to 25 words.
 
 Original caption:
 "{caption}"
@@ -91,6 +95,34 @@ BANNED_PHRASES = (
 MIN_WORD_COUNT = 8
 MAX_WORD_COUNT = 25
 MAX_FAILED_DETAIL_CHARS = 800
+RAW_RESPONSE_LOG_CHARS = 500
+
+RICH_COLOR_WORDS = {
+    "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
+    "brown", "orange", "pink", "purple", "beige",
+}
+RICH_CLOTHING_WORDS = {
+    "shirt", "tshirt", "t-shirt", "coat", "jacket", "hoodie", "sweater",
+    "jumper", "dress", "skirt", "pants", "trousers", "jeans", "shorts",
+    "slacks", "shoes", "sneakers", "boots", "hat", "cap",
+}
+RICH_CARRIED_ITEM_WORDS = {
+    "bag", "backpack", "handbag", "shoulder bag", "crossbody bag",
+    "umbrella", "phone", "mobile phone", "bicycle",
+}
+RICH_GENDER_WORDS = {"man", "woman", "male", "female", "boy", "girl"}
+RICH_BODY_WORDS = {
+    "long hair", "short hair", "glasses", "thin", "slim", "tall", "short",
+}
+
+STRONG_COLOR_WORDS = RICH_COLOR_WORDS
+CARRIED_ITEM_WORDS = RICH_CARRIED_ITEM_WORDS
+GENDER_CONFLICT_GROUPS = [
+    {"man", "male", "boy"},
+    {"woman", "female", "girl"},
+]
+BAG_ITEM_WORDS = {"bag", "backpack", "handbag", "shoulder bag", "crossbody bag"}
+SHOE_ITEM_WORDS = {"shoes", "sneakers", "boots"}
 
 
 class LLMRequestError(RuntimeError):
@@ -127,6 +159,11 @@ def _mask_api_key(api_key):
 def _build_prompt(caption):
     escaped = str(caption).strip().replace('"', '\\"')
     return USER_PROMPT_TEMPLATE.format(caption=escaped)
+
+
+def _build_simple_prompt(caption):
+    escaped = str(caption).strip().replace('"', '\\"')
+    return SIMPLE_USER_PROMPT_TEMPLATE.format(caption=escaped)
 
 
 def _word_count(text):
@@ -175,30 +212,75 @@ def _term_set(text, terms):
 
 
 def _color_set(text):
-    return _term_set(text, COLOR_WORDS)
+    return _term_set(text, STRONG_COLOR_WORDS)
 
 
 def _gender_set(text):
-    return _term_set(text, GENDER_WORDS)
+    return _term_set(text, RICH_GENDER_WORDS)
 
 
-def _accessory_set(text):
-    tracked = set(ACCESSORY_TERMS) | {
-        "bag",
-        "backpack",
-        "hat",
-        "cap",
-        "umbrella",
-        "handbag",
-        "purse",
-        "phone",
-        "item",
+def _carried_item_set(text):
+    return _term_set(text, CARRIED_ITEM_WORDS)
+
+
+def _clothing_item_set(text):
+    return _term_set(text, RICH_CLOTHING_WORDS | CARRIED_ITEM_WORDS)
+
+
+def _phrase_set(text, phrases):
+    lowered = str(text).lower()
+    return {
+        phrase for phrase in phrases
+        if re.search(r"\b" + re.escape(phrase) + r"\b", lowered)
     }
-    return _term_set(text, tracked)
 
 
-def attribute_preservation_report(original, rewrite):
-    """Cheap guardrail for common hallucinations after the prompt does the work."""
+def _color_item_phrases(text, item_words):
+    lowered = str(text).lower()
+    phrases = set()
+    for color in STRONG_COLOR_WORDS:
+        for item in item_words:
+            pattern = r"\b" + re.escape(color) + r"(?:\s+\w+){0,2}\s+" + re.escape(item) + r"\b"
+            if re.search(pattern, lowered):
+                phrases.add((color, item))
+    return phrases
+
+
+def extract_attributes(text):
+    text = str(text)
+    return {
+        "colors": _color_set(text),
+        "clothing_items": _clothing_item_set(text),
+        "carried_items": _carried_item_set(text),
+        "gender_words": _gender_set(text),
+        "hair_words": _phrase_set(text, {"long hair", "short hair"}),
+        "glasses": bool(_phrase_set(text, {"glasses"})),
+        "shoe_color_phrases": _color_item_phrases(text, SHOE_ITEM_WORDS),
+        "bag_color_phrases": _color_item_phrases(text, BAG_ITEM_WORDS),
+    }
+
+
+def _gender_conflicts(source_gender, synth_gender):
+    if synth_gender and not source_gender:
+        return True
+    for group in GENDER_CONFLICT_GROUPS:
+        if source_gender & group and synth_gender - group:
+            return True
+    return False
+
+
+def _color_phrase_conflicts(source_phrases, synth_phrases):
+    if not source_phrases or not synth_phrases:
+        return False
+    source_colors = {color for color, _item in source_phrases}
+    for color, _item in synth_phrases:
+        if color not in source_colors:
+            return True
+    return False
+
+
+def attribute_preservation_report(original, rewrite, enable_conflict_filter=True):
+    """Return (ok, reason) for a generated caption against one canonical source."""
     original = str(original)
     rewrite = _normalize_caption(rewrite)
     lowered = rewrite.lower()
@@ -209,22 +291,66 @@ def attribute_preservation_report(original, rewrite):
     if wc > MAX_WORD_COUNT:
         return False, "too_long"
     if any(phrase in lowered for phrase in BANNED_PHRASES):
-        return False, "banned_phrase"
+        return False, "forbidden_phrase"
+    if not enable_conflict_filter:
+        return True, "ok"
 
-    extra_colors = _color_set(rewrite) - _color_set(original)
-    if extra_colors:
-        return False, f"color_hallucination={sorted(extra_colors)}"
+    source_attrs = extract_attributes(original)
+    synth_attrs = extract_attributes(rewrite)
 
-    orig_gender = _gender_set(original)
-    rewrite_gender = _gender_set(rewrite)
-    if rewrite_gender and not orig_gender:
-        return False, f"gender_hallucination={sorted(rewrite_gender)}"
-
-    extra_accessories = _accessory_set(rewrite) - _accessory_set(original)
-    if extra_accessories:
-        return False, f"accessory_hallucination={sorted(extra_accessories)}"
+    if _gender_conflicts(source_attrs["gender_words"], synth_attrs["gender_words"]):
+        return False, "gender_conflict"
+    if (
+        "long hair" in source_attrs["hair_words"]
+        and "short hair" in synth_attrs["hair_words"]
+    ):
+        return False, "hair_conflict"
+    if (
+        "short hair" in source_attrs["hair_words"]
+        and "long hair" in synth_attrs["hair_words"]
+    ):
+        return False, "hair_conflict"
+    if _color_phrase_conflicts(
+        source_attrs["bag_color_phrases"], synth_attrs["bag_color_phrases"]
+    ):
+        return False, "bag_color_conflict"
+    if _color_phrase_conflicts(
+        source_attrs["shoe_color_phrases"], synth_attrs["shoe_color_phrases"]
+    ):
+        return False, "shoe_color_conflict"
+    if synth_attrs["colors"] - source_attrs["colors"]:
+        return False, "color_hallucination"
+    if synth_attrs["carried_items"] - source_attrs["carried_items"]:
+        return False, "item_hallucination"
 
     return True, "ok"
+
+
+def _richness_score(caption):
+    return (
+        2 * len(_color_set(caption))
+        + 2 * len(_term_set(caption, RICH_CLOTHING_WORDS))
+        + 2 * len(_carried_item_set(caption))
+        + len(_gender_set(caption))
+        + len(_phrase_set(caption, RICH_BODY_WORDS))
+        + min(_word_count(caption), 40) * 0.05
+    )
+
+
+def choose_canonical_caption(captions, rule):
+    cleaned = _dedupe_captions(captions, limit=0)
+    if not cleaned:
+        return ""
+    if rule == "first":
+        return cleaned[0]
+    if rule == "longest":
+        return max(cleaned, key=lambda c: (min(_word_count(c), 80), len(c)))
+    if rule == "richest":
+        return max(
+            cleaned,
+            key=lambda c: (_richness_score(c), min(_word_count(c), 80), len(c)),
+        )
+    raise ValueError(f"Unsupported canonical_caption_rule: {rule}")
 
 
 def _strip_json_fence(text):
@@ -381,17 +507,62 @@ def _post_chat_completion(
     raise last_error or LLMRequestError("unknown chat/completions failure")
 
 
-def _build_messages(caption):
+def _build_messages(caption, simple=False):
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _build_prompt(caption)},
+        {
+            "role": "user",
+            "content": _build_simple_prompt(caption) if simple else _build_prompt(caption),
+        },
     ]
 
 
-def generate_one(client_cfg, source_caption, captions_per_image):
-    messages = _build_messages(source_caption)
-    meta = {"parse_error": None, "request_error": None, "fallback_used": False}
+def _filter_generated_captions(
+    source_caption, candidates, max_captions_per_image, enable_conflict_filter=True
+):
+    kept = []
+    dropped = []
+    seen = set()
+    for candidate in candidates:
+        clean = _normalize_caption(candidate)
+        if not clean:
+            dropped.append("empty_caption")
+            continue
+        dedupe_key = re.sub(r"\s+", " ", clean.lower()).strip(" .!?")
+        if dedupe_key in seen:
+            dropped.append("duplicate_caption")
+            continue
+        ok, reason = attribute_preservation_report(
+            source_caption,
+            clean,
+            enable_conflict_filter=enable_conflict_filter,
+        )
+        if not ok:
+            dropped.append(reason)
+            continue
+        seen.add(dedupe_key)
+        kept.append(clean)
+        if len(kept) >= int(max_captions_per_image):
+            break
+    return kept, dropped
+
+
+def generate_one(
+    client_cfg,
+    source_caption,
+    captions_per_image,
+    max_captions_per_image,
+    enable_conflict_filter=True,
+):
+    meta = {
+        "parse_error": None,
+        "request_error": None,
+        "fallback_used": False,
+        "simple_prompt_retry": False,
+    }
+    raw = ""
     try:
+        messages = _build_messages(source_caption, simple=False)
         raw, fallback_used = _post_chat_completion(
             api_base=client_cfg["api_base"],
             api_key=client_cfg["api_key"],
@@ -416,20 +587,53 @@ def generate_one(client_cfg, source_caption, captions_per_image):
     try:
         candidates, parse_reasons = _parse_llm_captions(raw, captions_per_image)
     except LLMParseError as error:
-        meta["parse_error"] = {
-            "reason": error.reason,
-            "detail": error.detail,
-            "raw": str(raw)[:MAX_FAILED_DETAIL_CHARS],
-        }
-        return [], [error.reason], [], meta
-
-    kept, dropped = [], list(parse_reasons)
-    for candidate in candidates:
-        ok, reason = attribute_preservation_report(source_caption, candidate)
-        if ok:
-            kept.append(candidate)
+        if error.reason == "no_json_found" or str(raw).strip() == "":
+            meta["simple_prompt_retry"] = True
+            try:
+                retry_raw, retry_fallback_used = _post_chat_completion(
+                    api_base=client_cfg["api_base"],
+                    api_key=client_cfg["api_key"],
+                    model=client_cfg["model"],
+                    messages=_build_messages(source_caption, simple=True),
+                    temperature=client_cfg["temperature"],
+                    max_tokens=client_cfg["max_tokens"],
+                    timeout=client_cfg["timeout"],
+                    max_retries=0,
+                    retry_sleep=client_cfg["retry_sleep"],
+                    use_response_format=client_cfg["use_response_format"],
+                )
+                meta["fallback_used"] = bool(meta["fallback_used"] or retry_fallback_used)
+                raw = retry_raw
+                candidates, parse_reasons = _parse_llm_captions(raw, captions_per_image)
+            except LLMRequestError as retry_error:
+                meta["request_error"] = {
+                    "status": retry_error.status,
+                    "message": str(retry_error),
+                    "detail": retry_error.detail,
+                }
+                return [], [f"llm_error={type(retry_error).__name__}"], [], meta
+            except LLMParseError as retry_parse_error:
+                meta["parse_error"] = {
+                    "reason": retry_parse_error.reason,
+                    "detail": retry_parse_error.detail,
+                    "raw": str(raw)[:RAW_RESPONSE_LOG_CHARS],
+                }
+                return [], [retry_parse_error.reason], [], meta
         else:
-            dropped.append(reason)
+            meta["parse_error"] = {
+                "reason": error.reason,
+                "detail": error.detail,
+                "raw": str(raw)[:RAW_RESPONSE_LOG_CHARS],
+            }
+            return [], [error.reason], [], meta
+
+    kept, dropped = _filter_generated_captions(
+        source_caption,
+        candidates,
+        max_captions_per_image=max_captions_per_image,
+        enable_conflict_filter=enable_conflict_filter,
+    )
+    dropped = list(parse_reasons) + dropped
     return kept, dropped, [], meta
 
 
@@ -441,7 +645,13 @@ def _extract_img_path_from_train_sample(sample):
     )
 
 
-def _collect_train_jobs(train_samples, max_train_keys=-1, source_captions_per_image=0):
+def _collect_train_jobs(
+    train_samples,
+    max_train_keys=-1,
+    source_mode="canonical_only",
+    canonical_caption_rule="richest",
+    max_sources_per_image=1,
+):
     """Return jobs as (stable_image_key, [source captions])."""
     groups = OrderedDict()
     for sample in train_samples:
@@ -463,10 +673,13 @@ def _collect_train_jobs(train_samples, max_train_keys=-1, source_captions_per_im
         captions = _dedupe_captions(group["captions"], limit=0)
         if not captions:
             continue
-        canonical = _choose_canonical_source(captions)
-        ordered = [canonical] + [c for c in captions if c != canonical]
-        if source_captions_per_image > 0:
-            ordered = ordered[:source_captions_per_image]
+        canonical = choose_canonical_caption(captions, canonical_caption_rule)
+        ordered = [canonical]
+        if source_mode == "multi_source":
+            ordered.extend([c for c in captions if c != canonical])
+        elif source_mode != "canonical_only":
+            raise ValueError(f"Unsupported source_mode: {source_mode}")
+        ordered = ordered[:max(1, int(max_sources_per_image))]
         jobs.append((group["key"], ordered))
     return jobs
 
@@ -605,10 +818,37 @@ def parse_args():
     # Legacy-compatible generation controls.
     parser.add_argument("--captions_per_image", type=int, default=3,
                         help="captions requested per source caption")
-    parser.add_argument("--max_captions_per_image", type=int, default=6,
+    parser.add_argument("--max_captions_per_image", type=int, default=3,
                         help="final deduplicated cap per image")
+    parser.add_argument(
+        "--source_mode",
+        type=str,
+        default="canonical_only",
+        choices=["canonical_only", "multi_source"],
+    )
+    parser.add_argument(
+        "--canonical_caption_rule",
+        type=str,
+        default="richest",
+        choices=["longest", "first", "richest"],
+    )
+    parser.add_argument("--max_sources_per_image", type=int, default=1)
+    parser.set_defaults(enable_conflict_filter=True)
+    parser.add_argument(
+        "--enable_conflict_filter",
+        dest="enable_conflict_filter",
+        action="store_true",
+        help="enable source-vs-synth attribute conflict filtering",
+    )
+    parser.add_argument(
+        "--disable_conflict_filter",
+        dest="enable_conflict_filter",
+        action="store_false",
+        help="disable source-vs-synth attribute conflict filtering",
+    )
+    parser.add_argument("--debug_print_sources", default=False, action="store_true")
     parser.add_argument("--source_captions_per_image", type=int, default=0,
-                        help="0 means use all original captions for an image")
+                        help="legacy alias for --max_sources_per_image")
     parser.add_argument("--min_kept_per_image", type=int, default=1)
     parser.add_argument("--max_train_keys", type=int, default=-1,
                         help="legacy alias for --limit; -1 means all")
@@ -653,6 +893,18 @@ def main():
         raise ValueError("min_kept_per_image must be >= 0")
     if args.concurrency < 1:
         raise ValueError("concurrency must be >= 1")
+    if args.max_sources_per_image < 1:
+        raise ValueError("max_sources_per_image must be >= 1")
+    if args.source_captions_per_image > 0:
+        args.max_sources_per_image = args.source_captions_per_image
+    if args.source_mode == "canonical_only":
+        args.max_sources_per_image = 1
+    if not args.dry_run and not str(args.api_key or "").strip():
+        print(
+            "[SYNTH-V5] error: OPENAI_API_KEY is not set. "
+            "Export OPENAI_API_KEY or pass --api_key; the key will not be printed."
+        )
+        return 2
 
     if args.test_api:
         return _run_test_api(args)
@@ -662,10 +914,12 @@ def main():
     jobs = _collect_train_jobs(
         dataset.train,
         max_train_keys=max_train_keys,
-        source_captions_per_image=int(args.source_captions_per_image),
+        source_mode=args.source_mode,
+        canonical_caption_rule=args.canonical_caption_rule,
+        max_sources_per_image=int(args.max_sources_per_image),
     )
 
-    print("[SYNTH-V5] version=v5.2_yunwu_openai_compatible")
+    print("[SYNTH-V5] version=v5.3_yunwu_openai_compatible")
     print(f"[SYNTH-V5] dataset_name={args.dataset_name}")
     print(f"[SYNTH-V5] root_dir={args.root_dir}")
     print(f"[SYNTH-V5] caption_file={dataset.anno_path}")
@@ -674,6 +928,10 @@ def main():
     print(f"[SYNTH-V5] captions_per_image={args.captions_per_image}")
     print(f"[SYNTH-V5] max_captions_per_image={args.max_captions_per_image}")
     print(f"[SYNTH-V5] min_kept_per_image={args.min_kept_per_image}")
+    print(f"[SYNTH-V5] source_mode={args.source_mode}")
+    print(f"[SYNTH-V5] canonical_caption_rule={args.canonical_caption_rule}")
+    print(f"[SYNTH-V5] max_sources_per_image={args.max_sources_per_image}")
+    print(f"[SYNTH-V5] enable_conflict_filter={args.enable_conflict_filter}")
     print(f"[SYNTH-V5] provider={args.provider}")
     print(f"[SYNTH-V5] api_base={args.api_base}")
     print(f"[SYNTH-V5] model={args.model}")
@@ -681,6 +939,11 @@ def main():
     print(f"[SYNTH-V5] concurrency={args.concurrency}")
     print(f"[SYNTH-V5] dry_run={args.dry_run}")
     print(f"[SYNTH-V5] debug={args.debug}")
+    if args.debug_print_sources:
+        print("[SYNTH-V5] selected_sources_top20:")
+        for key, sources in jobs[:20]:
+            source = sources[0] if sources else ""
+            print(f"  - {key}: {source}")
 
     if args.dry_run:
         return _run_dry_run(args, jobs)
@@ -737,6 +1000,7 @@ def main():
     num_kept_total = 0
     num_dropped_total = 0
     num_response_format_fallbacks = 0
+    num_simple_prompt_retries = 0
     parse_error_samples_written = 0
     drop_reason_counts = {}
     t0 = time.time()
@@ -751,6 +1015,8 @@ def main():
                 client_cfg,
                 source,
                 args.captions_per_image,
+                max_captions_per_image=args.max_captions_per_image,
+                enable_conflict_filter=bool(args.enable_conflict_filter),
             )
             metas.append({"source": source, **meta})
             all_kept.extend(kept)
@@ -772,6 +1038,8 @@ def main():
                 "key": key,
                 "source": sources[0] if sources else "",
                 "sources": sources,
+                "source_mode": args.source_mode,
+                "canonical_caption_rule": args.canonical_caption_rule,
                 "captions": kept,
                 "dropped_reasons": dropped,
                 "event_reasons": events,
@@ -794,6 +1062,8 @@ def main():
             for meta in metas:
                 if meta.get("fallback_used"):
                     num_response_format_fallbacks += 1
+                if meta.get("simple_prompt_retry"):
+                    num_simple_prompt_retries += 1
                 if (
                     args.debug_sample_limit > 0
                     and meta.get("parse_error")
@@ -825,6 +1095,7 @@ def main():
                     f"kept={num_kept_total} dropped={num_dropped_total} "
                     f"llm_err={num_llm_errors} parse_err={num_parse_errors} "
                     f"response_format_fallbacks={num_response_format_fallbacks} "
+                    f"simple_prompt_retries={num_simple_prompt_retries} "
                     f"rate={rate:.3f}/s",
                     flush=True,
                 )
@@ -857,6 +1128,7 @@ def main():
     print(f"[SYNTH-V5] num_llm_errors={num_llm_errors}")
     print(f"[SYNTH-V5] num_parse_errors={num_parse_errors}")
     print(f"[SYNTH-V5] response_format_fallbacks={num_response_format_fallbacks}")
+    print(f"[SYNTH-V5] simple_prompt_retries={num_simple_prompt_retries}")
     print("[SYNTH-V5] drop_reason_counts_top10:")
     for reason, count in sorted(drop_reason_counts.items(), key=lambda x: -x[1])[:10]:
         print(f"  - {reason}: {count}")

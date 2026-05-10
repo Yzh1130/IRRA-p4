@@ -11,7 +11,7 @@ fi
 
 PACK_DIR="pack/synthcap_yunwu_smoke_$(date +%Y%m%d_%H%M%S)"
 BANK_DIR="pack/synthcap_bank"
-BANK_FILE="${BANK_DIR}/synthcap_yunwu_smoke20_v5.json"
+BANK_FILE="${BANK_DIR}/smoke_yunwu_gpt55_v53_20.json"
 mkdir -p "${PACK_DIR}" "${BANK_DIR}"
 
 echo "[SYNTH-SMOKE] api_base=${OPENAI_API_BASE}"
@@ -34,10 +34,13 @@ python tools/build_large_synth_bank_v5_llm.py \
   --limit 20 \
   --resume \
   --debug \
+  --source_mode canonical_only \
+  --canonical_caption_rule richest \
+  --max_captions_per_image 3 \
   --temperature 0.2 \
   --max_tokens 256 \
-  --timeout 60 \
-  --max_retries 3 \
+  --timeout 300 \
+  --max_retries 1 \
   --retry_sleep 2.0
 
 python tools/check_synth_caption_bank.py \
