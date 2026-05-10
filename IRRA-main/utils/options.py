@@ -317,6 +317,7 @@ def get_args():
     parser.add_argument("--synth_caption_bank_file", type=str, default="", help="json file path of synthetic caption bank")
     parser.add_argument("--synth_caption_keep_per_image", type=int, default=2, help="max synthetic captions appended per image")
     parser.add_argument("--synth_caption_train_mode", type=str, default="append", choices=["append", "off"], help="train-time synthetic caption mode")
+    parser.add_argument("--synth_caption_weight", type=float, default=None, help="alias for synth_loss_weight; only used when synth loss weighting is enabled")
     parser.add_argument("--use_synth_loss_weighting", default=False, action='store_true', help="enable lower per-sample loss weight metadata for synthetic captions")
     parser.add_argument("--synth_loss_weight", type=float, default=1.0, help="caption_weight assigned to synthetic captions when synth loss weighting is enabled")
     parser.add_argument("--synth_weight_apply_to_mlm", default=True, action='store_true', help="apply synthetic caption weights to MLM loss")
@@ -329,5 +330,9 @@ def get_args():
 
     # Parse CLI args into namespace.
     args = parser.parse_args()
+    if args.synth_caption_weight is None:
+        args.synth_caption_weight = args.synth_loss_weight
+    else:
+        args.synth_loss_weight = args.synth_caption_weight
 
     return args

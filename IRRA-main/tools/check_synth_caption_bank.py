@@ -116,26 +116,42 @@ def main():
             invalid_value_key_count += 1
 
     topk = max(0, int(args.show_unmatched_topk))
+    matched_examples = matched_keys[:5]
     unmatched_examples = unmatched_keys[:topk]
+    avg_caps_per_image = (
+        total_synth_captions / float(len(bank_keys)) if bank_keys else 0.0
+    )
 
     print(f"[SYNTH-CHECK] dataset_name={args.dataset_name}")
     print(f"[SYNTH-CHECK] root_dir={args.root_dir}")
     print(f"[SYNTH-CHECK] bank_file={args.synth_caption_bank_file}")
     print("[SYNTH-CHECK] train_key_rule=basename(img_path)")
+    print(f"[SYNTH-CHECK] train_image_keys={len(train_keys)}")
     print(f"[SYNTH-CHECK] bank_total_keys={len(bank_keys)}")
     print(f"[SYNTH-CHECK] matched_train_keys={len(matched_keys)}")
-    print(f"[SYNTH-CHECK] unmatched_keys={len(unmatched_keys)}")
+    print(f"[SYNTH-CHECK] unmatched_bank_keys={len(unmatched_keys)}")
     print(f"[SYNTH-CHECK] total_synthetic_captions={total_synth_captions}")
+    print(f"[SYNTH-CHECK] avg_captions_per_image={avg_caps_per_image:.3f}")
     print(
         "[SYNTH-CHECK] invalid_value_key_count="
         f"{invalid_value_key_count} (non-list values)"
     )
-    if unmatched_examples:
-        print(f"[SYNTH-CHECK] unmatched_key_examples_top{topk}:")
-        for key in unmatched_examples:
-            print(f"  - {key}")
+    if matched_examples:
+        print("[SYNTH-CHECK] matched_examples_top5:")
+        for key in matched_examples:
+            captions = bank.get(key, [])
+            preview = captions[0] if isinstance(captions, list) and captions else ""
+            print(f"  - {key}: {preview}")
     else:
-        print(f"[SYNTH-CHECK] unmatched_key_examples_top{topk}: []")
+        print("[SYNTH-CHECK] matched_examples_top5: []")
+    if unmatched_examples:
+        print(f"[SYNTH-CHECK] unmatched_examples_top{topk}:")
+        for key in unmatched_examples:
+            captions = bank.get(key, [])
+            preview = captions[0] if isinstance(captions, list) and captions else ""
+            print(f"  - {key}: {preview}")
+    else:
+        print(f"[SYNTH-CHECK] unmatched_examples_top{topk}: []")
 
     return 0
 

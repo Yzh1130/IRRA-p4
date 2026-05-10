@@ -230,6 +230,8 @@ def _append_synth_captions_to_train(dataset, args, logger):
 
     original_train_count = len(dataset.train)
     added_synth_captions = 0
+    matched_train_keys = 0
+    bank_total_keys = 0
     enabled = use_synth and train_mode == "append"
 
     if enabled:
@@ -253,6 +255,7 @@ def _append_synth_captions_to_train(dataset, args, logger):
                 "synth_caption_bank_file must be a JSON object: "
                 "{<stable_image_key>: [caption1, caption2, ...], ...}."
             )
+        bank_total_keys = len(synth_bank)
 
         # One base sample per image_id, preserving first-seen order.
         base_sample_by_image_id = {}
@@ -269,6 +272,8 @@ def _append_synth_captions_to_train(dataset, args, logger):
             synth_captions = synth_bank.get(stable_image_key, [])
             if not isinstance(synth_captions, list):
                 continue
+            if stable_image_key in synth_bank:
+                matched_train_keys += 1
 
             kept = 0
             for synth_caption in synth_captions:
@@ -288,7 +293,14 @@ def _append_synth_captions_to_train(dataset, args, logger):
             dataset.train.extend(appended_samples)
             added_synth_captions = len(appended_samples)
 
+    logger.info("[SYNTH] use_synth_caption_bank=%s", use_synth)
+    logger.info("[SYNTH] synth_caption_bank_file=%s", bank_file)
+    logger.info("[SYNTH] original_train_count=%d", original_train_count)
+    logger.info("[SYNTH] matched_train_keys=%d", matched_train_keys)
+    logger.info("[SYNTH] added_synth_captions=%d", added_synth_captions)
+    logger.info("[SYNTH] synth_caption_keep_per_image=%d", keep_per_image)
     logger.info("[SYNTH] enabled=%s", enabled)
+    logger.info("[SYNTH] bank_total_keys=%d", bank_total_keys)
     logger.info("[SYNTH] bank_file=%s", bank_file)
     logger.info("[SYNTH] keep_per_image=%d", keep_per_image)
     logger.info("[SYNTH] added_synth_captions=%d", added_synth_captions)
