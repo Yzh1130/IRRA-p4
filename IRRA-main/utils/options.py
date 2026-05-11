@@ -78,15 +78,21 @@ def get_args():
     parser.add_argument("--uspc_text_view_mode", type=str, default="rule", choices=["rule"], help="USPC text semantic view construction mode")
     parser.add_argument("--uspc_loss_type", type=str, default="sdm", choices=["sdm", "ce"], help="USPC internal alignment loss type")
     parser.add_argument("--debug_uspc", default=False, action='store_true', help="print extra USPC debug information")
-    parser.add_argument("--use_hardneg_aux", default=False, action='store_true', help="enable batch-internal hard-negative-aware auxiliary loss")
-    parser.add_argument("--lambda_hn", type=float, default=0.05, help="weight for hard-negative auxiliary loss")
-    parser.add_argument("--hn_margin", type=float, default=0.05, help="margin used by hard-negative auxiliary hinge loss")
+    parser.add_argument("--use_hard_negative_loss", default=False, action='store_true', help="enable RDE-style in-batch hard-negative ranking loss")
+    parser.add_argument("--use_hardneg_aux", default=False, action='store_true', help="enable legacy batch-internal hard-negative-aware auxiliary loss")
+    parser.add_argument("--lambda_hn", type=float, default=0.0, help="weight for hard-negative loss")
+    parser.add_argument("--hn_margin", type=float, default=0.05, help="margin used by hard-negative hinge/ranking loss")
+    parser.add_argument("--hn_topk", type=int, default=1, help="top-k hardest in-batch negatives per query for --use_hard_negative_loss")
+    parser.add_argument("--hn_warmup_epochs", type=int, default=5, help="number of 1-based warmup epochs before enabling --use_hard_negative_loss")
+    parser.add_argument("--hn_direction", type=str, default="t2i", choices=["t2i", "i2t", "both"], help="hard-negative direction")
+    parser.add_argument("--hn_detach_neg", default=False, action='store_true', help="detach negative similarities in in-batch hard-negative loss")
+    parser.add_argument("--hn_use_fused_image_feature", default=False, action='store_true', help="prefer fused deterministic image feature when available for hard-negative loss")
+    parser.add_argument("--hn_debug", default=False, action='store_true', help="print extra in-batch hard-negative debug information")
     parser.add_argument("--hn_topn", type=int, default=3, help="average the top-n hardest in-batch negatives per query")
     parser.add_argument("--hn_start_epoch", type=int, default=5, help="1-based epoch index to start hard-negative auxiliary loss")
     parser.add_argument("--hardneg_version", type=str, default="v1", choices=["v1", "v2"], help="hard-negative auxiliary loss version")
     parser.add_argument("--hn_temperature", type=float, default=0.07, help="temperature for hard-negative v2 softplus/logsumexp scaling")
     parser.add_argument("--hn_loss_type", type=str, default="softplus", choices=["softplus", "logsumexp"], help="hard-negative v2 loss form")
-    parser.add_argument("--hn_direction", type=str, default="both", choices=["t2i", "i2t", "both"], help="hard-negative v2 direction")
     parser.add_argument("--hn_false_neg_margin", type=float, default=0.0, help="optional hard-negative v2 false-negative guard margin")
     parser.add_argument("--debug_hardneg_stats", default=False, action='store_true', help="print extra hard-negative auxiliary stats")
     parser.add_argument("--use_offline_hardneg", default=False, action='store_true', help="enable offline hard-negative image auxiliary loss")
@@ -330,6 +336,17 @@ def get_args():
 
     # Parse CLI args into namespace.
     args = parser.parse_args()
+    if args.use_hard_negative_loss and args.use_hardneg_aux:
+        parser.error(
+            "--use_hard_negative_loss and legacy --use_hardneg_aux share "
+            "loss_hn logging; enable only one hard-negative path."
+        )
+    if int(args.hn_topk) <= 0:
+        parser.error("--hn_topk must be > 0.")
+    if int(args.hn_warmup_epochs) < 0:
+        parser.error("--hn_warmup_epochs must be >= 0.")
+    if args.hn_debug:
+        args.debug_hardneg_stats = True
     if args.synth_caption_weight is None:
         args.synth_caption_weight = args.synth_loss_weight
     else:

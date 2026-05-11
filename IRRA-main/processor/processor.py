@@ -2353,6 +2353,110 @@ def _add_hardneg_aux_to_total_loss(args, total_loss, ret, epoch):
     return total_loss
 
 
+def _get_first_tensor_from_ret(ret, keys):
+    for key in keys:
+        value = ret.get(key, None)
+        if torch.is_tensor(value):
+            return value, key
+    return None, "missing"
+
+
+def _compute_inbatch_hard_negative_terms(args, ret, batch, epoch):
+    if not bool(getattr(args, "use_hard_negative_loss", False)):
+        return {}
+
+    zero = batch["images"].new_zeros(())
+    lambda_hn = float(getattr(args, "lambda_hn", 0.0))
+    hn_direction = str(getattr(args, "hn_direction", "t2i")).lower()
+
+    def _inactive_terms():
+        return {
+            "loss_hn": zero,
+            "loss_hn_weighted": zero,
+            "hn_active": False,
+            "hn_num_valid_queries": 0.0,
+            "hn_mean_pos_sim": zero,
+            "hn_mean_neg_sim": zero,
+            "hn_margin_violation_rate": zero,
+            # Legacy aliases keep existing meter/debug surfaces usable.
+            "hn_avg_pos_sim": zero,
+            "hn_avg_neg_sim": zero,
+            "hn_violation_rate": zero,
+            "hn_t2i_loss": zero,
+            "hn_i2t_loss": zero,
+            "hn_t2i_valid": 0.0,
+            "hn_i2t_valid": 0.0,
+            "hn_direction": hn_direction,
+            "hn_image_feature_source": "inactive",
+            "hn_text_feature_source": "inactive",
+        }
+
+    if int(epoch) <= int(getattr(args, "hn_warmup_epochs", 5)):
+        return _inactive_terms()
+
+    text_feat, text_source = _get_first_tensor_from_ret(
+        ret,
+        ["text_prob_feat", "text_det_feat", "text_mu"],
+    )
+    if bool(getattr(args, "hn_use_fused_image_feature", False)):
+        image_keys = ["fused_det_feat", "fused_mu", "fused_prob_feat", "v_rgb_c"]
+    else:
+        image_keys = ["fused_prob_feat", "fused_det_feat", "fused_mu", "v_rgb_c"]
+    image_feat, image_source = _get_first_tensor_from_ret(ret, image_keys)
+    pids = batch.get("pids", None)
+    if text_feat is None or image_feat is None or pids is None:
+        raise KeyError(
+            "use_hard_negative_loss=True requires text/image global features "
+            "and batch['pids']."
+        )
+
+    hn_out = objectives.compute_inbatch_hard_negative_loss(
+        text_features=text_feat,
+        image_features=image_feat,
+        pids=pids,
+        margin=float(getattr(args, "hn_margin", 0.05)),
+        topk=int(getattr(args, "hn_topk", 1)),
+        direction=hn_direction,
+        detach_neg=bool(getattr(args, "hn_detach_neg", False)),
+    )
+    loss_hn = hn_out["loss"]
+    mean_pos_sim = hn_out["mean_pos_sim"]
+    mean_neg_sim = hn_out["mean_neg_sim"]
+    violation_rate = hn_out["margin_violation_rate"]
+    return {
+        "loss_hn": loss_hn,
+        "loss_hn_weighted": loss_hn * lambda_hn,
+        "hn_active": True,
+        "hn_num_valid_queries": hn_out["num_valid_queries"],
+        "hn_mean_pos_sim": mean_pos_sim,
+        "hn_mean_neg_sim": mean_neg_sim,
+        "hn_margin_violation_rate": violation_rate,
+        # Legacy aliases keep existing hard-negative meters/debug checks readable.
+        "hn_avg_pos_sim": mean_pos_sim,
+        "hn_avg_neg_sim": mean_neg_sim,
+        "hn_violation_rate": violation_rate,
+        "hn_t2i_loss": hn_out.get("t2i_loss", zero),
+        "hn_i2t_loss": hn_out.get("i2t_loss", zero),
+        "hn_t2i_valid": hn_out.get("t2i_valid", 0.0),
+        "hn_i2t_valid": hn_out.get("i2t_valid", 0.0),
+        "hn_direction": hn_direction,
+        "hn_image_feature_source": image_source,
+        "hn_text_feature_source": text_source,
+    }
+
+
+def _add_inbatch_hard_negative_to_total_loss(args, total_loss, ret, epoch):
+    if not bool(getattr(args, "use_hard_negative_loss", False)):
+        return total_loss
+    if int(epoch) <= int(getattr(args, "hn_warmup_epochs", 5)):
+        return total_loss
+    if "loss_hn_weighted" in ret:
+        return total_loss + ret["loss_hn_weighted"]
+    if "loss_hn" in ret:
+        return total_loss + float(getattr(args, "lambda_hn", 0.0)) * ret["loss_hn"]
+    return total_loss
+
+
 def _compute_offline_hardneg_terms(args, ret, batch, epoch):
     if not bool(getattr(args, "use_offline_hardneg", False)):
         return {}
@@ -3201,6 +3305,9 @@ def do_train(
         "loss_hn_weighted": AverageMeter(),
         "hn_active": AverageMeter(),
         "hn_num_valid_queries": AverageMeter(),
+        "hn_mean_pos_sim": AverageMeter(),
+        "hn_mean_neg_sim": AverageMeter(),
+        "hn_margin_violation_rate": AverageMeter(),
         "hn_avg_pos_sim": AverageMeter(),
         "hn_avg_neg_sim": AverageMeter(),
         "hn_avg_margin_gap": AverageMeter(),
@@ -3365,6 +3472,8 @@ def do_train(
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
             original_total_loss = _build_total_loss(args, ret)
             ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))
+            if getattr(args, "use_hard_negative_loss", False):
+                ret.update(_compute_inbatch_hard_negative_terms(args, ret, batch, epoch))
             if getattr(args, "use_hardneg_aux", False):
                 ret.update(_compute_hardneg_aux_terms(args, ret, batch, epoch))
             if getattr(args, "use_offline_hardneg", False):
@@ -3375,6 +3484,10 @@ def do_train(
                 args, original_total_loss, ret, epoch
             )
             total_loss = _add_proto_calibration_to_total_loss(args, total_loss, ret)
+            if getattr(args, "use_hard_negative_loss", False):
+                total_loss = _add_inbatch_hard_negative_to_total_loss(
+                    args, total_loss, ret, epoch
+                )
             if getattr(args, "use_hardneg_aux", False):
                 total_loss = _add_hardneg_aux_to_total_loss(
                     args, total_loss, ret, epoch
@@ -3543,7 +3656,7 @@ def do_train(
                 _to_scalar(ret.get("shared_cons_valid_thermal_count", 0)),
                 batch_size,
             )
-            if getattr(args, "use_hardneg_aux", False):
+            if getattr(args, "use_hard_negative_loss", False) or getattr(args, "use_hardneg_aux", False):
                 meters["loss_hn"].update(_to_scalar(ret.get("loss_hn", 0)), batch_size)
                 meters["loss_hn_weighted"].update(
                     _to_scalar(ret.get("loss_hn_weighted", 0)), batch_size
@@ -3551,6 +3664,23 @@ def do_train(
                 meters["hn_active"].update(_to_scalar(ret.get("hn_active", 0)), 1)
                 meters["hn_num_valid_queries"].update(
                     _to_scalar(ret.get("hn_num_valid_queries", 0)), 1
+                )
+                meters["hn_mean_pos_sim"].update(
+                    _to_scalar(ret.get("hn_mean_pos_sim", ret.get("hn_avg_pos_sim", 0))),
+                    batch_size,
+                )
+                meters["hn_mean_neg_sim"].update(
+                    _to_scalar(ret.get("hn_mean_neg_sim", ret.get("hn_avg_neg_sim", 0))),
+                    batch_size,
+                )
+                meters["hn_margin_violation_rate"].update(
+                    _to_scalar(
+                        ret.get(
+                            "hn_margin_violation_rate",
+                            ret.get("hn_violation_rate", 0),
+                        )
+                    ),
+                    batch_size,
                 )
                 meters["hn_avg_pos_sim"].update(
                     _to_scalar(ret.get("hn_avg_pos_sim", 0)), batch_size
@@ -3774,7 +3904,10 @@ def do_train(
                     "proto_t_mean_norm",
                     "proto_align_cos_mean",
                 }
-                debug_hardneg_stats = bool(getattr(args, "debug_hardneg_stats", False))
+                debug_hardneg_stats = bool(
+                    getattr(args, "debug_hardneg_stats", False)
+                    or getattr(args, "hn_debug", False)
+                )
                 debug_proto_stats = bool(getattr(args, "debug_proto_stats", False))
                 for k, v in meters.items():
                     if v.count > 0:
@@ -3798,6 +3931,17 @@ def do_train(
                     info_str += (
                         f", proto_version: {ret.get('proto_version', getattr(args, 'proto_version', 'v1'))}"
                     )
+                if bool(getattr(args, "use_hard_negative_loss", False)):
+                    info_str += (
+                        f", hn_direction: {ret.get('hn_direction', getattr(args, 'hn_direction', 't2i'))}"
+                    )
+                    if bool(getattr(args, "hn_debug", False)):
+                        info_str += (
+                            f", hn_image_feature_source: {ret.get('hn_image_feature_source', 'unknown')}"
+                        )
+                        info_str += (
+                            f", hn_text_feature_source: {ret.get('hn_text_feature_source', 'unknown')}"
+                        )
                 if bool(getattr(args, "use_hardneg_aux", False)):
                     info_str += (
                         f", hn_version: {ret.get('hn_version', getattr(args, 'hardneg_version', 'v1'))}"

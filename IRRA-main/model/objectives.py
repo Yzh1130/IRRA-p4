@@ -74,6 +74,214 @@ def compute_sdm(
     return loss
 
 
+def _empty_inbatch_hard_negative_output(reference):
+    zero = reference.new_zeros(())
+    return {
+        "loss": zero,
+        "num_valid_queries": 0.0,
+        "mean_pos_sim": zero,
+        "mean_neg_sim": zero,
+        "margin_violation_rate": zero,
+        "t2i_loss": zero,
+        "i2t_loss": zero,
+        "t2i_valid": 0.0,
+        "i2t_valid": 0.0,
+    }
+
+
+def _empty_inbatch_hard_negative_direction_output(reference):
+    zero = reference.new_zeros(())
+    return {
+        "loss": zero,
+        "num_valid_queries": 0.0,
+        "mean_pos_sim": zero,
+        "mean_neg_sim": zero,
+        "margin_violation_rate": zero,
+    }
+
+
+def _compute_inbatch_hard_negative_direction(
+    sim_matrix,
+    query_pid,
+    gallery_pid,
+    margin,
+    topk,
+    detach_neg=False,
+):
+    zero = sim_matrix.new_zeros(())
+    if sim_matrix.numel() == 0:
+        return _empty_inbatch_hard_negative_direction_output(sim_matrix)
+
+    finite_sim_mask = torch.isfinite(sim_matrix)
+    sim_matrix = torch.nan_to_num(
+        sim_matrix, nan=-1.0, posinf=1.0, neginf=-1.0
+    ).clamp_(min=-1.0, max=1.0)
+
+    pos_mask = query_pid.unsqueeze(1).eq(gallery_pid.unsqueeze(0))
+    neg_mask = ~pos_mask
+    valid_pos_mask = pos_mask & finite_sim_mask
+    valid_neg_mask = neg_mask & finite_sim_mask
+
+    pos_count = valid_pos_mask.sum(dim=1)
+    neg_count = valid_neg_mask.sum(dim=1)
+    valid_query_mask = (pos_count > 0) & (neg_count > 0)
+    if not valid_query_mask.any():
+        return _empty_inbatch_hard_negative_direction_output(sim_matrix)
+
+    sim_pos = sim_matrix.masked_fill(~valid_pos_mask, float("-inf")).max(dim=1).values
+    sim_pos = torch.nan_to_num(sim_pos, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    masked_neg_sim = sim_matrix.masked_fill(~valid_neg_mask, float("-inf"))
+    effective_topk = min(int(topk), masked_neg_sim.shape[1])
+    if effective_topk <= 0:
+        return _empty_inbatch_hard_negative_direction_output(sim_matrix)
+
+    topk_neg_sim = torch.topk(
+        masked_neg_sim,
+        k=effective_topk,
+        dim=1,
+        largest=True,
+        sorted=False,
+    ).values
+    valid_topk_mask = torch.isfinite(topk_neg_sim)
+    hardneg_count = valid_topk_mask.sum(dim=1)
+    valid_query_mask = (
+        valid_query_mask
+        & hardneg_count.gt(0)
+        & torch.isfinite(sim_pos)
+    )
+    if not valid_query_mask.any():
+        return _empty_inbatch_hard_negative_direction_output(sim_matrix)
+
+    neg_for_loss = topk_neg_sim.detach() if detach_neg else topk_neg_sim
+    margin_gap = float(margin) + neg_for_loss - sim_pos.unsqueeze(1)
+    margin_gap = margin_gap.masked_fill(~valid_topk_mask, 0.0)
+    pair_loss = F.relu(margin_gap)
+    per_query_loss = pair_loss.sum(dim=1) / hardneg_count.clamp_min(1).to(
+        pair_loss.dtype
+    )
+
+    topk_neg_for_stats = topk_neg_sim.masked_fill(~valid_topk_mask, 0.0)
+    per_query_neg_sim = topk_neg_for_stats.sum(dim=1) / hardneg_count.clamp_min(
+        1
+    ).to(topk_neg_for_stats.dtype)
+    violation_gap = float(margin) + topk_neg_sim - sim_pos.unsqueeze(1)
+    per_query_violation = (
+        (violation_gap.gt(0) & valid_topk_mask).float().sum(dim=1)
+        / hardneg_count.clamp_min(1).float()
+    )
+
+    return {
+        "loss": per_query_loss[valid_query_mask].mean(),
+        "num_valid_queries": float(valid_query_mask.sum().item()),
+        "mean_pos_sim": sim_pos[valid_query_mask].mean(),
+        "mean_neg_sim": per_query_neg_sim[valid_query_mask].mean(),
+        "margin_violation_rate": per_query_violation[valid_query_mask].mean(),
+    }
+
+
+def compute_inbatch_hard_negative_loss(
+    text_features,
+    image_features,
+    pids,
+    margin,
+    topk,
+    direction,
+    detach_neg=False,
+    epsilon=1e-8,
+):
+    """
+    In-batch hard-negative ranking loss over text-image similarities.
+
+    Positives are same-pid pairs and negatives are different-pid pairs. Each query
+    uses its maximum positive similarity and the top-k hardest valid negatives.
+    """
+    if int(topk) <= 0:
+        raise ValueError(f"hn_topk must be > 0, got {topk}.")
+    direction = str(direction).lower()
+    if direction not in {"t2i", "i2t", "both"}:
+        raise ValueError(f"hn_direction must be t2i, i2t or both, got {direction}.")
+    if text_features.dim() != 2 or image_features.dim() != 2:
+        raise ValueError(
+            "In-batch hard-negative loss expects 2D features, "
+            f"got {tuple(text_features.shape)} and {tuple(image_features.shape)}."
+        )
+    if text_features.shape[1] != image_features.shape[1]:
+        raise ValueError(
+            "text_features and image_features must share feature dim, got "
+            f"{text_features.shape[1]} and {image_features.shape[1]}."
+        )
+
+    pids = pids.reshape(-1).to(device=text_features.device)
+    if text_features.shape[0] != pids.shape[0] or image_features.shape[0] != pids.shape[0]:
+        raise ValueError(
+            "text_features, image_features and pids must share batch size, got "
+            f"{text_features.shape[0]}, {image_features.shape[0]}, {pids.shape[0]}."
+        )
+    if text_features.shape[0] == 0 or image_features.shape[0] == 0:
+        return _empty_inbatch_hard_negative_output(text_features)
+
+    text_features = torch.nan_to_num(
+        text_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    image_features = torch.nan_to_num(
+        image_features.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    text_norm = F.normalize(text_features, p=2, dim=1, eps=epsilon)
+    image_norm = F.normalize(image_features, p=2, dim=1, eps=epsilon)
+    sim_matrix = text_norm @ image_norm.t()
+
+    t2i = _compute_inbatch_hard_negative_direction(
+        sim_matrix=sim_matrix,
+        query_pid=pids,
+        gallery_pid=pids,
+        margin=margin,
+        topk=topk,
+        detach_neg=detach_neg,
+    )
+    i2t = _compute_inbatch_hard_negative_direction(
+        sim_matrix=sim_matrix.t(),
+        query_pid=pids,
+        gallery_pid=pids,
+        margin=margin,
+        topk=topk,
+        detach_neg=detach_neg,
+    )
+
+    if direction == "t2i":
+        loss = t2i["loss"]
+        selected = [t2i]
+    elif direction == "i2t":
+        loss = i2t["loss"]
+        selected = [i2t]
+    else:
+        loss = 0.5 * (t2i["loss"] + i2t["loss"])
+        selected = [t2i, i2t]
+
+    total_valid = sum(float(item["num_valid_queries"]) for item in selected)
+    zero = text_features.new_zeros(())
+
+    def _weighted_stat(key):
+        if total_valid <= 0:
+            return zero
+        out = zero
+        for item in selected:
+            out = out + item[key] * float(item["num_valid_queries"])
+        return out / total_valid
+
+    return {
+        "loss": loss,
+        "num_valid_queries": total_valid,
+        "mean_pos_sim": _weighted_stat("mean_pos_sim"),
+        "mean_neg_sim": _weighted_stat("mean_neg_sim"),
+        "margin_violation_rate": _weighted_stat("margin_violation_rate"),
+        "t2i_loss": t2i["loss"],
+        "i2t_loss": i2t["loss"],
+        "t2i_valid": t2i["num_valid_queries"],
+        "i2t_valid": i2t["num_valid_queries"],
+    }
+
+
 def compute_distribution_sdm_from_distance(
     distance_matrix,
     pid,
