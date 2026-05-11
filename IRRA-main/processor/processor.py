@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets.bases import tokenize
 from model import build_model, objectives
 from model.objectives import compute_uspc_loss
+from utils.attribute_parser import parse_basic_attributes
 from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
@@ -1894,6 +1895,8 @@ def _build_total_loss(args, ret):
                 "loss_dist_sdm_total",
                 "loss_dist_sdm_text_rgb",
                 "loss_dist_sdm_rgb_thermal",
+                "loss_attr_aux_raw",
+                "loss_attr_aux_weighted",
             }:
                 continue
             total_loss = v if total_loss is None else total_loss + v
@@ -1927,6 +1930,145 @@ def _get_caption_weight_for_loss(args, batch, apply_flag_name, default=True):
     if bool(torch.all(caption_weight.eq(1.0)).item()):
         return None
     return caption_weight
+
+
+ATTR_AUX_NAMES = (
+    "gender",
+    "upper_color",
+    "lower_color",
+    "shoe_color",
+    "bag_color",
+    "bag_present",
+    "hair_length",
+)
+
+
+def _attr_aux_enabled(args):
+    return bool(
+        getattr(args, "use_attr_aux", False)
+        and float(getattr(args, "lambda_attr_aux", 0.0)) > 0.0
+    )
+
+
+def _empty_attr_aux_terms(reference, active=False):
+    zero = reference.new_zeros(())
+    out = {
+        "loss_attr_aux_raw": zero,
+        "loss_attr_aux_weighted": zero,
+        "attr_active": zero.new_tensor(1.0 if active else 0.0),
+    }
+    for attr_name in ATTR_AUX_NAMES:
+        out[f"attr_valid_{attr_name}"] = zero
+    return out
+
+
+def _compute_attr_aux_terms(args, ret, batch, epoch):
+    if not _attr_aux_enabled(args):
+        return {}
+
+    if "images" not in batch or not torch.is_tensor(batch["images"]):
+        raise KeyError("Attribute auxiliary loss requires batch['images'] tensor.")
+    reference = batch["images"]
+
+    if int(epoch) <= int(getattr(args, "attr_warmup_epochs", 0)):
+        return _empty_attr_aux_terms(reference, active=False)
+    active_until_epoch = int(getattr(args, "attr_active_until_epoch", -1))
+    if active_until_epoch > 0 and int(epoch) > active_until_epoch:
+        return _empty_attr_aux_terms(reference, active=False)
+
+    schema = str(getattr(args, "attr_schema", "basic_v1")).lower()
+    if schema != "basic_v1":
+        raise ValueError(f"Unsupported attr_schema={schema!r}. Expected 'basic_v1'.")
+    if "raw_captions" not in batch:
+        raise KeyError(
+            "use_attr_aux=True requires batch['raw_captions']; the first "
+            "USPC-v2-A version parses captions dynamically in processor."
+        )
+
+    missing_logits = [
+        f"attr_logits_{attr_name}"
+        for attr_name in ATTR_AUX_NAMES
+        if f"attr_logits_{attr_name}" not in ret
+    ]
+    if missing_logits:
+        raise KeyError(
+            "use_attr_aux=True requires model to return attribute logits, "
+            f"missing {missing_logits}. Ensure the model was built with "
+            "--use_attr_aux and lambda_attr_aux > 0."
+        )
+
+    parsed = parse_basic_attributes(
+        batch["raw_captions"],
+        device=reference.device,
+    )
+    targets = parsed["targets"]
+    masks = parsed["masks"]
+    loss_type = str(getattr(args, "attr_loss_type", "ce")).lower()
+    if loss_type not in {"ce", "bce"}:
+        raise ValueError(f"Unsupported attr_loss_type={loss_type!r}.")
+
+    losses = []
+    out = _empty_attr_aux_terms(reference, active=True)
+    for attr_name in ATTR_AUX_NAMES:
+        logits = ret[f"attr_logits_{attr_name}"]
+        if not torch.is_tensor(logits):
+            raise TypeError(f"ret['attr_logits_{attr_name}'] must be a tensor.")
+        if logits.dim() != 2:
+            raise ValueError(
+                f"ret['attr_logits_{attr_name}'] must have shape [B, C], "
+                f"got {tuple(logits.shape)}."
+            )
+        mask = masks[attr_name].to(device=logits.device, dtype=torch.bool).reshape(-1)
+        target = targets[attr_name].to(device=logits.device).reshape(-1).long()
+        if mask.shape[0] != logits.shape[0] or target.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"Attribute batch mismatch for {attr_name}: "
+                f"logits={tuple(logits.shape)}, target={tuple(target.shape)}, "
+                f"mask={tuple(mask.shape)}."
+            )
+
+        valid_count = int(mask.sum().item())
+        out[f"attr_valid_{attr_name}"] = logits.new_tensor(float(valid_count))
+        if valid_count <= 0:
+            continue
+
+        valid_logits = logits[mask].float()
+        valid_target = target[mask]
+        if loss_type == "ce":
+            attr_loss = F.cross_entropy(valid_logits, valid_target)
+        else:
+            target_onehot = F.one_hot(
+                valid_target,
+                num_classes=valid_logits.shape[1],
+            ).to(device=valid_logits.device, dtype=valid_logits.dtype)
+            attr_loss = F.binary_cross_entropy_with_logits(
+                valid_logits,
+                target_onehot,
+            )
+        losses.append(attr_loss)
+
+    if losses:
+        loss_raw = torch.stack(losses).mean()
+    else:
+        loss_raw = reference.new_zeros(())
+    loss_weighted = float(getattr(args, "lambda_attr_aux", 0.0)) * loss_raw
+    out["loss_attr_aux_raw"] = loss_raw
+    out["loss_attr_aux_weighted"] = loss_weighted
+    out["attr_parser_stats"] = parsed.get("stats", {})
+    out["attr_loss_type"] = loss_type
+    out["attr_feature_source"] = str(getattr(args, "attr_feature_source", "fused_det"))
+    return out
+
+
+def _add_attr_aux_to_total_loss(args, total_loss, ret):
+    if not _attr_aux_enabled(args):
+        return total_loss
+    if "loss_attr_aux_weighted" not in ret:
+        raise KeyError(
+            "Attribute auxiliary loss is enabled but 'loss_attr_aux_weighted' "
+            "is missing from processor outputs."
+        )
+    return total_loss + ret["loss_attr_aux_weighted"]
 
 
 def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
@@ -3270,6 +3412,16 @@ def do_train(
         "id_loss": AverageMeter(),
         "mlm_loss": AverageMeter(),
         "loss_mlm": AverageMeter(),
+        "loss_attr_aux_raw": AverageMeter(),
+        "loss_attr_aux_weighted": AverageMeter(),
+        "attr_active": AverageMeter(),
+        "attr_valid_gender": AverageMeter(),
+        "attr_valid_upper_color": AverageMeter(),
+        "attr_valid_lower_color": AverageMeter(),
+        "attr_valid_shoe_color": AverageMeter(),
+        "attr_valid_bag_color": AverageMeter(),
+        "attr_valid_bag_present": AverageMeter(),
+        "attr_valid_hair_length": AverageMeter(),
         "loss_uspc": AverageMeter(),
         "loss_uspc_raw": AverageMeter(),
         "loss_uspc_color": AverageMeter(),
@@ -3384,6 +3536,7 @@ def do_train(
     best_top1 = 0.0
     mtp_text_example_logged = False
     use_uspc = _uspc_enabled(args)
+    use_attr_aux = _attr_aux_enabled(args)
     uspc_text_tokenizer = SimpleTokenizer() if use_uspc else None
     use_modality_text_prompt = bool(
         getattr(args, "use_modality_text_prompt", False)
@@ -3395,6 +3548,7 @@ def do_train(
     for epoch in range(start_epoch, num_epoch + 1):
         start_time = time.time()
         uspc_debug_logged_this_epoch = False
+        attr_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
             meter.reset()
         epoch_img_local_runtime = resolve_img_local_runtime(args, epoch)
@@ -3497,6 +3651,30 @@ def do_train(
                     args, total_loss, ret, epoch
                 )
             total_loss = _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch)
+            attr_terms = None
+            if use_attr_aux:
+                attr_terms = _compute_attr_aux_terms(args, ret, batch, epoch)
+                ret.update(attr_terms)
+                total_loss = _add_attr_aux_to_total_loss(args, total_loss, ret)
+                if (
+                    bool(getattr(args, "debug_attr_aux", False))
+                    and attr_debug_batches_logged_this_epoch < 2
+                ):
+                    logger.info(
+                        "[ATTR_AUX][DEBUG] epoch=%d iter=%d active=%d "
+                        "lambda_attr_aux=%.6f loss_raw=%.6f loss_weighted=%.6f "
+                        "feature_source=%s loss_type=%s stats=%s",
+                        epoch,
+                        n_iter + 1,
+                        int(round(_to_scalar(attr_terms.get("attr_active", 0)))),
+                        float(getattr(args, "lambda_attr_aux", 0.0)),
+                        _to_scalar(attr_terms.get("loss_attr_aux_raw", 0)),
+                        _to_scalar(attr_terms.get("loss_attr_aux_weighted", 0)),
+                        str(attr_terms.get("attr_feature_source", "unknown")),
+                        str(attr_terms.get("attr_loss_type", "unknown")),
+                        attr_terms.get("attr_parser_stats", {}),
+                    )
+                    attr_debug_batches_logged_this_epoch += 1
             uspc_terms = None
             if _uspc_should_encode_views(args):
                 if uspc_inputs is None:
@@ -3555,6 +3733,25 @@ def do_train(
             meters["loss_mlm"].update(
                 _to_scalar(ret.get("loss_mlm", ret.get("mlm_loss", 0))), batch_size
             )
+            if attr_terms is not None:
+                meters["loss_attr_aux_raw"].update(
+                    _to_scalar(attr_terms.get("loss_attr_aux_raw", 0)),
+                    batch_size,
+                )
+                meters["loss_attr_aux_weighted"].update(
+                    _to_scalar(attr_terms.get("loss_attr_aux_weighted", 0)),
+                    batch_size,
+                )
+                meters["attr_active"].update(
+                    _to_scalar(attr_terms.get("attr_active", 0)),
+                    1,
+                )
+                for attr_name in ATTR_AUX_NAMES:
+                    meter_name = f"attr_valid_{attr_name}"
+                    meters[meter_name].update(
+                        _to_scalar(attr_terms.get(meter_name, 0)),
+                        1,
+                    )
             if uspc_terms is not None:
                 for uspc_loss_name in [
                     "loss_uspc",

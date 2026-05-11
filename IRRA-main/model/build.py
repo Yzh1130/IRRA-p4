@@ -389,6 +389,21 @@ class IRRA(nn.Module):
                 f"img_local_temp must be > 0, got {self.img_local_temp}."
             )
         self.img_local_unc_head = None
+        self.use_attr_aux = bool(
+            getattr(args, "use_attr_aux", False)
+            and float(getattr(args, "lambda_attr_aux", 0.0)) > 0.0
+        )
+        self.attr_feature_source = str(
+            getattr(args, "attr_feature_source", "fused_det")
+        ).lower()
+        if self.use_attr_aux and self.attr_feature_source not in {
+            "fused_det",
+            "fused_prob",
+        }:
+            raise ValueError(
+                "attr_feature_source must be one of ['fused_det', 'fused_prob'], "
+                f"got {self.attr_feature_source}."
+            )
 
         if "id" in args.loss_names:
             self.classifier = nn.Linear(self.embed_dim, self.num_classes)
@@ -441,6 +456,15 @@ class IRRA(nn.Module):
             nn.init.constant_(self.img_local_unc_head.weight.data, 0.0)
             nn.init.constant_(self.img_local_unc_head.bias.data, 0.0)
             self.effective_img_local_fuse_gamma = self.img_local_fuse_gamma
+
+        if self.use_attr_aux:
+            self.attr_head_gender = nn.Linear(self.embed_dim, 3)
+            self.attr_head_upper_color = nn.Linear(self.embed_dim, 11)
+            self.attr_head_lower_color = nn.Linear(self.embed_dim, 11)
+            self.attr_head_shoe_color = nn.Linear(self.embed_dim, 11)
+            self.attr_head_bag_color = nn.Linear(self.embed_dim, 11)
+            self.attr_head_bag_present = nn.Linear(self.embed_dim, 2)
+            self.attr_head_hair_length = nn.Linear(self.embed_dim, 2)
 
     def set_img_local_runtime(self, active, fuse_gamma):
         if not self.use_image_local_filter:
@@ -1595,6 +1619,20 @@ class IRRA(nn.Module):
             "sigma_unify_t": zero_sigma,     # [B, C]
         }
 
+    def _forward_attr_heads(self, attr_feat):
+        def _head_logits(head):
+            return head(attr_feat.to(head.weight.dtype)).float()
+
+        return {
+            "attr_logits_gender": _head_logits(self.attr_head_gender),
+            "attr_logits_upper_color": _head_logits(self.attr_head_upper_color),
+            "attr_logits_lower_color": _head_logits(self.attr_head_lower_color),
+            "attr_logits_shoe_color": _head_logits(self.attr_head_shoe_color),
+            "attr_logits_bag_color": _head_logits(self.attr_head_bag_color),
+            "attr_logits_bag_present": _head_logits(self.attr_head_bag_present),
+            "attr_logits_hair_length": _head_logits(self.attr_head_hair_length),
+        }
+
     def forward(self, batch):
         ret = {}
 
@@ -1813,6 +1851,9 @@ class IRRA(nn.Module):
         )
         if hn_fused_det_feat is not None:
             ret["hn_fused_det_feat"] = hn_fused_det_feat
+        if self.use_attr_aux:
+            attr_feat = p_f if self.attr_feature_source == "fused_prob" else f_det
+            ret.update(self._forward_attr_heads(attr_feat))
         if self.use_modality_text_prompt:
             ret.update(
                 {
