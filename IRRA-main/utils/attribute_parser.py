@@ -56,11 +56,13 @@ UPPER_WORDS = {
     "hoodie",
     "sweater",
     "top",
+    "tops",
     "blouse",
 }
 LOWER_WORDS = {"pants", "jeans", "trousers", "shorts", "skirt"}
 SHOE_WORDS = {"shoe", "shoes", "sneaker", "sneakers", "boot", "boots"}
 BAG_WORDS = {"bag", "backpack", "handbag", "purse"}
+BAG_NEGATION_WORDS = {"no", "not", "without", "none"}
 
 SLOT_WORDS = {
     "upper_color": UPPER_WORDS,
@@ -68,6 +70,7 @@ SLOT_WORDS = {
     "shoe_color": SHOE_WORDS,
     "bag_color": BAG_WORDS,
 }
+ALL_SLOT_WORDS = set().union(*SLOT_WORDS.values())
 
 TOKEN_RE = re.compile(r"[a-z]+(?:-[a-z]+)*|\d+", re.IGNORECASE)
 
@@ -107,34 +110,100 @@ def _parse_gender(tokens):
     return 0, False, False
 
 
-def _parse_slot_color(tokens, slot_words, window=4):
-    color_hits = set()
-    slot_positions = [
-        idx for idx, token in enumerate(tokens) if _slot_token_key(token) in slot_words
-    ]
-    if not slot_positions:
-        return 0, False, False
+def _is_slot_token(token):
+    return _slot_token_key(token) in ALL_SLOT_WORDS
 
-    color_positions = [
-        (idx, _color_key(token))
-        for idx, token in enumerate(tokens)
-        if _color_key(token) is not None
-    ]
-    for color_idx, color_name in color_positions:
-        if any(abs(color_idx - slot_idx) <= int(window) for slot_idx in slot_positions):
-            color_hits.add(color_name)
 
-    if len(color_hits) == 1:
-        return COLOR_TO_ID[next(iter(color_hits))], True, False
-    if len(color_hits) > 1:
+def _left_slot_colors(tokens, slot_idx, max_distance=3):
+    colors = []
+    for distance in range(1, max_distance + 1):
+        idx = slot_idx - distance
+        if idx < 0:
+            break
+        if _is_slot_token(tokens[idx]):
+            break
+        color = _color_key(tokens[idx])
+        if color is not None:
+            colors.append(color)
+    return colors
+
+
+def _right_slot_colors(tokens, slot_idx, max_distance=2):
+    colors = []
+    for distance in range(1, max_distance + 1):
+        idx = slot_idx + distance
+        if idx >= len(tokens):
+            break
+        if _is_slot_token(tokens[idx]):
+            break
+        color = _color_key(tokens[idx])
+        if color is None:
+            continue
+        next_idx = idx + 1
+        if next_idx < len(tokens) and _is_slot_token(tokens[next_idx]):
+            continue
+        colors.append(color)
+    return colors
+
+
+def _single_slot_color(tokens, slot_idx):
+    left_colors = _left_slot_colors(tokens, slot_idx)
+    if left_colors:
+        unique_left = set(left_colors)
+        if len(unique_left) == 1:
+            return left_colors[0], False
+        return None, True
+
+    right_colors = _right_slot_colors(tokens, slot_idx)
+    if right_colors:
+        unique_right = set(right_colors)
+        if len(unique_right) == 1:
+            return right_colors[0], False
+        return None, True
+
+    return None, False
+
+
+def _parse_slot_color(tokens, slot_words):
+    color_hits = []
+    has_conflict = False
+    for idx, token in enumerate(tokens):
+        if _slot_token_key(token) not in slot_words:
+            continue
+        color_name, conflict = _single_slot_color(tokens, idx)
+        has_conflict = has_conflict or conflict
+        if color_name is not None:
+            color_hits.append(color_name)
+
+    unique_hits = set(color_hits)
+    if len(unique_hits) == 1 and not has_conflict:
+        return COLOR_TO_ID[color_hits[0]], True, False
+    if len(unique_hits) > 1 or has_conflict:
         return 0, False, True
     return 0, False, False
 
 
 def _parse_bag_present(tokens):
-    has_bag = any(_slot_token_key(token) in BAG_WORDS for token in tokens)
-    if has_bag:
+    bag_positions = [
+        idx for idx, token in enumerate(tokens) if _slot_token_key(token) in BAG_WORDS
+    ]
+    if not bag_positions:
+        return 0, False
+
+    positive_bags = []
+    negated_bags = []
+    for idx in bag_positions:
+        prev_tokens = tokens[max(0, idx - 3) : idx]
+        is_negated = any(token in BAG_NEGATION_WORDS for token in prev_tokens)
+        if is_negated:
+            negated_bags.append(idx)
+        else:
+            positive_bags.append(idx)
+
+    if positive_bags:
         return 1, True
+    if negated_bags:
+        return 0, True
     return 0, False
 
 
@@ -236,6 +305,30 @@ def _tensor_dict_to_lists(tensor_dict):
     return {key: value.detach().cpu().tolist() for key, value in tensor_dict.items()}
 
 
+def _label_for_demo(attr_name, target):
+    if attr_name == "gender":
+        return GENDER_CLASSES[target]
+    if attr_name.endswith("_color"):
+        return COLOR_CLASSES[target]
+    if attr_name == "bag_present":
+        return "has_bag" if target == 1 else "no_bag"
+    if attr_name == "hair_length":
+        return ("short", "long")[target]
+    return str(target)
+
+
+def _decoded_demo(parsed, captions):
+    decoded = []
+    for row_idx, caption in enumerate(captions):
+        attrs = {}
+        for attr_name in ATTR_NAMES:
+            mask = bool(parsed["masks"][attr_name][row_idx].item())
+            target = int(parsed["targets"][attr_name][row_idx].item())
+            attrs[attr_name] = _label_for_demo(attr_name, target) if mask else "MASKED"
+        decoded.append({"caption": caption, "attrs": attrs})
+    return decoded
+
+
 def _demo():
     examples = [
         "A man wearing a black jacket, blue jeans, white shoes and a gray backpack.",
@@ -247,6 +340,7 @@ def _demo():
     pprint(
         {
             "captions": examples,
+            "decoded": _decoded_demo(parsed, examples),
             "targets": _tensor_dict_to_lists(parsed["targets"]),
             "masks": _tensor_dict_to_lists(parsed["masks"]),
             "stats": parsed["stats"],
