@@ -28,6 +28,31 @@ ATTR_NAMES = (
     "bag_present",
     "hair_length",
 )
+USPC_SLOT_LOCAL_ATTR_NAMES = (
+    "upper_color",
+    "lower_color",
+    "shoe_color",
+    "bag_color",
+    "bag_present",
+    "hair_length",
+)
+USPC_SLOT_LOCAL_REGION_MAP = {
+    "upper_color": "upper",
+    "lower_color": "lower",
+    "shoe_color": "shoes",
+    "bag_color": "bag",
+    "bag_present": "bag",
+    "hair_length": "head",
+}
+ATTR_NUM_CLASSES = {
+    "gender": len(GENDER_CLASSES),
+    "upper_color": len(COLOR_CLASSES),
+    "lower_color": len(COLOR_CLASSES),
+    "shoe_color": len(COLOR_CLASSES),
+    "bag_color": len(COLOR_CLASSES),
+    "bag_present": 2,
+    "hair_length": 2,
+}
 
 COLOR_TO_ID = {name: idx for idx, name in enumerate(COLOR_CLASSES)}
 COLOR_ALIASES = {
@@ -73,6 +98,18 @@ SLOT_WORDS = {
 ALL_SLOT_WORDS = set().union(*SLOT_WORDS.values())
 
 TOKEN_RE = re.compile(r"[a-z]+(?:-[a-z]+)*|\d+", re.IGNORECASE)
+
+
+def get_basic_attribute_num_classes():
+    return dict(ATTR_NUM_CLASSES)
+
+
+def get_uspc_slot_local_attr_names():
+    return tuple(USPC_SLOT_LOCAL_ATTR_NAMES)
+
+
+def get_uspc_slot_region_map():
+    return dict(USPC_SLOT_LOCAL_REGION_MAP)
 
 
 def _as_caption_list(raw_captions):

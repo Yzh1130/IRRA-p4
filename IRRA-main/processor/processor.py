@@ -11,7 +11,10 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets.bases import tokenize
 from model import build_model, objectives
 from model.objectives import compute_uspc_loss
-from utils.attribute_parser import parse_basic_attributes
+from utils.attribute_parser import (
+    get_uspc_slot_local_attr_names,
+    parse_basic_attributes,
+)
 from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
@@ -1897,6 +1900,8 @@ def _build_total_loss(args, ret):
                 "loss_dist_sdm_rgb_thermal",
                 "loss_attr_aux_raw",
                 "loss_attr_aux_weighted",
+                "loss_uspc_slot_local_raw",
+                "loss_uspc_slot_local_weighted",
             }:
                 continue
             total_loss = v if total_loss is None else total_loss + v
@@ -1941,6 +1946,7 @@ ATTR_AUX_NAMES = (
     "bag_present",
     "hair_length",
 )
+USPC_SLOT_LOCAL_ATTR_NAMES = get_uspc_slot_local_attr_names()
 
 
 def _attr_aux_enabled(args):
@@ -2069,6 +2075,124 @@ def _add_attr_aux_to_total_loss(args, total_loss, ret):
             "is missing from processor outputs."
         )
     return total_loss + ret["loss_attr_aux_weighted"]
+
+
+def _uspc_slot_local_enabled(args):
+    return bool(
+        getattr(args, "use_uspc_slot_local", False)
+        and float(getattr(args, "lambda_uspc_slot_local", 0.0)) > 0.0
+    )
+
+
+def _empty_uspc_slot_local_terms(reference, active=False):
+    zero = reference.new_zeros(())
+    out = {
+        "loss_uspc_slot_local_raw": zero,
+        "loss_uspc_slot_local_weighted": zero,
+        "uspc_slot_local_active": zero.new_tensor(1.0 if active else 0.0),
+    }
+    for attr_name in USPC_SLOT_LOCAL_ATTR_NAMES:
+        out[f"uspc_slot_valid_{attr_name}"] = zero
+    return out
+
+
+def _compute_uspc_slot_local_terms(args, ret, batch, epoch):
+    if not _uspc_slot_local_enabled(args):
+        return {}
+
+    if "images" not in batch or not torch.is_tensor(batch["images"]):
+        raise KeyError("USPC slot-local loss requires batch['images'] tensor.")
+    reference = batch["images"]
+
+    if int(epoch) <= int(getattr(args, "uspc_slot_warmup_epochs", 0)):
+        return _empty_uspc_slot_local_terms(reference, active=False)
+    active_until_epoch = int(getattr(args, "uspc_slot_active_until_epoch", -1))
+    if active_until_epoch > 0 and int(epoch) > active_until_epoch:
+        return _empty_uspc_slot_local_terms(reference, active=False)
+
+    patch_source = str(getattr(args, "uspc_slot_patch_source", "rgb")).lower()
+    if patch_source != "rgb":
+        raise NotImplementedError(
+            "USPC-v2-B0 only guarantees --uspc_slot_patch_source rgb. "
+            f"Got {patch_source!r}."
+        )
+    loss_type = str(getattr(args, "uspc_slot_loss_type", "ce")).lower()
+    if loss_type != "ce":
+        raise ValueError(f"Unsupported uspc_slot_loss_type={loss_type!r}.")
+    if "raw_captions" not in batch:
+        raise KeyError(
+            "use_uspc_slot_local=True requires batch['raw_captions']; "
+            "dataset/collate stay unchanged and processor parses captions dynamically."
+        )
+    if "uspc_slot_logits" not in ret:
+        raise KeyError(
+            "use_uspc_slot_local=True requires model to return "
+            "ret['uspc_slot_logits']. Ensure the model was built with "
+            "--use_uspc_slot_local and lambda_uspc_slot_local > 0."
+        )
+
+    logits_by_attr = ret["uspc_slot_logits"]
+    if not isinstance(logits_by_attr, dict):
+        raise TypeError("ret['uspc_slot_logits'] must be a dict of tensors.")
+
+    parsed = parse_basic_attributes(
+        batch["raw_captions"],
+        device=reference.device,
+    )
+    targets = parsed["targets"]
+    masks = parsed["masks"]
+
+    losses = []
+    out = _empty_uspc_slot_local_terms(reference, active=True)
+    for attr_name in USPC_SLOT_LOCAL_ATTR_NAMES:
+        if attr_name not in logits_by_attr:
+            raise KeyError(f"ret['uspc_slot_logits'] is missing {attr_name!r}.")
+        logits = logits_by_attr[attr_name]
+        if not torch.is_tensor(logits):
+            raise TypeError(f"USPC slot logits for {attr_name} must be a tensor.")
+        if logits.dim() != 2:
+            raise ValueError(
+                f"USPC slot logits for {attr_name} must have shape [B, C], "
+                f"got {tuple(logits.shape)}."
+            )
+
+        mask = masks[attr_name].to(device=logits.device, dtype=torch.bool).reshape(-1)
+        target = targets[attr_name].to(device=logits.device).reshape(-1).long()
+        if mask.shape[0] != logits.shape[0] or target.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"USPC slot batch mismatch for {attr_name}: "
+                f"logits={tuple(logits.shape)}, target={tuple(target.shape)}, "
+                f"mask={tuple(mask.shape)}."
+            )
+
+        valid_count = int(mask.sum().item())
+        out[f"uspc_slot_valid_{attr_name}"] = logits.new_tensor(float(valid_count))
+        if valid_count <= 0:
+            continue
+        losses.append(F.cross_entropy(logits[mask].float(), target[mask]))
+
+    if losses:
+        loss_raw = torch.stack(losses).mean()
+    else:
+        loss_raw = reference.new_zeros(())
+    loss_weighted = float(getattr(args, "lambda_uspc_slot_local", 0.0)) * loss_raw
+    out["loss_uspc_slot_local_raw"] = loss_raw
+    out["loss_uspc_slot_local_weighted"] = loss_weighted
+    out["uspc_slot_parser_stats"] = parsed.get("stats", {})
+    out["uspc_slot_patch_source"] = patch_source
+    out["uspc_slot_loss_type"] = loss_type
+    return out
+
+
+def _add_uspc_slot_local_to_total_loss(args, total_loss, ret):
+    if not _uspc_slot_local_enabled(args):
+        return total_loss
+    if "loss_uspc_slot_local_weighted" not in ret:
+        raise KeyError(
+            "USPC slot-local loss is enabled but "
+            "'loss_uspc_slot_local_weighted' is missing from processor outputs."
+        )
+    return total_loss + ret["loss_uspc_slot_local_weighted"]
 
 
 def _compute_rgbt_moe_adapter_terms(args, ret, batch, epoch):
@@ -3422,6 +3546,15 @@ def do_train(
         "attr_valid_bag_color": AverageMeter(),
         "attr_valid_bag_present": AverageMeter(),
         "attr_valid_hair_length": AverageMeter(),
+        "loss_uspc_slot_local_raw": AverageMeter(),
+        "loss_uspc_slot_local_weighted": AverageMeter(),
+        "uspc_slot_local_active": AverageMeter(),
+        "uspc_slot_valid_upper_color": AverageMeter(),
+        "uspc_slot_valid_lower_color": AverageMeter(),
+        "uspc_slot_valid_shoe_color": AverageMeter(),
+        "uspc_slot_valid_bag_color": AverageMeter(),
+        "uspc_slot_valid_bag_present": AverageMeter(),
+        "uspc_slot_valid_hair_length": AverageMeter(),
         "loss_uspc": AverageMeter(),
         "loss_uspc_raw": AverageMeter(),
         "loss_uspc_color": AverageMeter(),
@@ -3537,6 +3670,7 @@ def do_train(
     mtp_text_example_logged = False
     use_uspc = _uspc_enabled(args)
     use_attr_aux = _attr_aux_enabled(args)
+    use_uspc_slot_local = _uspc_slot_local_enabled(args)
     uspc_text_tokenizer = SimpleTokenizer() if use_uspc else None
     use_modality_text_prompt = bool(
         getattr(args, "use_modality_text_prompt", False)
@@ -3549,6 +3683,7 @@ def do_train(
         start_time = time.time()
         uspc_debug_logged_this_epoch = False
         attr_debug_batches_logged_this_epoch = 0
+        uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
             meter.reset()
         epoch_img_local_runtime = resolve_img_local_runtime(args, epoch)
@@ -3675,6 +3810,55 @@ def do_train(
                         attr_terms.get("attr_parser_stats", {}),
                     )
                     attr_debug_batches_logged_this_epoch += 1
+            uspc_slot_terms = None
+            if use_uspc_slot_local:
+                uspc_slot_terms = _compute_uspc_slot_local_terms(
+                    args,
+                    ret,
+                    batch,
+                    epoch,
+                )
+                ret.update(uspc_slot_terms)
+                total_loss = _add_uspc_slot_local_to_total_loss(
+                    args,
+                    total_loss,
+                    ret,
+                )
+                if (
+                    bool(getattr(args, "debug_uspc_slot_local", False))
+                    and uspc_slot_debug_batches_logged_this_epoch < 2
+                ):
+                    logger.info(
+                        "[USPC_SLOT_LOCAL][DEBUG] epoch=%d iter=%d active=%d "
+                        "lambda=%.6f loss_raw=%.6f loss_weighted=%.6f "
+                        "patch_source=%s loss_type=%s stats=%s",
+                        epoch,
+                        n_iter + 1,
+                        int(
+                            round(
+                                _to_scalar(
+                                    uspc_slot_terms.get(
+                                        "uspc_slot_local_active",
+                                        0,
+                                    )
+                                )
+                            )
+                        ),
+                        float(getattr(args, "lambda_uspc_slot_local", 0.0)),
+                        _to_scalar(
+                            uspc_slot_terms.get("loss_uspc_slot_local_raw", 0)
+                        ),
+                        _to_scalar(
+                            uspc_slot_terms.get(
+                                "loss_uspc_slot_local_weighted",
+                                0,
+                            )
+                        ),
+                        str(uspc_slot_terms.get("uspc_slot_patch_source", "unknown")),
+                        str(uspc_slot_terms.get("uspc_slot_loss_type", "unknown")),
+                        uspc_slot_terms.get("uspc_slot_parser_stats", {}),
+                    )
+                    uspc_slot_debug_batches_logged_this_epoch += 1
             uspc_terms = None
             if _uspc_should_encode_views(args):
                 if uspc_inputs is None:
@@ -3750,6 +3934,29 @@ def do_train(
                     meter_name = f"attr_valid_{attr_name}"
                     meters[meter_name].update(
                         _to_scalar(attr_terms.get(meter_name, 0)),
+                        1,
+                    )
+            if uspc_slot_terms is not None:
+                meters["loss_uspc_slot_local_raw"].update(
+                    _to_scalar(
+                        uspc_slot_terms.get("loss_uspc_slot_local_raw", 0)
+                    ),
+                    batch_size,
+                )
+                meters["loss_uspc_slot_local_weighted"].update(
+                    _to_scalar(
+                        uspc_slot_terms.get("loss_uspc_slot_local_weighted", 0)
+                    ),
+                    batch_size,
+                )
+                meters["uspc_slot_local_active"].update(
+                    _to_scalar(uspc_slot_terms.get("uspc_slot_local_active", 0)),
+                    1,
+                )
+                for attr_name in USPC_SLOT_LOCAL_ATTR_NAMES:
+                    meter_name = f"uspc_slot_valid_{attr_name}"
+                    meters[meter_name].update(
+                        _to_scalar(uspc_slot_terms.get(meter_name, 0)),
                         1,
                     )
             if uspc_terms is not None:

@@ -24,6 +24,11 @@ from .text_guided_masking import (
     summarize_mask_stats,
 )
 from .uncertainty import GlobalUncertaintyModeler
+from utils.attribute_parser import (
+    get_basic_attribute_num_classes,
+    get_uspc_slot_local_attr_names,
+    get_uspc_slot_region_map,
+)
 
 
 def apply_image_local_filter(
@@ -404,6 +409,46 @@ class IRRA(nn.Module):
                 "attr_feature_source must be one of ['fused_det', 'fused_prob'], "
                 f"got {self.attr_feature_source}."
             )
+        self.use_uspc_slot_local = bool(
+            getattr(args, "use_uspc_slot_local", False)
+            and float(getattr(args, "lambda_uspc_slot_local", 0.0)) > 0.0
+        )
+        self.uspc_slot_patch_source = str(
+            getattr(args, "uspc_slot_patch_source", "rgb")
+        ).lower()
+        self.uspc_slot_region_mode = str(
+            getattr(args, "uspc_slot_region_mode", "fixed_stripe")
+        ).lower()
+        self.uspc_slot_loss_type = str(
+            getattr(args, "uspc_slot_loss_type", "ce")
+        ).lower()
+        self.uspc_slot_detach_patch = bool(
+            getattr(args, "uspc_slot_detach_patch", False)
+        )
+        self.debug_uspc_slot_local = bool(
+            getattr(args, "debug_uspc_slot_local", False)
+        )
+        self.uspc_slot_attr_names = get_uspc_slot_local_attr_names()
+        self.uspc_slot_region_map = get_uspc_slot_region_map()
+        if self.use_uspc_slot_local:
+            if self.uspc_slot_patch_source != "rgb":
+                raise NotImplementedError(
+                    "USPC-v2-B0 only guarantees --uspc_slot_patch_source rgb. "
+                    f"Got {self.uspc_slot_patch_source!r}."
+                )
+            if self.uspc_slot_region_mode != "fixed_stripe":
+                raise ValueError(
+                    "uspc_slot_region_mode must be 'fixed_stripe', "
+                    f"got {self.uspc_slot_region_mode!r}."
+                )
+            if self.uspc_slot_loss_type != "ce":
+                raise ValueError(
+                    "uspc_slot_loss_type must be 'ce', "
+                    f"got {self.uspc_slot_loss_type!r}."
+                )
+            self.uspc_slot_grid_h, self.uspc_slot_grid_w = (
+                self._configured_patch_grid(args)
+            )
 
         if "id" in args.loss_names:
             self.classifier = nn.Linear(self.embed_dim, self.num_classes)
@@ -465,6 +510,18 @@ class IRRA(nn.Module):
             self.attr_head_bag_color = nn.Linear(self.embed_dim, 11)
             self.attr_head_bag_present = nn.Linear(self.embed_dim, 2)
             self.attr_head_hair_length = nn.Linear(self.embed_dim, 2)
+
+        if self.use_uspc_slot_local:
+            attr_num_classes = get_basic_attribute_num_classes()
+            self.uspc_slot_heads = nn.ModuleDict(
+                {
+                    attr_name: nn.Linear(
+                        self.embed_dim,
+                        int(attr_num_classes[attr_name]),
+                    )
+                    for attr_name in self.uspc_slot_attr_names
+                }
+            )
 
     def set_img_local_runtime(self, active, fuse_gamma):
         if not self.use_image_local_filter:
@@ -1539,7 +1596,9 @@ class IRRA(nn.Module):
         """
         return self._encode_rgbt_eval_outputs(rgb_image, thermal_image)
 
-    def encode_rgbt_global(self, rgb_image, thermal_image=None):
+    def encode_rgbt_global(
+        self, rgb_image, thermal_image=None, return_patch_tokens=False
+    ):
         """
         Args:
             rgb_image: [B, 3, H, W]
@@ -1550,6 +1609,7 @@ class IRRA(nn.Module):
             f_c: [B, C], fused by element-wise addition
             rgb_tokens: [B, L_v, C]
             moe_adapter_aux: dict or None
+            patch_outputs: optional dict when return_patch_tokens=True
         """
         rgb_tokens, rgb_moe_adapter_aux = self._encode_visual_tokens(
             rgb_image,
@@ -1582,6 +1642,11 @@ class IRRA(nn.Module):
             v_t_c = torch.zeros_like(v_rgb_c)  # [B, C]
             thermal_local_stats = None
             thermal_moe_adapter_aux = None
+            thermal_patch_tokens = v_rgb_c.new_zeros(
+                v_rgb_c.shape[0],
+                0,
+                v_rgb_c.shape[-1],
+            )
 
         if self.use_rgbt_add_fusion:
             f_c = v_rgb_c + v_t_c  # [B, C]
@@ -1602,6 +1667,20 @@ class IRRA(nn.Module):
             rgb_aux=rgb_moe_adapter_aux,
             thermal_aux=thermal_moe_adapter_aux,
         )
+        if return_patch_tokens:
+            patch_outputs = {
+                "rgb_patch_feats": rgb_patch_tokens,
+                "thermal_patch_feats": thermal_patch_tokens,
+            }
+            return (
+                v_rgb_c,
+                v_t_c,
+                f_c,
+                rgb_tokens,
+                local_stats,
+                moe_adapter_aux,
+                patch_outputs,
+            )
         return v_rgb_c, v_t_c, f_c, rgb_tokens, local_stats, moe_adapter_aux
 
     def _deterministic_uncertainty_outputs(self, f_c, l_c):
@@ -1631,6 +1710,142 @@ class IRRA(nn.Module):
             "attr_logits_bag_color": _head_logits(self.attr_head_bag_color),
             "attr_logits_bag_present": _head_logits(self.attr_head_bag_present),
             "attr_logits_hair_length": _head_logits(self.attr_head_hair_length),
+        }
+
+    def _as_hw_pair(self, value, default):
+        if isinstance(value, str):
+            cleaned = (
+                value.replace("(", " ")
+                .replace(")", " ")
+                .replace("[", " ")
+                .replace("]", " ")
+                .replace(",", " ")
+                .replace("x", " ")
+                .replace("X", " ")
+            )
+            parts = [part for part in cleaned.split() if part]
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+            if len(parts) == 1:
+                one = int(parts[0])
+                return one, one
+            return default
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2:
+                return int(value[0]), int(value[1])
+            if len(value) == 1:
+                one = int(value[0])
+                return one, one
+            return default
+        if value is None:
+            return default
+        one = int(value)
+        return one, one
+
+    def _configured_patch_grid(self, args):
+        img_h, img_w = self._as_hw_pair(getattr(args, "img_size", None), (384, 128))
+        stride_h, stride_w = self._as_hw_pair(
+            getattr(args, "stride_size", None),
+            (16, 16),
+        )
+        stride_h = max(1, int(stride_h))
+        stride_w = max(1, int(stride_w))
+        return max(1, img_h // stride_h), max(1, img_w // stride_w)
+
+    def _runtime_patch_grid(self, patch_count):
+        patch_count = int(patch_count)
+        cfg_h = max(1, int(getattr(self, "uspc_slot_grid_h", 1)))
+        cfg_w = max(1, int(getattr(self, "uspc_slot_grid_w", 1)))
+        if cfg_h * cfg_w == patch_count:
+            return cfg_h, cfg_w
+        if cfg_w > 0 and patch_count % cfg_w == 0:
+            return max(1, patch_count // cfg_w), cfg_w
+        if cfg_h > 0 and patch_count % cfg_h == 0:
+            return cfg_h, max(1, patch_count // cfg_h)
+        return patch_count, 1
+
+    def _row_bounds(self, grid_h, start_frac, end_frac):
+        start = int(round(float(start_frac) * float(grid_h)))
+        end = int(round(float(end_frac) * float(grid_h)))
+        start = max(0, min(int(grid_h), start))
+        end = max(0, min(int(grid_h), end))
+        if end <= start:
+            end = min(int(grid_h), start + 1)
+        return start, end
+
+    def _mean_region(self, patch_grid, row_start, row_end, col_mask=None):
+        if col_mask is None:
+            region = patch_grid[:, row_start:row_end, :, :]
+        else:
+            region = patch_grid[:, row_start:row_end, col_mask, :]
+        if region.numel() == 0:
+            return patch_grid.new_zeros(
+                patch_grid.shape[0],
+                patch_grid.shape[-1],
+            )
+        return region.reshape(region.shape[0], -1, region.shape[-1]).mean(dim=1)
+
+    def _pool_uspc_fixed_regions(self, patch_tokens):
+        if patch_tokens is None:
+            raise KeyError("USPC slot-local heads require rgb patch tokens.")
+        if patch_tokens.dim() != 3:
+            raise ValueError(
+                "USPC slot-local patch tokens must have shape [B, N, C], "
+                f"got {tuple(patch_tokens.shape)}."
+            )
+        if patch_tokens.shape[1] <= 0:
+            raise ValueError("USPC slot-local patch tokens are empty.")
+
+        patch_tokens = patch_tokens.float()
+        grid_h, grid_w = self._runtime_patch_grid(patch_tokens.shape[1])
+        patch_count = grid_h * grid_w
+        patch_grid = patch_tokens[:, :patch_count, :].reshape(
+            patch_tokens.shape[0],
+            grid_h,
+            grid_w,
+            patch_tokens.shape[-1],
+        )
+
+        head_rows = self._row_bounds(grid_h, 0.00, 0.20)
+        upper_rows = self._row_bounds(grid_h, 0.20, 0.55)
+        lower_rows = self._row_bounds(grid_h, 0.55, 0.85)
+        shoes_rows = self._row_bounds(grid_h, 0.85, 1.00)
+        bag_rows = self._row_bounds(grid_h, 0.25, 0.75)
+        edge_cols = max(1, grid_w // 4)
+        bag_col_mask = torch.zeros(
+            grid_w,
+            dtype=torch.bool,
+            device=patch_tokens.device,
+        )
+        bag_col_mask[:edge_cols] = True
+        bag_col_mask[-edge_cols:] = True
+
+        return {
+            "head": self._mean_region(patch_grid, *head_rows),
+            "upper": self._mean_region(patch_grid, *upper_rows),
+            "lower": self._mean_region(patch_grid, *lower_rows),
+            "shoes": self._mean_region(patch_grid, *shoes_rows),
+            "bag": self._mean_region(patch_grid, *bag_rows, col_mask=bag_col_mask),
+        }
+
+    def _forward_uspc_slot_local_heads(self, patch_tokens):
+        if not self.use_uspc_slot_local:
+            return {}
+        region_feats = self._pool_uspc_fixed_regions(patch_tokens)
+        head_region_feats = (
+            {key: value.detach() for key, value in region_feats.items()}
+            if self.uspc_slot_detach_patch
+            else region_feats
+        )
+        logits = {}
+        for attr_name in self.uspc_slot_attr_names:
+            region_name = self.uspc_slot_region_map[attr_name]
+            head = self.uspc_slot_heads[attr_name]
+            region_feat = head_region_feats[region_name]
+            logits[attr_name] = head(region_feat.to(head.weight.dtype)).float()
+        return {
+            "logits": logits,
+            "region_feats": region_feats,
         }
 
     def forward(self, batch):
@@ -1667,16 +1882,32 @@ class IRRA(nn.Module):
             caption_ids_th = batch.get("caption_ids_th", caption_ids)
 
         # 1) RGB/Thermal pooled global branch (before uncertainty heads).
-        (
-            v_rgb_c_raw,
-            v_t_c_raw,
-            _,
-            rgb_tokens,
-            img_local_stats,
-            rgbt_moe_adapter_aux,
-        ) = self.encode_rgbt_global(
-            images, thermal_images
-        )
+        local_patch_outputs = None
+        if self.use_uspc_slot_local:
+            (
+                v_rgb_c_raw,
+                v_t_c_raw,
+                _,
+                rgb_tokens,
+                img_local_stats,
+                rgbt_moe_adapter_aux,
+                local_patch_outputs,
+            ) = self.encode_rgbt_global(
+                images,
+                thermal_images,
+                return_patch_tokens=True,
+            )
+        else:
+            (
+                v_rgb_c_raw,
+                v_t_c_raw,
+                _,
+                rgb_tokens,
+                img_local_stats,
+                rgbt_moe_adapter_aux,
+            ) = self.encode_rgbt_global(
+                images, thermal_images
+            )
 
         # 2) Text pooled global branch (before uncertainty heads).
         # A/B boundary:
@@ -1854,6 +2085,22 @@ class IRRA(nn.Module):
         if self.use_attr_aux:
             attr_feat = p_f if self.attr_feature_source == "fused_prob" else f_det
             ret.update(self._forward_attr_heads(attr_feat))
+        if self.use_uspc_slot_local:
+            if local_patch_outputs is None:
+                raise RuntimeError(
+                    "USPC slot-local is enabled but patch outputs were not collected."
+                )
+            rgb_patch_feats = local_patch_outputs.get("rgb_patch_feats", None)
+            ret["rgb_patch_feats"] = rgb_patch_feats
+            if self.uspc_slot_patch_source in {"thermal", "concat_rgbt"}:
+                ret["thermal_patch_feats"] = local_patch_outputs.get(
+                    "thermal_patch_feats",
+                    None,
+                )
+            slot_outputs = self._forward_uspc_slot_local_heads(rgb_patch_feats)
+            ret["uspc_slot_logits"] = slot_outputs["logits"]
+            if self.debug_uspc_slot_local:
+                ret["uspc_slot_region_feats"] = slot_outputs["region_feats"]
         if self.use_modality_text_prompt:
             ret.update(
                 {
