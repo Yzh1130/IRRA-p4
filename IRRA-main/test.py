@@ -33,6 +33,15 @@ def _apply_qalr_test_overrides(args, cli_args):
         "qalr_query_gate_margin": 0.05,
         "use_qalr_focus_topn": False,
         "qalr_focus_topn": 16,
+        "use_uspc_slot_rerank": False,
+        "uspc_slot_rerank_topk": 50,
+        "uspc_slot_rerank_alpha": 0.0,
+        "uspc_slot_rerank_score_norm": "zscore",
+        "uspc_slot_rerank_region_mode": "fixed_stripe",
+        "uspc_slot_rerank_patch_source": "rgb",
+        "uspc_slot_rerank_min_valid_slots": 1,
+        "uspc_slot_rerank_skip_negative_bag": True,
+        "debug_uspc_slot_rerank": False,
     }
     for key, value in qalr_defaults.items():
         if not hasattr(args, key):
@@ -62,6 +71,24 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.use_qalr_focus_topn = cli_args.use_qalr_focus_topn
     if cli_args.qalr_focus_topn is not None:
         args.qalr_focus_topn = cli_args.qalr_focus_topn
+    if cli_args.use_uspc_slot_rerank is not None:
+        args.use_uspc_slot_rerank = cli_args.use_uspc_slot_rerank
+    if cli_args.uspc_slot_rerank_topk is not None:
+        args.uspc_slot_rerank_topk = cli_args.uspc_slot_rerank_topk
+    if cli_args.uspc_slot_rerank_alpha is not None:
+        args.uspc_slot_rerank_alpha = cli_args.uspc_slot_rerank_alpha
+    if cli_args.uspc_slot_rerank_score_norm is not None:
+        args.uspc_slot_rerank_score_norm = cli_args.uspc_slot_rerank_score_norm
+    if cli_args.uspc_slot_rerank_region_mode is not None:
+        args.uspc_slot_rerank_region_mode = cli_args.uspc_slot_rerank_region_mode
+    if cli_args.uspc_slot_rerank_patch_source is not None:
+        args.uspc_slot_rerank_patch_source = cli_args.uspc_slot_rerank_patch_source
+    if cli_args.uspc_slot_rerank_min_valid_slots is not None:
+        args.uspc_slot_rerank_min_valid_slots = cli_args.uspc_slot_rerank_min_valid_slots
+    if cli_args.uspc_slot_rerank_skip_negative_bag is not None:
+        args.uspc_slot_rerank_skip_negative_bag = cli_args.uspc_slot_rerank_skip_negative_bag
+    if cli_args.debug_uspc_slot_rerank is not None:
+        args.debug_uspc_slot_rerank = cli_args.debug_uspc_slot_rerank
     return args
 
 
@@ -181,6 +208,84 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk",
+    )
+    parser.add_argument(
+        "--use_uspc_slot_rerank",
+        default=None,
+        action="store_true",
+        help="enable USPC-v2C text-slot guided inference-time local reranking",
+    )
+    parser.add_argument(
+        "--no_use_uspc_slot_rerank",
+        dest="use_uspc_slot_rerank",
+        default=None,
+        action="store_false",
+        help="disable USPC-v2C text-slot guided inference-time local reranking",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_topk",
+        type=int,
+        default=None,
+        help="number of top-ranked gallery candidates per query used for USPC slot reranking",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_alpha",
+        type=float,
+        default=None,
+        help="fusion weight for USPC slot rerank score",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_score_norm",
+        type=str,
+        default=None,
+        choices=["zscore", "none"],
+        help="query-wise USPC slot rerank score normalization",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_region_mode",
+        type=str,
+        default=None,
+        choices=["fixed_stripe"],
+        help="region pooling mode for USPC slot rerank",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_patch_source",
+        type=str,
+        default=None,
+        choices=["rgb"],
+        help="patch source for USPC slot rerank; v2C first version supports RGB only",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_min_valid_slots",
+        type=int,
+        default=None,
+        help="minimum parsed valid slots required before applying USPC slot rerank",
+    )
+    parser.add_argument(
+        "--uspc_slot_rerank_skip_negative_bag",
+        default=None,
+        action="store_true",
+        help="skip no-bag text slots during USPC slot rerank",
+    )
+    parser.add_argument(
+        "--no_uspc_slot_rerank_skip_negative_bag",
+        dest="uspc_slot_rerank_skip_negative_bag",
+        default=None,
+        action="store_false",
+        help="include no-bag text slots during USPC slot rerank",
+    )
+    parser.add_argument(
+        "--debug_uspc_slot_rerank",
+        default=None,
+        action="store_true",
+        help="print extra USPC slot rerank debug information",
+    )
+    parser.add_argument(
+        "--no_debug_uspc_slot_rerank",
+        dest="debug_uspc_slot_rerank",
+        default=None,
+        action="store_false",
+        help="disable extra USPC slot rerank debug information",
     )
     cli_args = parser.parse_args()
 

@@ -240,6 +240,19 @@ def get_args():
     parser.add_argument("--use_qalr_focus_topn", default=False, action='store_true', help="enable focus top-n rerank inside the selected global top-K candidates")
     parser.add_argument("--qalr_focus_topn", type=int, default=16, help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk")
 
+    ######################## inference-only USPC text-slot local rerank ########################
+    # Evaluation-only USPC-v2C switch. This does not add training losses or checkpoint weights.
+    parser.add_argument("--use_uspc_slot_rerank", default=False, action='store_true', help="enable USPC-v2C text-slot guided inference-time local reranking")
+    parser.add_argument("--uspc_slot_rerank_topk", type=int, default=50, help="number of top-ranked gallery candidates per query used for USPC slot reranking")
+    parser.add_argument("--uspc_slot_rerank_alpha", type=float, default=0.0, help="fusion weight for USPC slot rerank score: final = global + alpha * slot")
+    parser.add_argument("--uspc_slot_rerank_score_norm", type=str, default="zscore", choices=["zscore", "none"], help="query-wise USPC slot rerank score normalization")
+    parser.add_argument("--uspc_slot_rerank_region_mode", type=str, default="fixed_stripe", choices=["fixed_stripe"], help="region pooling mode for USPC slot rerank")
+    parser.add_argument("--uspc_slot_rerank_patch_source", type=str, default="rgb", choices=["rgb"], help="patch source for USPC slot rerank; v2C first version supports RGB only")
+    parser.add_argument("--uspc_slot_rerank_min_valid_slots", type=int, default=1, help="minimum parsed valid text slots required before applying USPC slot rerank to a query")
+    parser.add_argument("--uspc_slot_rerank_skip_negative_bag", default=True, action='store_true', help="skip no-bag text slots during USPC slot rerank")
+    parser.add_argument("--no_uspc_slot_rerank_skip_negative_bag", dest='uspc_slot_rerank_skip_negative_bag', action='store_false', help="include no-bag text slots during USPC slot rerank")
+    parser.add_argument("--debug_uspc_slot_rerank", default=False, action='store_true', help="print extra USPC slot rerank debug information")
+
     ######################## inference-only transport rerank ########################
     # Placeholder CLI surface only. No training/evaluation path uses it until explicitly wired in.
     parser.add_argument("--use_transport_rerank", default=False, action='store_true', help="enable evaluation-only transport rerank placeholder")

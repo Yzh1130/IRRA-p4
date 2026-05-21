@@ -11,6 +11,7 @@ from utils.query_adaptive_rerank import QueryAdaptiveLocalReranker
 from utils.transport_rerank import build_transport_reranker
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
+from utils.attribute_parser import COLOR_CLASSES, parse_basic_attributes
 
 
 def _stable_hash(value):
@@ -20,6 +21,16 @@ def _stable_hash(value):
 
 def _tensor_shape(tensor):
     return list(tensor.shape) if torch.is_tensor(tensor) else []
+
+
+USPC_SLOT_RERANK_COLOR_SLOTS = {
+    "upper_color": ("upper", "{} upper clothing"),
+    "lower_color": ("lower", "{} lower clothing"),
+    "shoe_color": ("shoes", "{} shoes"),
+    "bag_color": ("bag", "{} bag"),
+}
+
+USPC_SLOT_RERANK_HAIR_LABELS = ("short", "long")
 
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
@@ -432,21 +443,484 @@ class Evaluator():
             sim_std,
             _stable_hash(top1),
         )
+
+    def _get_query_raw_captions(self, expected_count):
+        txt_dataset = getattr(self.txt_loader, "dataset", None)
+        raw_captions = getattr(txt_dataset, "captions", None)
+        if raw_captions is None:
+            raise RuntimeError(
+                "use_uspc_slot_rerank=True requires txt_loader.dataset.captions."
+            )
+        raw_captions = [
+            "" if caption is None else str(caption)
+            for caption in list(raw_captions)
+        ]
+        if len(raw_captions) != int(expected_count):
+            raise RuntimeError(
+                "use_uspc_slot_rerank=True requires raw captions to align with "
+                f"text queries, got {len(raw_captions)} captions for "
+                f"{int(expected_count)} queries."
+            )
+        return raw_captions
+
+    def _as_hw_pair(self, value, default):
+        if isinstance(value, str):
+            cleaned = (
+                value.replace("(", " ")
+                .replace(")", " ")
+                .replace("[", " ")
+                .replace("]", " ")
+                .replace(",", " ")
+                .replace("x", " ")
+                .replace("X", " ")
+            )
+            parts = [part for part in cleaned.split() if part]
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+            if len(parts) == 1:
+                one = int(parts[0])
+                return one, one
+            return default
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2:
+                return int(value[0]), int(value[1])
+            if len(value) == 1:
+                one = int(value[0])
+                return one, one
+            return default
+        if value is None:
+            return default
+        one = int(value)
+        return one, one
+
+    def _infer_uspc_slot_rerank_grid(self, patch_count, model_args):
+        patch_count = int(patch_count)
+        img_h, img_w = self._as_hw_pair(
+            getattr(model_args, "img_size", None),
+            (384, 128),
+        )
+        stride_h, stride_w = self._as_hw_pair(
+            getattr(model_args, "stride_size", None),
+            (16, 16),
+        )
+        stride_h = max(1, int(stride_h))
+        stride_w = max(1, int(stride_w))
+        cfg_h = max(1, int(img_h) // stride_h)
+        cfg_w = max(1, int(img_w) // stride_w)
+        if cfg_h * cfg_w == patch_count:
+            return cfg_h, cfg_w
+        if cfg_w > 0 and patch_count % cfg_w == 0:
+            return max(1, patch_count // cfg_w), cfg_w
+        if cfg_h > 0 and patch_count % cfg_h == 0:
+            return cfg_h, max(1, patch_count // cfg_h)
+        return max(1, patch_count), 1
+
+    def _row_bounds_for_rerank(self, grid_h, start_frac, end_frac):
+        start = int(round(float(start_frac) * float(grid_h)))
+        end = int(round(float(end_frac) * float(grid_h)))
+        start = max(0, min(int(grid_h), start))
+        end = max(0, min(int(grid_h), end))
+        if end <= start:
+            end = min(int(grid_h), start + 1)
+        return start, end
+
+    def _mean_fixed_region_for_rerank(
+        self, patch_grid, row_start, row_end, col_mask=None
+    ):
+        if col_mask is None:
+            region = patch_grid[:, row_start:row_end, :, :]
+        else:
+            region = patch_grid[:, row_start:row_end, col_mask, :]
+        if region.numel() == 0:
+            return patch_grid.new_zeros(
+                patch_grid.shape[0],
+                patch_grid.shape[-1],
+            )
+        return region.reshape(region.shape[0], -1, region.shape[-1]).mean(dim=1)
+
+    def _pool_fixed_regions_for_rerank(self, gallery_rgb_patch_tokens, model_args):
+        if gallery_rgb_patch_tokens is None:
+            raise RuntimeError(
+                "use_uspc_slot_rerank=True requires gallery RGB patch tokens."
+            )
+        if gallery_rgb_patch_tokens.dim() != 3:
+            raise ValueError(
+                "USPC slot rerank RGB patch tokens must have shape [G, N, C], "
+                f"got {tuple(gallery_rgb_patch_tokens.shape)}."
+            )
+        if gallery_rgb_patch_tokens.shape[1] <= 0:
+            raise ValueError("USPC slot rerank RGB patch tokens are empty.")
+
+        patch_tokens = gallery_rgb_patch_tokens.float()
+        grid_h, grid_w = self._infer_uspc_slot_rerank_grid(
+            patch_tokens.shape[1],
+            model_args,
+        )
+        patch_count = grid_h * grid_w
+        patch_grid = patch_tokens[:, :patch_count, :].reshape(
+            patch_tokens.shape[0],
+            grid_h,
+            grid_w,
+            patch_tokens.shape[-1],
+        )
+
+        head_rows = self._row_bounds_for_rerank(grid_h, 0.00, 0.20)
+        upper_rows = self._row_bounds_for_rerank(grid_h, 0.20, 0.55)
+        lower_rows = self._row_bounds_for_rerank(grid_h, 0.55, 0.85)
+        shoes_rows = self._row_bounds_for_rerank(grid_h, 0.85, 1.00)
+        bag_rows = self._row_bounds_for_rerank(grid_h, 0.25, 0.75)
+        edge_cols = max(1, grid_w // 4)
+        bag_col_mask = torch.zeros(
+            grid_w,
+            dtype=torch.bool,
+            device=patch_tokens.device,
+        )
+        bag_col_mask[:edge_cols] = True
+        bag_col_mask[-edge_cols:] = True
+
+        region_feats = {
+            "head": self._mean_fixed_region_for_rerank(patch_grid, *head_rows),
+            "upper": self._mean_fixed_region_for_rerank(patch_grid, *upper_rows),
+            "lower": self._mean_fixed_region_for_rerank(patch_grid, *lower_rows),
+            "shoes": self._mean_fixed_region_for_rerank(patch_grid, *shoes_rows),
+            "bag": self._mean_fixed_region_for_rerank(
+                patch_grid, *bag_rows, col_mask=bag_col_mask
+            ),
+        }
+        return {
+            name: F.normalize(feat.float(), p=2, dim=1)
+            for name, feat in region_feats.items()
+        }
+
+    def _build_slot_prompts_for_query(
+        self, parsed_attrs, query_index, skip_negative_bag=True
+    ):
+        slots = []
+        targets = parsed_attrs["targets"]
+        masks = parsed_attrs["masks"]
+
+        for attr_name, (region_name, prompt_template) in (
+            USPC_SLOT_RERANK_COLOR_SLOTS.items()
+        ):
+            is_valid = bool(masks[attr_name][query_index].item())
+            if not is_valid:
+                continue
+            color_index = int(targets[attr_name][query_index].item())
+            if color_index < 0 or color_index >= len(COLOR_CLASSES):
+                continue
+            color_name = COLOR_CLASSES[color_index]
+            slots.append(
+                {
+                    "attr_name": attr_name,
+                    "region_name": region_name,
+                    "prompt": prompt_template.format(color_name),
+                }
+            )
+
+        if bool(masks["bag_present"][query_index].item()):
+            bag_target = int(targets["bag_present"][query_index].item())
+            if bag_target == 1:
+                slots.append(
+                    {
+                        "attr_name": "bag_present",
+                        "region_name": "bag",
+                        "prompt": "bag",
+                    }
+                )
+            elif not skip_negative_bag:
+                slots.append(
+                    {
+                        "attr_name": "bag_present",
+                        "region_name": "bag",
+                        "prompt": "no bag",
+                    }
+                )
+
+        if bool(masks["hair_length"][query_index].item()):
+            hair_target = int(targets["hair_length"][query_index].item())
+            if 0 <= hair_target < len(USPC_SLOT_RERANK_HAIR_LABELS):
+                slots.append(
+                    {
+                        "attr_name": "hair_length",
+                        "region_name": "head",
+                        "prompt": (
+                            f"{USPC_SLOT_RERANK_HAIR_LABELS[hair_target]} hair"
+                        ),
+                    }
+                )
+
+        return slots
+
+    def _encode_slot_prompt_embeddings(self, model, prompts, device):
+        unique_prompts = list(dict.fromkeys(prompts))
+        if not unique_prompts:
+            return {}
+        text_length = int(getattr(getattr(model, "args", None), "text_length", 77))
+        prompt_ids = self._tokenize_text_batch(
+            unique_prompts,
+            text_length=text_length,
+            device=device,
+        )
+        with torch.no_grad():
+            prompt_outputs = self._encode_text_feature(
+                model,
+                prompt_ids,
+                return_local_tokens=False,
+            )
+        if isinstance(prompt_outputs, dict):
+            prompt_feats = prompt_outputs["global_feat"]
+        else:
+            prompt_feats = prompt_outputs
+        prompt_feats = F.normalize(prompt_feats.float(), p=2, dim=1)
+        return {
+            prompt: prompt_feats[index]
+            for index, prompt in enumerate(unique_prompts)
+        }
+
+    def _normalize_uspc_slot_scores(self, scores, score_norm):
+        score_norm = str(score_norm).lower()
+        if score_norm == "none":
+            return scores
+        if score_norm != "zscore":
+            raise ValueError(
+                "Unsupported uspc_slot_rerank_score_norm="
+                f"{score_norm!r}. Supported: 'zscore', 'none'."
+            )
+        score_mean = scores.mean()
+        score_std = scores.std(unbiased=False).clamp_min(1e-6)
+        return (scores - score_mean) / score_std
+
+    def _apply_uspc_slot_rerank(self, model, embedding_outputs, global_similarity):
+        model_args = getattr(model, "args", None)
+        topk = int(getattr(model_args, "uspc_slot_rerank_topk", 50))
+        alpha = float(getattr(model_args, "uspc_slot_rerank_alpha", 0.0))
+        score_norm = str(
+            getattr(model_args, "uspc_slot_rerank_score_norm", "zscore")
+        ).lower()
+        region_mode = str(
+            getattr(model_args, "uspc_slot_rerank_region_mode", "fixed_stripe")
+        ).lower()
+        patch_source = str(
+            getattr(model_args, "uspc_slot_rerank_patch_source", "rgb")
+        ).lower()
+        min_valid_slots = int(
+            getattr(model_args, "uspc_slot_rerank_min_valid_slots", 1)
+        )
+        skip_negative_bag = bool(
+            getattr(model_args, "uspc_slot_rerank_skip_negative_bag", True)
+        )
+
+        if topk <= 0:
+            raise ValueError(f"uspc_slot_rerank_topk must be > 0, got {topk}.")
+        if min_valid_slots <= 0:
+            raise ValueError(
+                "uspc_slot_rerank_min_valid_slots must be > 0, "
+                f"got {min_valid_slots}."
+            )
+        if score_norm not in {"zscore", "none"}:
+            raise ValueError(
+                "Unsupported uspc_slot_rerank_score_norm="
+                f"{score_norm!r}. Supported: 'zscore', 'none'."
+            )
+        if region_mode != "fixed_stripe":
+            raise ValueError(
+                "USPC-v2C currently supports only "
+                "--uspc_slot_rerank_region_mode fixed_stripe."
+            )
+        if patch_source != "rgb":
+            raise NotImplementedError(
+                "USPC-v2C first version supports only "
+                "--uspc_slot_rerank_patch_source rgb."
+            )
+        if not isinstance(embedding_outputs, dict):
+            raise RuntimeError(
+                "use_uspc_slot_rerank=True requires rich evaluator outputs."
+            )
+
+        num_query, num_gallery = global_similarity.shape
+        if num_query == 0 or num_gallery == 0:
+            return global_similarity, {
+                "uspc_slot_rerank_active": False,
+                "uspc_slot_rerank_topk": topk,
+                "uspc_slot_rerank_alpha": alpha,
+                "uspc_slot_rerank_valid_query_count": 0,
+                "uspc_slot_rerank_avg_valid_slots": 0.0,
+                "uspc_slot_rerank_score_mean": 0.0,
+                "uspc_slot_rerank_score_std": 0.0,
+            }
+
+        raw_captions = self._get_query_raw_captions(num_query)
+        parsed_attrs = parse_basic_attributes(
+            raw_captions,
+            device=global_similarity.device,
+        )
+        query_slots = []
+        slot_prompts = []
+        valid_slot_counts = []
+        for query_index in range(num_query):
+            slots = self._build_slot_prompts_for_query(
+                parsed_attrs,
+                query_index,
+                skip_negative_bag=skip_negative_bag,
+            )
+            query_slots.append(slots)
+            valid_slot_counts.append(len(slots))
+            if len(slots) >= min_valid_slots:
+                slot_prompts.extend([slot["prompt"] for slot in slots])
+
+        prompt_embeddings = self._encode_slot_prompt_embeddings(
+            model,
+            slot_prompts,
+            device=global_similarity.device,
+        )
+        region_feats = self._pool_fixed_regions_for_rerank(
+            embedding_outputs.get("gallery_rgb_patch_tokens", None),
+            model_args,
+        )
+
+        effective_topk = min(topk, num_gallery)
+        original_order = torch.argsort(global_similarity, dim=1, descending=True)
+        topk_indices = original_order[:, :effective_topk]
+        topk_scores = torch.gather(global_similarity, dim=1, index=topk_indices)
+        ranking_order = original_order.clone()
+        valid_query_mask = torch.zeros(
+            num_query,
+            dtype=torch.bool,
+            device=global_similarity.device,
+        )
+        raw_slot_score_values = []
+
+        for query_index, slots in enumerate(query_slots):
+            if len(slots) < min_valid_slots:
+                continue
+            candidate_indices = topk_indices[query_index]
+            per_slot_scores = []
+            for slot in slots:
+                prompt_feat = prompt_embeddings.get(slot["prompt"], None)
+                region_feat = region_feats.get(slot["region_name"], None)
+                if prompt_feat is None or region_feat is None:
+                    continue
+                per_slot_scores.append(region_feat[candidate_indices] @ prompt_feat)
+            if len(per_slot_scores) < min_valid_slots:
+                continue
+
+            raw_slot_scores = torch.stack(per_slot_scores, dim=0).mean(dim=0)
+            normalized_slot_scores = self._normalize_uspc_slot_scores(
+                raw_slot_scores,
+                score_norm=score_norm,
+            )
+            final_topk_scores = (
+                topk_scores[query_index]
+                + alpha * normalized_slot_scores
+            )
+            topk_rerank_order = torch.argsort(
+                final_topk_scores,
+                dim=0,
+                descending=True,
+                stable=True,
+            )
+            ranking_order[query_index, :effective_topk] = torch.gather(
+                candidate_indices,
+                dim=0,
+                index=topk_rerank_order,
+            )
+            valid_query_mask[query_index] = True
+            raw_slot_score_values.append(raw_slot_scores.detach().float())
+
+        rank_scores = torch.arange(
+            num_gallery,
+            0,
+            -1,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        ).unsqueeze(0).expand(num_query, -1)
+        reranked_similarity = torch.empty(
+            global_similarity.shape,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        )
+        reranked_similarity.scatter_(
+            dim=1,
+            index=ranking_order,
+            src=rank_scores,
+        )
+
+        valid_slot_tensor = torch.tensor(
+            valid_slot_counts,
+            dtype=torch.float32,
+            device=global_similarity.device,
+        )
+        if raw_slot_score_values:
+            raw_slot_scores = torch.cat(raw_slot_score_values, dim=0)
+            score_mean = float(raw_slot_scores.mean().item())
+            score_std = float(raw_slot_scores.std(unbiased=False).item())
+        else:
+            score_mean = 0.0
+            score_std = 0.0
+        reranked_query_count = int(
+            (
+                ranking_order[:, :effective_topk]
+                != original_order[:, :effective_topk]
+            ).any(dim=1).sum().item()
+        )
+        topk_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, :effective_topk], dim=1).values,
+            torch.sort(original_order[:, :effective_topk], dim=1).values,
+        )
+        tail_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, effective_topk:], dim=1).values,
+            torch.sort(original_order[:, effective_topk:], dim=1).values,
+        )
+        stats = {
+            "uspc_slot_rerank_active": True,
+            "uspc_slot_rerank_topk": effective_topk,
+            "uspc_slot_rerank_alpha": alpha,
+            "uspc_slot_rerank_score_norm": score_norm,
+            "uspc_slot_rerank_valid_query_count": int(
+                valid_query_mask.sum().item()
+            ),
+            "uspc_slot_rerank_avg_valid_slots": float(
+                valid_slot_tensor.mean().item()
+            ) if valid_slot_tensor.numel() else 0.0,
+            "uspc_slot_rerank_score_mean": score_mean,
+            "uspc_slot_rerank_score_std": score_std,
+            "uspc_slot_rerank_reranked_query_count": reranked_query_count,
+            "uspc_slot_rerank_topk_boundary_safe": bool(
+                topk_membership_safe and tail_membership_safe
+            ),
+        }
+        return reranked_similarity, stats
     
     def eval(self, model, i2t_metric=False, return_local_tokens=False):
         use_qalr = bool(getattr(getattr(model, "args", None), "use_qalr", False))
         use_transport_rerank = bool(
             getattr(getattr(model, "args", None), "use_transport_rerank", False)
         )
+        use_uspc_slot_rerank = bool(
+            getattr(getattr(model, "args", None), "use_uspc_slot_rerank", False)
+        )
         use_mtp_eval_fusion = bool(
             getattr(getattr(model, "args", None), "use_modality_text_prompt", False)
         )
+        if use_uspc_slot_rerank and (use_qalr or use_transport_rerank):
+            self.logger.warning(
+                "USPC slot rerank is an inference-time rerank experiment and should "
+                "not be mixed with QALR or transport rerank. Disable --use_qalr and "
+                "--use_transport_rerank before running --use_uspc_slot_rerank."
+            )
+            raise RuntimeError(
+                "use_uspc_slot_rerank=True is mutually exclusive with use_qalr=True "
+                "or use_transport_rerank=True."
+            )
         return_local_tokens = bool(
-            return_local_tokens or use_qalr or use_transport_rerank
+            return_local_tokens
+            or use_qalr
+            or use_transport_rerank
+            or use_uspc_slot_rerank
         )
         model_args = getattr(model, "args", None)
         self.logger.info(
-            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_transport_rerank=%s use_modality_text_prompt=%s",
+            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
             self.source,
             bool(getattr(model, "training", False)),
             bool(getattr(model_args, "training", False)),
@@ -459,6 +933,7 @@ class Evaluator():
             bool(getattr(model_args, "use_id_uncertainty", True)),
             use_qalr,
             use_transport_rerank,
+            use_uspc_slot_rerank,
             use_mtp_eval_fusion,
         )
 
@@ -497,6 +972,61 @@ class Evaluator():
                 + beta * (qfeats_th @ gfeats_th.t())
             )
         baseline_similarity = similarity.clone()
+        if use_uspc_slot_rerank:
+            similarity, uspc_slot_rerank_stats = self._apply_uspc_slot_rerank(
+                model=model,
+                embedding_outputs=embedding_outputs,
+                global_similarity=similarity,
+            )
+            if bool(getattr(model.args, "debug_uspc_slot_rerank", False)):
+                self.logger.info(
+                    "[USPC_SLOT_RERANK] uspc_slot_rerank_active=%s, "
+                    "uspc_slot_rerank_topk=%d, "
+                    "uspc_slot_rerank_alpha=%.6f, "
+                    "uspc_slot_rerank_valid_query_count=%d, "
+                    "uspc_slot_rerank_avg_valid_slots=%.4f, "
+                    "uspc_slot_rerank_score_mean=%.6f, "
+                    "uspc_slot_rerank_score_std=%.6f, "
+                    "uspc_slot_rerank_reranked_query_count=%d, "
+                    "uspc_slot_rerank_topk_boundary_safe=%s",
+                    uspc_slot_rerank_stats.get("uspc_slot_rerank_active", False),
+                    int(uspc_slot_rerank_stats.get("uspc_slot_rerank_topk", 0)),
+                    float(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_alpha", 0.0
+                        )
+                    ),
+                    int(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_valid_query_count", 0
+                        )
+                    ),
+                    float(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_avg_valid_slots", 0.0
+                        )
+                    ),
+                    float(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_score_mean", 0.0
+                        )
+                    ),
+                    float(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_score_std", 0.0
+                        )
+                    ),
+                    int(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_reranked_query_count", 0
+                        )
+                    ),
+                    str(
+                        uspc_slot_rerank_stats.get(
+                            "uspc_slot_rerank_topk_boundary_safe", False
+                        )
+                    ),
+                )
         if use_qalr:
             use_qalr_score_norm = bool(
                 getattr(model.args, "use_qalr_score_norm", False)
