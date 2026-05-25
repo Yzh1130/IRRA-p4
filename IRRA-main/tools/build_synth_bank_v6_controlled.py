@@ -118,6 +118,22 @@ COLOR_WORDS = {
     "light",
 }
 
+GENERIC_CLOTHING_WORDS = {"clothing", "clothes", "garment", "outfit"}
+GARMENT_PATTERNS = OrderedDict(
+    [
+        ("shirt", (r"\bt-?shirt\b", r"\btshirt\b", r"\bshirt\b")),
+        ("blouse", (r"\bblouse\b",)),
+        ("hoodie", (r"\bhoodie\b",)),
+        ("sweater", (r"\bsweatshirt\b", r"\bsweater\b", r"\bjumper\b")),
+        ("jacket", (r"\bjacket\b",)),
+        ("coat", (r"\bcoat\b",)),
+        ("pants", (r"\btrousers\b", r"\btrouser\b", r"\bpants\b", r"\bpant\b")),
+        ("jeans", (r"\bjeans\b",)),
+        ("shorts", (r"\bshorts\b",)),
+        ("skirt", (r"\bskirt\b",)),
+        ("hat", (r"\bhat\b", r"\bcap\b")),
+    ]
+)
 CLOTHING_WORDS = {
     "shirt",
     "tshirt",
@@ -146,18 +162,44 @@ CLOTHING_WORDS = {
 
 BAG_TERMS = {
     "bag",
+    "bags",
     "backpack",
+    "backpacks",
     "handbag",
+    "handbags",
     "purse",
+    "purses",
     "satchel",
+    "satchels",
     "school bag",
+    "school bags",
     "shoulder bag",
+    "shoulder bags",
     "crossbody bag",
+    "crossbody bags",
     "schoolbag",
+    "schoolbags",
+    "duffel bag",
+    "duffel bags",
+    "plastic bag",
+    "plastic bags",
     "briefcase",
+    "briefcases",
 }
 
-SHOE_TERMS = {"shoes", "sneakers", "boots", "trainers", "footwear"}
+SHOE_TERMS = {
+    "shoe",
+    "shoes",
+    "sneaker",
+    "sneakers",
+    "casual shoe",
+    "casual shoes",
+    "boot",
+    "boots",
+    "trainer",
+    "trainers",
+    "footwear",
+}
 BODY_BUILD_TERMS = {
     "thin",
     "slim",
@@ -182,15 +224,25 @@ VIEWPOINT_TERMS = {
     "from behind",
     "back view",
     "rear",
-    "front",
     "from front",
     "front view",
-    "side",
     "side view",
     "profile",
 }
 PHONE_TERMS = {"phone", "mobile phone", "cell phone", "cellphone", "telephone"}
-HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {"umbrella", "book", "paper", "bottle"}
+HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {
+    "umbrella",
+    "book",
+    "paper",
+    "papers",
+    "bottle",
+    "object",
+    "objects",
+    "item",
+    "items",
+    "package",
+    "packages",
+}
 ACTION_VARIANTS = {
     "walking": {"walk", "walks", "walking", "walked"},
     "standing": {"stand", "stands", "standing", "stood"},
@@ -311,6 +363,9 @@ def _term_set(text, terms):
 
 def _color_set(text):
     found = _term_set(text, COLOR_WORDS)
+    # Treat dark/light as modifiers rather than independent colors.
+    found.discard("dark")
+    found.discard("light")
     if "grey" in found:
         found.remove("grey")
         found.add("gray")
@@ -321,22 +376,40 @@ def _color_set(text):
 
 
 def _bag_set(text):
-    found = _term_set(text, BAG_TERMS)
-    if any(term in found for term in found if term != "bag"):
-        found.add("bag")
-    return found
+    return {"bag"} if _term_set(text, BAG_TERMS) else set()
 
 
 def _required_bag_set(text):
-    return _term_set(text, BAG_TERMS)
+    return _bag_set(text)
 
 
 def _shoe_set(text):
-    return _term_set(text, SHOE_TERMS)
+    return {"shoe"} if _term_set(text, SHOE_TERMS) else set()
 
 
 def _clothing_set(text):
-    return _term_set(text, CLOTHING_WORDS)
+    text = str(text or "").lower()
+    found = set()
+    for canonical, patterns in GARMENT_PATTERNS.items():
+        if any(re.search(pattern, text) for pattern in patterns):
+            found.add(canonical)
+
+    # Count "top" only when it is clearly a garment, not in "on top" or
+    # "top side". It is intentionally generic and used only when explicit.
+    if re.search(
+        r"\b(?:wear(?:s|ing)?|wore|in|with|a|an|the|black|white|gray|grey|blue|red|green|yellow|pink|purple|brown|orange)\s+(?:\w+\s+){0,2}top\b",
+        text,
+    ) and not re.search(r"\b(?:on top|top side)\b", text):
+        found.add("top")
+
+    # Only force "dress" preservation when it is explicitly worn, not when a
+    # phrase like "top side of the dress" describes another garment region.
+    if re.search(r"\b(?:wear(?:s|ing)?|wore|in|dressed in)\s+(?:a\s+|an\s+|the\s+)?(?:\w+\s+){0,2}dress\b", text):
+        found.add("dress")
+
+    if _term_set(text, GENERIC_CLOTHING_WORDS):
+        found.add("generic_clothing")
+    return found
 
 
 def _body_build_set(text):
@@ -344,7 +417,15 @@ def _body_build_set(text):
 
 
 def _viewpoint_set(text):
-    return _term_set(text, VIEWPOINT_TERMS)
+    text = str(text or "").lower()
+    found = set()
+    if re.search(r"\b(?:from behind|behind|back view|rear view|from back)\b", text):
+        found.add("back")
+    if re.search(r"\b(?:from front|front view|facing front)\b", text):
+        found.add("front")
+    if re.search(r"\b(?:from side|side view|profile view|in profile)\b", text):
+        found.add("side")
+    return found
 
 
 def _action_set(text):

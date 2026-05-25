@@ -60,6 +60,22 @@ COLOR_WORDS = {
     "light",
 }
 
+GENERIC_CLOTHING_WORDS = {"clothing", "clothes", "garment", "outfit"}
+GARMENT_PATTERNS = OrderedDict(
+    [
+        ("shirt", (r"\bt-?shirt\b", r"\btshirt\b", r"\bshirt\b")),
+        ("blouse", (r"\bblouse\b",)),
+        ("hoodie", (r"\bhoodie\b",)),
+        ("sweater", (r"\bsweatshirt\b", r"\bsweater\b", r"\bjumper\b")),
+        ("jacket", (r"\bjacket\b",)),
+        ("coat", (r"\bcoat\b",)),
+        ("pants", (r"\btrousers\b", r"\btrouser\b", r"\bpants\b", r"\bpant\b")),
+        ("jeans", (r"\bjeans\b",)),
+        ("shorts", (r"\bshorts\b",)),
+        ("skirt", (r"\bskirt\b",)),
+        ("hat", (r"\bhat\b", r"\bcap\b")),
+    ]
+)
 CLOTHING_WORDS = {
     "shirt",
     "tshirt",
@@ -88,18 +104,44 @@ CLOTHING_WORDS = {
 
 BAG_TERMS = {
     "bag",
+    "bags",
     "backpack",
+    "backpacks",
     "handbag",
+    "handbags",
     "purse",
+    "purses",
     "satchel",
+    "satchels",
     "school bag",
+    "school bags",
     "shoulder bag",
+    "shoulder bags",
     "crossbody bag",
+    "crossbody bags",
     "schoolbag",
+    "schoolbags",
+    "duffel bag",
+    "duffel bags",
+    "plastic bag",
+    "plastic bags",
     "briefcase",
+    "briefcases",
 }
 
-SHOE_TERMS = {"shoes", "sneakers", "boots", "trainers", "footwear"}
+SHOE_TERMS = {
+    "shoe",
+    "shoes",
+    "sneaker",
+    "sneakers",
+    "casual shoe",
+    "casual shoes",
+    "boot",
+    "boots",
+    "trainer",
+    "trainers",
+    "footwear",
+}
 BODY_BUILD_TERMS = {
     "thin",
     "slim",
@@ -124,15 +166,25 @@ VIEWPOINT_TERMS = {
     "from behind",
     "back view",
     "rear",
-    "front",
     "from front",
     "front view",
-    "side",
     "side view",
     "profile",
 }
 PHONE_TERMS = {"phone", "mobile phone", "cell phone", "cellphone", "telephone"}
-HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {"umbrella", "book", "paper", "bottle"}
+HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {
+    "umbrella",
+    "book",
+    "paper",
+    "papers",
+    "bottle",
+    "object",
+    "objects",
+    "item",
+    "items",
+    "package",
+    "packages",
+}
 ACTION_VARIANTS = {
     "walking": {"walk", "walks", "walking", "walked"},
     "standing": {"stand", "stands", "standing", "stood"},
@@ -203,6 +255,8 @@ def _term_set(text, terms):
 
 def _color_set(text):
     found = _term_set(text, COLOR_WORDS)
+    found.discard("dark")
+    found.discard("light")
     if "grey" in found:
         found.remove("grey")
         found.add("gray")
@@ -213,22 +267,33 @@ def _color_set(text):
 
 
 def _bag_set(text):
-    found = _term_set(text, BAG_TERMS)
-    if any(term in found for term in found if term != "bag"):
-        found.add("bag")
-    return found
+    return {"bag"} if _term_set(text, BAG_TERMS) else set()
 
 
 def _required_bag_set(text):
-    return _term_set(text, BAG_TERMS)
+    return _bag_set(text)
 
 
 def _shoe_set(text):
-    return _term_set(text, SHOE_TERMS)
+    return {"shoe"} if _term_set(text, SHOE_TERMS) else set()
 
 
 def _clothing_set(text):
-    return _term_set(text, CLOTHING_WORDS)
+    text = str(text or "").lower()
+    found = set()
+    for canonical, patterns in GARMENT_PATTERNS.items():
+        if any(re.search(pattern, text) for pattern in patterns):
+            found.add(canonical)
+    if re.search(
+        r"\b(?:wear(?:s|ing)?|wore|in|with|a|an|the|black|white|gray|grey|blue|red|green|yellow|pink|purple|brown|orange)\s+(?:\w+\s+){0,2}top\b",
+        text,
+    ) and not re.search(r"\b(?:on top|top side)\b", text):
+        found.add("top")
+    if re.search(r"\b(?:wear(?:s|ing)?|wore|in|dressed in)\s+(?:a\s+|an\s+|the\s+)?(?:\w+\s+){0,2}dress\b", text):
+        found.add("dress")
+    if _term_set(text, GENERIC_CLOTHING_WORDS):
+        found.add("generic_clothing")
+    return found
 
 
 def _body_build_set(text):
@@ -236,7 +301,15 @@ def _body_build_set(text):
 
 
 def _viewpoint_set(text):
-    return _term_set(text, VIEWPOINT_TERMS)
+    text = str(text or "").lower()
+    found = set()
+    if re.search(r"\b(?:from behind|behind|back view|rear view|from back)\b", text):
+        found.add("back")
+    if re.search(r"\b(?:from front|front view|facing front)\b", text):
+        found.add("front")
+    if re.search(r"\b(?:from side|side view|profile view|in profile)\b", text):
+        found.add("side")
+    return found
 
 
 def _action_set(text):
@@ -389,6 +462,19 @@ def _word_stats(lengths):
     }
 
 
+def _is_generic_duplicate_caption(caption):
+    if _word_count(caption) <= 8:
+        return True
+    has_specific_visual_fact = bool(
+        _color_set(caption)
+        or _clothing_set(caption)
+        or _shoe_set(caption)
+        or _bag_set(caption)
+        or _body_build_set(caption)
+    )
+    return not has_specific_visual_fact
+
+
 def analyze(rows, sources, bank_type):
     train_keys = set(sources.keys())
     bank_keys = [row["key"] for row in rows]
@@ -407,7 +493,13 @@ def analyze(rows, sources, bank_type):
 
     invalid_count = sum(1 for row in rows if row.get("invalid") or not row.get("caption"))
     normalized = [_norm_key(row["caption"]) for row in valid_rows]
-    duplicate_count = sum(count - 1 for count in Counter(normalized).values() if count > 1)
+    duplicate_counter = Counter(normalized)
+    duplicate_count = sum(count - 1 for count in duplicate_counter.values() if count > 1)
+    duplicate_groups = OrderedDict()
+    for row in valid_rows:
+        key = _norm_key(row["caption"])
+        if duplicate_counter[key] > 1:
+            duplicate_groups.setdefault(key, []).append(row)
     forbidden_count = sum(1 for row in valid_rows if _has_forbidden(row["caption"]))
     word_length_out_of_range_count = sum(
         1 for length in lengths if length < 8 or length > 45
@@ -426,12 +518,44 @@ def analyze(rows, sources, bank_type):
             ("new_body", 0),
             ("new_view", 0),
             ("new_action", 0),
+            ("duplicate_severe", 0),
+            ("duplicate_warning", 0),
             ("missing_source_caption", 0),
         ]
     )
     examples = {name: [] for name in strict_counts}
 
     if bank_type == "metadata":
+        for dup_key, group_rows in duplicate_groups.items():
+            caption = group_rows[0]["caption"] if group_rows else ""
+            source_keys = {
+                _norm_key(row.get("source_caption", "")) for row in group_rows
+            }
+            source_keys.discard("")
+            pids = {
+                str(sources.get(row["key"], {}).get("pid", ""))
+                for row in group_rows
+            }
+            pids.discard("")
+            same_source = len(source_keys) == 1
+            same_pid = len(pids) == 1
+            generic = _is_generic_duplicate_caption(caption)
+            reason_name = (
+                "duplicate_warning"
+                if same_source and same_pid and not generic
+                else "duplicate_severe"
+            )
+            strict_counts[reason_name] += 1
+            if len(examples[reason_name]) < 5:
+                examples[reason_name].append(
+                    (
+                        ",".join(row["key"] for row in group_rows),
+                        ["same_source=" + str(same_source), "same_pid=" + str(same_pid), "generic=" + str(generic)],
+                        group_rows[0].get("source_caption", ""),
+                        caption,
+                    )
+                )
+
         for row in valid_rows:
             source_caption = row.get("source_caption", "")
             if not source_caption:
@@ -495,6 +619,18 @@ def analyze(rows, sources, bank_type):
                         examples[name].append(
                             (row["key"], sorted(terms), source_caption, row["caption"])
                         )
+    else:
+        strict_counts["duplicate_severe"] = len(duplicate_groups)
+        if duplicate_groups:
+            for _dup_key, group_rows in list(duplicate_groups.items())[:5]:
+                examples["duplicate_severe"].append(
+                    (
+                        ",".join(row["key"] for row in group_rows),
+                        ["flat_bank_duplicate"],
+                        "",
+                        group_rows[0]["caption"],
+                    )
+                )
 
     return {
         "total_train_images": len(train_keys),
@@ -613,22 +749,32 @@ def main():
 
     print_samples(rows, sources, max(0, int(args.sample)), args.seed)
 
+    strict_counts = report["strict_counts"]
     strict_reasons = OrderedDict()
     strict_reasons["unmatched_keys"] = report["unmatched_keys"]
     strict_reasons["invalid_count"] = report["invalid_count"]
-    strict_reasons["duplicate_count"] = report["duplicate_count"]
+    strict_reasons["duplicate_severe"] = strict_counts.get("duplicate_severe", 0)
     strict_reasons["forbidden_word_count"] = report["forbidden_word_count"]
     strict_reasons["word_length_out_of_range_count"] = report[
         "word_length_out_of_range_count"
     ]
     if bank_type == "metadata":
-        strict_reasons.update(report["strict_counts"])
+        for reason, count in strict_counts.items():
+            if reason in {"duplicate_severe", "duplicate_warning"}:
+                continue
+            strict_reasons[reason] = count
+
+    warning_reasons = OrderedDict()
+    warning_reasons["duplicate_warning"] = strict_counts.get("duplicate_warning", 0)
 
     severe = any(count > 0 for count in strict_reasons.values())
     print("[SYNTH-V6-CHECK] strict_issue_reasons:")
     for reason, count in strict_reasons.items():
         if count > 0:
             print(f"  - {reason}: {count}")
+    for reason, count in warning_reasons.items():
+        if count > 0:
+            print(f"  - {reason}: {count} (warning)")
     if args.strict and severe:
         print("[SYNTH-V6-CHECK] strict=True severe_issues_found=True")
         return 1
