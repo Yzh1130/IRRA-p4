@@ -32,15 +32,21 @@ RAW_RESPONSE_LOG_CHARS = 800
 SYSTEM_PROMPT = (
     "You generate conservative synthetic training captions for text-to-image "
     "person retrieval. Rewrite only facts clearly stated in the source caption. "
-    "Do not infer or invent visual attributes. Output strict JSON only."
+    "Preserve visible facts exactly and do not infer, invent, omit, or alter "
+    "attributes. Output strict JSON only."
 )
 
 USER_PROMPT_TEMPLATE = """Rewrite the source person caption into one safe synthetic caption.
 
 Rules:
-- Only rewrite the original caption.
+- Rewrite only the original caption; preserve visible facts, do not infer.
 - Do not add facts that are not explicitly stated in the original caption.
-- Do not infer colors, gender, age, bags, backpacks, shoes, clothing, actions, hair, or accessories.
+- Do not change any color words. Gray must stay gray, green must stay green, white must stay white.
+- Do not change clothing item types. A hoodie cannot become clothing. Trousers cannot become jeans unless the source says jeans.
+- Do not add body build words such as thin, slim, heavy, medium, average, or well-proportioned unless the source explicitly contains them.
+- Do not add viewpoint words such as from behind, back, front, or side unless the source explicitly contains them.
+- Do not add or change bags, backpacks, handbags, purses, shoes, sneakers, clothing, actions, hair, gender, or accessories.
+- Do not omit major clothing facts if the source contains upper clothing, lower clothing, shoes, or a bag.
 - Preserve visible appearance, clothing, carried items, and posture/action when stated.
 - Do not use uncertain wording such as maybe, probably, possibly, appears to, or seems.
 - Do not mention thermal, infrared, RGB, modality, dataset, camera, photo, or image.
@@ -116,6 +122,9 @@ CLOTHING_WORDS = {
     "shirt",
     "tshirt",
     "t-shirt",
+    "clothing",
+    "clothes",
+    "top",
     "coat",
     "jacket",
     "hoodie",
@@ -132,6 +141,7 @@ CLOTHING_WORDS = {
     "boots",
     "hat",
     "cap",
+    "uniform",
 }
 
 BAG_TERMS = {
@@ -140,12 +150,55 @@ BAG_TERMS = {
     "handbag",
     "purse",
     "satchel",
+    "school bag",
     "shoulder bag",
     "crossbody bag",
     "schoolbag",
     "briefcase",
 }
 
+SHOE_TERMS = {"shoes", "sneakers", "boots", "trainers", "footwear"}
+BODY_BUILD_TERMS = {
+    "thin",
+    "slim",
+    "skinny",
+    "heavy",
+    "fat",
+    "obese",
+    "stout",
+    "medium",
+    "average",
+    "well-proportioned",
+    "well proportioned",
+    "medium build",
+    "average build",
+    "heavy build",
+    "slim build",
+    "thin build",
+}
+VIEWPOINT_TERMS = {
+    "back",
+    "behind",
+    "from behind",
+    "back view",
+    "rear",
+    "front",
+    "from front",
+    "front view",
+    "side",
+    "side view",
+    "profile",
+}
+PHONE_TERMS = {"phone", "mobile phone", "cell phone", "cellphone", "telephone"}
+HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {"umbrella", "book", "paper", "bottle"}
+ACTION_VARIANTS = {
+    "walking": {"walk", "walks", "walking", "walked"},
+    "standing": {"stand", "stands", "standing", "stood"},
+    "holding": {"hold", "holds", "holding", "held"},
+    "carrying": {"carry", "carries", "carrying", "carried", "take", "takes", "taking"},
+    "using": {"use", "uses", "using", "used", "texting"},
+    "riding": {"ride", "rides", "riding", "rode"},
+}
 GENDER_WORDS = {"man", "woman", "boy", "girl", "male", "female", "lady"}
 MALE_WORDS = {"man", "boy", "male"}
 FEMALE_WORDS = {"woman", "girl", "female", "lady"}
@@ -272,6 +325,42 @@ def _bag_set(text):
     if any(term in found for term in found if term != "bag"):
         found.add("bag")
     return found
+
+
+def _required_bag_set(text):
+    return _term_set(text, BAG_TERMS)
+
+
+def _shoe_set(text):
+    return _term_set(text, SHOE_TERMS)
+
+
+def _clothing_set(text):
+    return _term_set(text, CLOTHING_WORDS)
+
+
+def _body_build_set(text):
+    return _term_set(text, BODY_BUILD_TERMS)
+
+
+def _viewpoint_set(text):
+    return _term_set(text, VIEWPOINT_TERMS)
+
+
+def _action_set(text):
+    lowered = str(text or "").lower()
+    found = set()
+    for canonical, variants in ACTION_VARIANTS.items():
+        if any(re.search(r"\b" + re.escape(term) + r"\b", lowered) for term in variants):
+            found.add(canonical)
+    return found
+
+
+def _source_allows_hold_or_carry(source_caption):
+    return bool(
+        _action_set(source_caption) & {"holding", "carrying", "using"}
+        or _term_set(source_caption, HELD_ITEM_TERMS)
+    )
 
 
 def _gender_set(text):
@@ -526,12 +615,61 @@ def local_filter(source_caption, synth_caption):
     new_colors = synth_colors - source_colors
     if new_colors:
         return False, "new_color:" + ",".join(sorted(new_colors))
+    deleted_colors = source_colors - synth_colors
+    if deleted_colors:
+        return False, "deleted_color:" + ",".join(sorted(deleted_colors))
 
     source_bags = _bag_set(source_caption)
     synth_bags = _bag_set(synth_caption)
     new_bags = synth_bags - source_bags
     if new_bags:
         return False, "new_bag:" + ",".join(sorted(new_bags))
+    required_source_bags = _required_bag_set(source_caption)
+    if required_source_bags:
+        required_synth_bags = _required_bag_set(synth_caption)
+        missing_bags = required_source_bags - required_synth_bags
+        if missing_bags:
+            return False, "deleted_bag:" + ",".join(sorted(missing_bags))
+
+    source_shoes = _shoe_set(source_caption)
+    synth_shoes = _shoe_set(synth_caption)
+    new_shoes = synth_shoes - source_shoes
+    if new_shoes:
+        return False, "new_shoe:" + ",".join(sorted(new_shoes))
+    missing_shoes = source_shoes - synth_shoes
+    if missing_shoes:
+        return False, "deleted_shoe:" + ",".join(sorted(missing_shoes))
+
+    source_clothing = _clothing_set(source_caption)
+    synth_clothing = _clothing_set(synth_caption)
+    new_clothing = synth_clothing - source_clothing
+    if new_clothing:
+        return False, "new_clothing:" + ",".join(sorted(new_clothing))
+    deleted_clothing = source_clothing - synth_clothing
+    if deleted_clothing:
+        return False, "deleted_clothing:" + ",".join(sorted(deleted_clothing))
+
+    source_body = _body_build_set(source_caption)
+    synth_body = _body_build_set(synth_caption)
+    new_body = synth_body - source_body
+    if new_body:
+        return False, "new_body:" + ",".join(sorted(new_body))
+
+    source_views = _viewpoint_set(source_caption)
+    synth_views = _viewpoint_set(synth_caption)
+    new_views = synth_views - source_views
+    if new_views:
+        return False, "new_view:" + ",".join(sorted(new_views))
+
+    source_actions = _action_set(source_caption)
+    synth_actions = _action_set(synth_caption)
+    new_actions = synth_actions - source_actions
+    allowed_new_actions = set()
+    if _source_allows_hold_or_carry(source_caption):
+        allowed_new_actions.update({"holding", "carrying", "using"})
+    new_actions = new_actions - allowed_new_actions
+    if new_actions:
+        return False, "new_action:" + ",".join(sorted(new_actions))
 
     source_gender = _gender_set(source_caption)
     synth_gender = _gender_set(synth_caption)

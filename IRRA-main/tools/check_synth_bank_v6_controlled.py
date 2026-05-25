@@ -60,16 +60,86 @@ COLOR_WORDS = {
     "light",
 }
 
+CLOTHING_WORDS = {
+    "shirt",
+    "tshirt",
+    "t-shirt",
+    "clothing",
+    "clothes",
+    "top",
+    "coat",
+    "jacket",
+    "hoodie",
+    "sweater",
+    "jumper",
+    "dress",
+    "skirt",
+    "pants",
+    "trousers",
+    "jeans",
+    "shorts",
+    "shoes",
+    "sneakers",
+    "boots",
+    "hat",
+    "cap",
+    "uniform",
+}
+
 BAG_TERMS = {
     "bag",
     "backpack",
     "handbag",
     "purse",
     "satchel",
+    "school bag",
     "shoulder bag",
     "crossbody bag",
     "schoolbag",
     "briefcase",
+}
+
+SHOE_TERMS = {"shoes", "sneakers", "boots", "trainers", "footwear"}
+BODY_BUILD_TERMS = {
+    "thin",
+    "slim",
+    "skinny",
+    "heavy",
+    "fat",
+    "obese",
+    "stout",
+    "medium",
+    "average",
+    "well-proportioned",
+    "well proportioned",
+    "medium build",
+    "average build",
+    "heavy build",
+    "slim build",
+    "thin build",
+}
+VIEWPOINT_TERMS = {
+    "back",
+    "behind",
+    "from behind",
+    "back view",
+    "rear",
+    "front",
+    "from front",
+    "front view",
+    "side",
+    "side view",
+    "profile",
+}
+PHONE_TERMS = {"phone", "mobile phone", "cell phone", "cellphone", "telephone"}
+HELD_ITEM_TERMS = PHONE_TERMS | BAG_TERMS | {"umbrella", "book", "paper", "bottle"}
+ACTION_VARIANTS = {
+    "walking": {"walk", "walks", "walking", "walked"},
+    "standing": {"stand", "stands", "standing", "stood"},
+    "holding": {"hold", "holds", "holding", "held"},
+    "carrying": {"carry", "carries", "carrying", "carried", "take", "takes", "taking"},
+    "using": {"use", "uses", "using", "used", "texting"},
+    "riding": {"ride", "rides", "riding", "rode"},
 }
 
 
@@ -149,6 +219,42 @@ def _bag_set(text):
     return found
 
 
+def _required_bag_set(text):
+    return _term_set(text, BAG_TERMS)
+
+
+def _shoe_set(text):
+    return _term_set(text, SHOE_TERMS)
+
+
+def _clothing_set(text):
+    return _term_set(text, CLOTHING_WORDS)
+
+
+def _body_build_set(text):
+    return _term_set(text, BODY_BUILD_TERMS)
+
+
+def _viewpoint_set(text):
+    return _term_set(text, VIEWPOINT_TERMS)
+
+
+def _action_set(text):
+    lowered = str(text or "").lower()
+    found = set()
+    for canonical, variants in ACTION_VARIANTS.items():
+        if any(re.search(r"\b" + re.escape(term) + r"\b", lowered) for term in variants):
+            found.add(canonical)
+    return found
+
+
+def _source_allows_hold_or_carry(source_caption):
+    return bool(
+        _action_set(source_caption) & {"holding", "carrying", "using"}
+        or _term_set(source_caption, HELD_ITEM_TERMS)
+    )
+
+
 def _has_forbidden(text):
     lowered = str(text or "").lower()
     return any(re.search(r"\b" + re.escape(term) + r"\b", lowered) for term in FORBIDDEN_PHRASES)
@@ -216,6 +322,16 @@ def load_bank(path):
                             "key": str(key),
                             "caption": _normalize_text(entry.get("caption", "")),
                             "source_caption": _normalize_text(entry.get("source_caption", "")),
+                            "quality_filter": _normalize_text(
+                                entry.get("quality", {}).get("filter", "")
+                                if isinstance(entry.get("quality", {}), dict)
+                                else ""
+                            ),
+                            "quality_reason": _normalize_text(
+                                entry.get("quality", {}).get("reason", "")
+                                if isinstance(entry.get("quality", {}), dict)
+                                else ""
+                            ),
                             "invalid": "",
                         }
                     )
@@ -225,6 +341,8 @@ def load_bank(path):
                             "key": str(key),
                             "caption": "",
                             "source_caption": "",
+                            "quality_filter": "",
+                            "quality_reason": "",
                             "invalid": "metadata_entry_not_object",
                         }
                     )
@@ -247,6 +365,8 @@ def load_bank(path):
                         "key": str(key),
                         "caption": _normalize_text(caption) if isinstance(caption, str) else "",
                         "source_caption": "",
+                        "quality_filter": "",
+                        "quality_reason": "",
                         "invalid": "" if isinstance(caption, str) else "flat_caption_not_string",
                     }
                 )
@@ -269,7 +389,7 @@ def _word_stats(lengths):
     }
 
 
-def analyze(rows, sources):
+def analyze(rows, sources, bank_type):
     train_keys = set(sources.keys())
     bank_keys = [row["key"] for row in rows]
     bank_key_set = set(bank_keys)
@@ -289,28 +409,92 @@ def analyze(rows, sources):
     normalized = [_norm_key(row["caption"]) for row in valid_rows]
     duplicate_count = sum(count - 1 for count in Counter(normalized).values() if count > 1)
     forbidden_count = sum(1 for row in valid_rows if _has_forbidden(row["caption"]))
+    word_length_out_of_range_count = sum(
+        1 for length in lengths if length < 8 or length > 45
+    )
 
-    color_hallucination = 0
-    bag_hallucination = 0
-    color_examples = []
-    bag_examples = []
+    strict_counts = OrderedDict(
+        [
+            ("new_color", 0),
+            ("deleted_color", 0),
+            ("new_bag", 0),
+            ("deleted_bag", 0),
+            ("new_shoe", 0),
+            ("deleted_shoe", 0),
+            ("new_clothing", 0),
+            ("deleted_clothing", 0),
+            ("new_body", 0),
+            ("new_view", 0),
+            ("new_action", 0),
+            ("missing_source_caption", 0),
+        ]
+    )
+    examples = {name: [] for name in strict_counts}
 
-    for row in valid_rows:
-        source_caption = row.get("source_caption") or _select_default_source(
-            sources.get(row["key"], {})
-        )
-        if not source_caption:
-            continue
-        new_colors = _color_set(row["caption"]) - _color_set(source_caption)
-        if new_colors:
-            color_hallucination += 1
-            if len(color_examples) < 5:
-                color_examples.append((row["key"], sorted(new_colors), source_caption, row["caption"]))
-        new_bags = _bag_set(row["caption"]) - _bag_set(source_caption)
-        if new_bags:
-            bag_hallucination += 1
-            if len(bag_examples) < 5:
-                bag_examples.append((row["key"], sorted(new_bags), source_caption, row["caption"]))
+    if bank_type == "metadata":
+        for row in valid_rows:
+            source_caption = row.get("source_caption", "")
+            if not source_caption:
+                strict_counts["missing_source_caption"] += 1
+                if len(examples["missing_source_caption"]) < 5:
+                    examples["missing_source_caption"].append(
+                        (row["key"], [], "", row["caption"])
+                    )
+                continue
+
+            checks = []
+            source_colors = _color_set(source_caption)
+            synth_colors = _color_set(row["caption"])
+            checks.append(("new_color", synth_colors - source_colors))
+            checks.append(("deleted_color", source_colors - synth_colors))
+
+            source_bags = _bag_set(source_caption)
+            synth_bags = _bag_set(row["caption"])
+            checks.append(("new_bag", synth_bags - source_bags))
+            checks.append(
+                (
+                    "deleted_bag",
+                    _required_bag_set(source_caption) - _required_bag_set(row["caption"]),
+                )
+            )
+
+            source_shoes = _shoe_set(source_caption)
+            synth_shoes = _shoe_set(row["caption"])
+            checks.append(("new_shoe", synth_shoes - source_shoes))
+            checks.append(("deleted_shoe", source_shoes - synth_shoes))
+
+            source_clothing = _clothing_set(source_caption)
+            synth_clothing = _clothing_set(row["caption"])
+            checks.append(("new_clothing", synth_clothing - source_clothing))
+            checks.append(("deleted_clothing", source_clothing - synth_clothing))
+
+            checks.append(
+                (
+                    "new_body",
+                    _body_build_set(row["caption"]) - _body_build_set(source_caption),
+                )
+            )
+            checks.append(
+                (
+                    "new_view",
+                    _viewpoint_set(row["caption"]) - _viewpoint_set(source_caption),
+                )
+            )
+
+            source_actions = _action_set(source_caption)
+            synth_actions = _action_set(row["caption"])
+            new_actions = synth_actions - source_actions
+            if _source_allows_hold_or_carry(source_caption):
+                new_actions = new_actions - {"holding", "carrying", "using"}
+            checks.append(("new_action", new_actions))
+
+            for name, terms in checks:
+                if terms:
+                    strict_counts[name] += 1
+                    if len(examples[name]) < 5:
+                        examples[name].append(
+                            (row["key"], sorted(terms), source_caption, row["caption"])
+                        )
 
     return {
         "total_train_images": len(train_keys),
@@ -323,11 +507,13 @@ def analyze(rows, sources):
         "word_stats": _word_stats(lengths),
         "duplicate_count": duplicate_count,
         "forbidden_word_count": forbidden_count,
-        "potential_new_color_hallucination_count": color_hallucination,
-        "potential_new_bag_hallucination_count": bag_hallucination,
+        "word_length_out_of_range_count": word_length_out_of_range_count,
+        "potential_new_color_hallucination_count": strict_counts["new_color"],
+        "potential_new_bag_hallucination_count": strict_counts["new_bag"],
         "invalid_count": invalid_count,
-        "color_examples": color_examples,
-        "bag_examples": bag_examples,
+        "strict_counts": strict_counts,
+        "strict_examples": examples,
+        "source_strict_checks_enabled": bank_type == "metadata",
     }
 
 
@@ -345,6 +531,10 @@ def print_samples(rows, sources, sample_count, seed):
         print(f"  - key={row['key']}")
         print(f"    source: {source_caption}")
         print(f"    synth:  {row['caption']}")
+        print(
+            "    quality: "
+            f"filter={row.get('quality_filter', '')} reason={row.get('quality_reason', '')}"
+        )
 
 
 def parse_args():
@@ -369,7 +559,7 @@ def main():
     caption_json = resolve_caption_json(args.root_dir, args.caption_json)
     bank_type, rows = load_bank(args.bank_file)
     sources = collect_train_sources(caption_json)
-    report = analyze(rows, sources)
+    report = analyze(rows, sources, bank_type)
 
     print(f"[SYNTH-V6-CHECK] bank_file={op.abspath(args.bank_file)}")
     print(f"[SYNTH-V6-CHECK] bank_type={bank_type}")
@@ -391,6 +581,10 @@ def main():
     print(f"[SYNTH-V6-CHECK] duplicate_count={report['duplicate_count']}")
     print(f"[SYNTH-V6-CHECK] forbidden_word_count={report['forbidden_word_count']}")
     print(
+        "[SYNTH-V6-CHECK] word_length_out_of_range_count="
+        f"{report['word_length_out_of_range_count']}"
+    )
+    print(
         "[SYNTH-V6-CHECK] potential_new_color_hallucination_count="
         f"{report['potential_new_color_hallucination_count']}"
     )
@@ -399,31 +593,42 @@ def main():
         f"{report['potential_new_bag_hallucination_count']}"
     )
     print(f"[SYNTH-V6-CHECK] invalid_count={report['invalid_count']}")
+    print(
+        "[SYNTH-V6-CHECK] source_strict_checks_enabled="
+        f"{report['source_strict_checks_enabled']}"
+    )
     print(f"[SYNTH-V6-CHECK] unmatched_key_examples={report['unmatched_key_examples']}")
 
-    if report["color_examples"]:
-        print("[SYNTH-V6-CHECK] color_hallucination_examples_top5:")
-        for key, new_terms, source, synth in report["color_examples"]:
-            print(f"  - {key} new={new_terms}")
-            print(f"    source: {source}")
-            print(f"    synth:  {synth}")
-    if report["bag_examples"]:
-        print("[SYNTH-V6-CHECK] bag_hallucination_examples_top5:")
-        for key, new_terms, source, synth in report["bag_examples"]:
-            print(f"  - {key} new={new_terms}")
+    for reason, count in report["strict_counts"].items():
+        print(f"[SYNTH-V6-CHECK] strict_reason_{reason}={count}")
+
+    for reason, examples in report["strict_examples"].items():
+        if not examples:
+            continue
+        print(f"[SYNTH-V6-CHECK] {reason}_examples_top5:")
+        for key, terms, source, synth in examples[:5]:
+            print(f"  - {key} terms={terms}")
             print(f"    source: {source}")
             print(f"    synth:  {synth}")
 
     print_samples(rows, sources, max(0, int(args.sample)), args.seed)
 
-    severe = (
-        report["unmatched_keys"] > 0
-        or report["invalid_count"] > 0
-        or report["duplicate_count"] > 0
-        or report["forbidden_word_count"] > 0
-        or report["potential_new_color_hallucination_count"] > 0
-        or report["potential_new_bag_hallucination_count"] > 0
-    )
+    strict_reasons = OrderedDict()
+    strict_reasons["unmatched_keys"] = report["unmatched_keys"]
+    strict_reasons["invalid_count"] = report["invalid_count"]
+    strict_reasons["duplicate_count"] = report["duplicate_count"]
+    strict_reasons["forbidden_word_count"] = report["forbidden_word_count"]
+    strict_reasons["word_length_out_of_range_count"] = report[
+        "word_length_out_of_range_count"
+    ]
+    if bank_type == "metadata":
+        strict_reasons.update(report["strict_counts"])
+
+    severe = any(count > 0 for count in strict_reasons.values())
+    print("[SYNTH-V6-CHECK] strict_issue_reasons:")
+    for reason, count in strict_reasons.items():
+        if count > 0:
+            print(f"  - {reason}: {count}")
     if args.strict and severe:
         print("[SYNTH-V6-CHECK] strict=True severe_issues_found=True")
         return 1
