@@ -3,12 +3,24 @@ Check SynthCap-v6 controlled metadata or flat caption banks for RGBT-PEDES.
 """
 import argparse
 import json
+import os
 import os.path as op
 import random
 import re
 import statistics
 import sys
 from collections import Counter, OrderedDict
+
+try:
+    from build_synth_bank_v6_controlled import (
+        audit_caption_pair as _shared_audit_caption_pair,
+        local_filter as _shared_local_filter,
+    )
+except ImportError:
+    from tools.build_synth_bank_v6_controlled import (
+        audit_caption_pair as _shared_audit_caption_pair,
+        local_filter as _shared_local_filter,
+    )
 
 
 SPLIT = "train"
@@ -390,21 +402,20 @@ def load_bank(path):
                 continue
             for entry in entries:
                 if isinstance(entry, dict):
+                    quality = entry.get("quality", {})
+                    quality = quality if isinstance(quality, dict) else {}
                     rows.append(
                         {
                             "key": str(key),
                             "caption": _normalize_text(entry.get("caption", "")),
                             "source_caption": _normalize_text(entry.get("source_caption", "")),
                             "quality_filter": _normalize_text(
-                                entry.get("quality", {}).get("filter", "")
-                                if isinstance(entry.get("quality", {}), dict)
-                                else ""
+                                quality.get("filter", "")
                             ),
                             "quality_reason": _normalize_text(
-                                entry.get("quality", {}).get("reason", "")
-                                if isinstance(entry.get("quality", {}), dict)
-                                else ""
+                                quality.get("reason", "")
                             ),
+                            "quality_pass": quality.get("pass", None),
                             "invalid": "",
                         }
                     )
@@ -507,15 +518,25 @@ def analyze(rows, sources, bank_type):
 
     strict_counts = OrderedDict(
         [
+            ("accepted_filter_fail", 0),
+            ("accepted_quality_mismatch", 0),
             ("new_color", 0),
             ("deleted_color", 0),
             ("new_bag", 0),
             ("deleted_bag", 0),
             ("new_shoe", 0),
             ("deleted_shoe", 0),
+            ("shoe_color_changed", 0),
+            ("clothing_type_changed", 0),
             ("new_clothing", 0),
             ("deleted_clothing", 0),
             ("new_body", 0),
+            ("changed_body", 0),
+            ("deleted_body", 0),
+            ("new_hair", 0),
+            ("changed_hair", 0),
+            ("deleted_hair", 0),
+            ("changed_gender_age", 0),
             ("new_view", 0),
             ("new_action", 0),
             ("duplicate_severe", 0),
@@ -524,6 +545,7 @@ def analyze(rows, sources, bank_type):
         ]
     )
     examples = {name: [] for name in strict_counts}
+    accepted_bad_keys = []
 
     if bank_type == "metadata":
         for dup_key, group_rows in duplicate_groups.items():
@@ -566,53 +588,25 @@ def analyze(rows, sources, bank_type):
                     )
                 continue
 
-            checks = []
-            source_colors = _color_set(source_caption)
-            synth_colors = _color_set(row["caption"])
-            checks.append(("new_color", synth_colors - source_colors))
-            checks.append(("deleted_color", source_colors - synth_colors))
+            filter_ok, filter_reason = _shared_local_filter(source_caption, row["caption"])
+            audit_issues = _shared_audit_caption_pair(source_caption, row["caption"])
+            if not filter_ok:
+                accepted_bad_keys.append(row["key"])
+                strict_counts["accepted_filter_fail"] += 1
+                if len(examples["accepted_filter_fail"]) < 5:
+                    examples["accepted_filter_fail"].append(
+                        (row["key"], [filter_reason], source_caption, row["caption"])
+                    )
+                if row.get("quality_pass") is True or row.get("quality_filter") == "pass":
+                    strict_counts["accepted_quality_mismatch"] += 1
+                    if len(examples["accepted_quality_mismatch"]) < 5:
+                        examples["accepted_quality_mismatch"].append(
+                            (row["key"], [filter_reason], source_caption, row["caption"])
+                        )
 
-            source_bags = _bag_set(source_caption)
-            synth_bags = _bag_set(row["caption"])
-            checks.append(("new_bag", synth_bags - source_bags))
-            checks.append(
-                (
-                    "deleted_bag",
-                    _required_bag_set(source_caption) - _required_bag_set(row["caption"]),
-                )
-            )
-
-            source_shoes = _shoe_set(source_caption)
-            synth_shoes = _shoe_set(row["caption"])
-            checks.append(("new_shoe", synth_shoes - source_shoes))
-            checks.append(("deleted_shoe", source_shoes - synth_shoes))
-
-            source_clothing = _clothing_set(source_caption)
-            synth_clothing = _clothing_set(row["caption"])
-            checks.append(("new_clothing", synth_clothing - source_clothing))
-            checks.append(("deleted_clothing", source_clothing - synth_clothing))
-
-            checks.append(
-                (
-                    "new_body",
-                    _body_build_set(row["caption"]) - _body_build_set(source_caption),
-                )
-            )
-            checks.append(
-                (
-                    "new_view",
-                    _viewpoint_set(row["caption"]) - _viewpoint_set(source_caption),
-                )
-            )
-
-            source_actions = _action_set(source_caption)
-            synth_actions = _action_set(row["caption"])
-            new_actions = synth_actions - source_actions
-            if _source_allows_hold_or_carry(source_caption):
-                new_actions = new_actions - {"holding", "carrying", "using"}
-            checks.append(("new_action", new_actions))
-
-            for name, terms in checks:
+            for name, terms in audit_issues.items():
+                if name not in strict_counts:
+                    continue
                 if terms:
                     strict_counts[name] += 1
                     if len(examples[name]) < 5:
@@ -649,6 +643,7 @@ def analyze(rows, sources, bank_type):
         "invalid_count": invalid_count,
         "strict_counts": strict_counts,
         "strict_examples": examples,
+        "accepted_bad_keys": sorted(set(accepted_bad_keys)),
         "source_strict_checks_enabled": bank_type == "metadata",
     }
 
@@ -673,6 +668,80 @@ def print_samples(rows, sources, sample_count, seed):
         )
 
 
+RETRYABLE_FAILED_PATTERNS = (
+    "parse_error",
+    "no valid json",
+    "api_error",
+    "timeout",
+    "timed out",
+    "rate limit",
+    "ratelimit",
+    "quota",
+    "balance",
+    "insufficient",
+    "billing",
+    "payment",
+    "connection",
+    "server error",
+    "internal server",
+    "authentication",
+    "unauthorized",
+)
+
+
+def _write_key_list(path, keys):
+    if not path:
+        return
+    parent = op.dirname(op.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for key in keys:
+            f.write(str(key) + "\n")
+
+
+def _failed_record_text(record):
+    parts = []
+    for field in ("filter", "reason", "llm_reason", "raw"):
+        value = record.get(field, "")
+        if value:
+            parts.append(str(value))
+    request_error = record.get("request_error", None)
+    if request_error:
+        parts.append(json.dumps(request_error, ensure_ascii=False))
+    return " ".join(parts).lower()
+
+
+def _is_retryable_failed_record(record):
+    text = _failed_record_text(record)
+    return any(pattern in text for pattern in RETRYABLE_FAILED_PATTERNS)
+
+
+def load_retryable_failed_keys(path):
+    keys = []
+    seen = set()
+    if not path:
+        return keys
+    if not op.isfile(path):
+        raise FileNotFoundError(f"failed_file does not exist: {op.abspath(path)}")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            key = str(record.get("key", "")).strip()
+            if not key or key in seen:
+                continue
+            if _is_retryable_failed_record(record):
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Check SynthCap-v6 controlled metadata or flat bank."
@@ -687,6 +756,9 @@ def parse_args():
     parser.add_argument("--sample", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--strict", default=False, action="store_true")
+    parser.add_argument("--failed_file", default="")
+    parser.add_argument("--export_accepted_bad_keys", default="")
+    parser.add_argument("--export_retryable_failed_keys", default="")
     return parser.parse_args()
 
 
@@ -734,6 +806,7 @@ def main():
         f"{report['source_strict_checks_enabled']}"
     )
     print(f"[SYNTH-V6-CHECK] unmatched_key_examples={report['unmatched_key_examples']}")
+    print(f"[SYNTH-V6-CHECK] accepted_bad_keys={len(report['accepted_bad_keys'])}")
 
     for reason, count in report["strict_counts"].items():
         print(f"[SYNTH-V6-CHECK] strict_reason_{reason}={count}")
@@ -748,6 +821,24 @@ def main():
             print(f"    synth:  {synth}")
 
     print_samples(rows, sources, max(0, int(args.sample)), args.seed)
+
+    if args.export_accepted_bad_keys:
+        _write_key_list(args.export_accepted_bad_keys, report["accepted_bad_keys"])
+        print(
+            "[SYNTH-V6-CHECK] wrote_accepted_bad_keys="
+            f"{op.abspath(args.export_accepted_bad_keys)} count={len(report['accepted_bad_keys'])}"
+        )
+
+    if args.export_retryable_failed_keys:
+        if not args.failed_file:
+            print("[SYNTH-V6-CHECK] error: --failed_file is required with --export_retryable_failed_keys")
+            return 2
+        retryable_failed_keys = load_retryable_failed_keys(args.failed_file)
+        _write_key_list(args.export_retryable_failed_keys, retryable_failed_keys)
+        print(
+            "[SYNTH-V6-CHECK] wrote_retryable_failed_keys="
+            f"{op.abspath(args.export_retryable_failed_keys)} count={len(retryable_failed_keys)}"
+        )
 
     strict_counts = report["strict_counts"]
     strict_reasons = OrderedDict()

@@ -42,9 +42,13 @@ Rules:
 - Rewrite only the original caption; preserve visible facts, do not infer.
 - Do not add facts that are not explicitly stated in the original caption.
 - Do not change any color words. Gray must stay gray, green must stay green, white must stay white.
-- Do not change clothing item types. A hoodie cannot become clothing. Trousers cannot become jeans unless the source says jeans.
-- Do not add body build words such as thin, slim, heavy, medium, average, or well-proportioned unless the source explicitly contains them.
+- Do not change hair length, hair color, or hair style. Long hair cannot become short hair. Do not add black hair unless the source says black hair.
+- Do not change gender or age words. Boy cannot become man or young man. Girl cannot become woman or young woman.
+- Do not change body build words. Medium build cannot become thin, slim, fat, or heavy.
+- Do not add body build words such as thin, slim, lean, slender, heavy, medium, average, or well-proportioned unless the source explicitly contains them.
 - Do not add viewpoint words such as from behind, back, front, or side unless the source explicitly contains them.
+- Do not write "the back of" unless the source explicitly states a back/behind viewpoint.
+- Do not change clothing item types. A hoodie cannot become a coat or jacket. Sweatpants cannot become trousers. Pants cannot become jeans unless the source says jeans.
 - Do not add or change bags, backpacks, handbags, purses, shoes, sneakers, clothing, actions, hair, gender, or accessories.
 - Do not omit major clothing facts if the source contains upper clothing, lower clothing, shoes, or a bag.
 - Preserve visible appearance, clothing, carried items, and posture/action when stated.
@@ -127,10 +131,15 @@ GARMENT_PATTERNS = OrderedDict(
         ("sweater", (r"\bsweatshirt\b", r"\bsweater\b", r"\bjumper\b")),
         ("jacket", (r"\bjacket\b",)),
         ("coat", (r"\bcoat\b",)),
-        ("pants", (r"\btrousers\b", r"\btrouser\b", r"\bpants\b", r"\bpant\b")),
+        ("sweatpants", (r"\bsweatpants\b", r"\bsweat pants\b")),
+        (
+            "pants",
+            (r"\btrousers\b", r"\btrouser\b", r"\bpants\b", r"\bpant\b", r"\bslacks\b", r"\bslack\b"),
+        ),
         ("jeans", (r"\bjeans\b",)),
         ("shorts", (r"\bshorts\b",)),
         ("skirt", (r"\bskirt\b",)),
+        ("uniform", (r"\buniform\b",)),
         ("hat", (r"\bhat\b", r"\bcap\b")),
     ]
 )
@@ -150,6 +159,8 @@ CLOTHING_WORDS = {
     "skirt",
     "pants",
     "trousers",
+    "sweatpants",
+    "slacks",
     "jeans",
     "shorts",
     "shoes",
@@ -204,6 +215,8 @@ BODY_BUILD_TERMS = {
     "thin",
     "slim",
     "skinny",
+    "lean",
+    "slender",
     "heavy",
     "fat",
     "obese",
@@ -217,7 +230,30 @@ BODY_BUILD_TERMS = {
     "heavy build",
     "slim build",
     "thin build",
+    "lean build",
+    "slender build",
 }
+BODY_BUILD_PATTERNS = OrderedDict(
+    [
+        ("thin", (r"\bthin\b", r"\bslim\b", r"\bskinny\b", r"\blean\b", r"\bslender\b")),
+        ("heavy", (r"\bheavy\b", r"\bfat\b", r"\bobese\b", r"\bstout\b")),
+        ("medium", (r"\bmedium[- ]build\b", r"\bmedium build\b", r"\bof medium build\b")),
+        ("average", (r"\baverage[- ]build\b", r"\baverage build\b")),
+        ("well_proportioned", (r"\bwell[- ]proportioned\b",)),
+    ]
+)
+HAIR_LENGTH_PATTERNS = OrderedDict(
+    [
+        ("long", (r"\blong[- ]haired\b", r"\blong\s+(?:\w+\s+){0,2}hair\b")),
+        ("short", (r"\bshort[- ]haired\b", r"\bshort\s+(?:\w+\s+){0,2}hair\b")),
+    ]
+)
+HAIR_STYLE_PATTERNS = OrderedDict(
+    [
+        ("ponytail", (r"\bponytail\b",)),
+        ("bald", (r"\bbald\b",)),
+    ]
+)
 VIEWPOINT_TERMS = {
     "back",
     "behind",
@@ -251,9 +287,21 @@ ACTION_VARIANTS = {
     "using": {"use", "uses", "using", "used", "texting"},
     "riding": {"ride", "rides", "riding", "rode"},
 }
-GENDER_WORDS = {"man", "woman", "boy", "girl", "male", "female", "lady"}
-MALE_WORDS = {"man", "boy", "male"}
-FEMALE_WORDS = {"woman", "girl", "female", "lady"}
+GENDER_WORDS = {
+    "young man",
+    "young woman",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "male",
+    "female",
+    "lady",
+}
+MALE_WORDS = {"young man", "man", "boy", "male"}
+FEMALE_WORDS = {"young woman", "woman", "girl", "female", "lady"}
+CHILD_GENDER_WORDS = {"boy", "girl"}
+ADULT_GENDER_WORDS = {"young man", "young woman", "man", "woman", "lady"}
 ACTION_WORDS = {"walking", "standing", "holding", "carrying", "using", "riding"}
 
 
@@ -387,6 +435,32 @@ def _shoe_set(text):
     return {"shoe"} if _term_set(text, SHOE_TERMS) else set()
 
 
+def _colors_near_terms(text, terms, before_words=3, after_words=4):
+    text = str(text or "").lower()
+    term_pattern = "|".join(
+        re.escape(term).replace(r"\ ", r"\s+")
+        for term in sorted(terms, key=len, reverse=True)
+    )
+    colors = set()
+    if not term_pattern:
+        return colors
+    for match in re.finditer(r"\b(?:" + term_pattern + r")\b", text):
+        before = text[: match.start()]
+        before_tokens = re.findall(r"[a-z-]+", before)[-int(before_words):]
+        colors.update(_color_set(" ".join(before_tokens)))
+
+        after = text[match.end() :]
+        after_tokens = re.findall(r"[a-z-]+", after)[: int(after_words)]
+        after_text = " ".join(after_tokens)
+        if re.search(r"\b(?:is|are|was|were|being|be)\b", after_text):
+            colors.update(_color_set(after_text))
+    return colors
+
+
+def _shoe_color_set(text):
+    return _colors_near_terms(text, SHOE_TERMS)
+
+
 def _clothing_set(text):
     text = str(text or "").lower()
     found = set()
@@ -404,7 +478,16 @@ def _clothing_set(text):
 
     # Only force "dress" preservation when it is explicitly worn, not when a
     # phrase like "top side of the dress" describes another garment region.
-    if re.search(r"\b(?:wear(?:s|ing)?|wore|in|dressed in)\s+(?:a\s+|an\s+|the\s+)?(?:\w+\s+){0,2}dress\b", text):
+    if re.search(
+        r"\b(?:wear(?:s|ing)?|wore|in|dressed in)\s+(?:a\s+|an\s+|the\s+)?(?:\w+\s+){0,4}dress\b",
+        text,
+    ) or (
+        re.search(
+            r"\b(?:a|an|the|black|white|gray|grey|blue|red|green|yellow|pink|purple|brown|orange)\s+(?:\w+\s+){0,2}dress\b",
+            text,
+        )
+        and not re.search(r"\b(?:top|bottom|left|right)?\s*side of the dress\b", text)
+    ):
         found.add("dress")
 
     if _term_set(text, GENERIC_CLOTHING_WORDS):
@@ -413,17 +496,53 @@ def _clothing_set(text):
 
 
 def _body_build_set(text):
-    return _term_set(text, BODY_BUILD_TERMS)
+    text = str(text or "").lower()
+    found = set()
+    for canonical, patterns in BODY_BUILD_PATTERNS.items():
+        if any(re.search(pattern, text) for pattern in patterns):
+            found.add(canonical)
+    return found
+
+
+def _hair_attr_set(text):
+    text = str(text or "").lower()
+    found = set()
+    for canonical, patterns in HAIR_LENGTH_PATTERNS.items():
+        if any(re.search(pattern, text) for pattern in patterns):
+            found.add("hair_length:" + canonical)
+    for canonical, patterns in HAIR_STYLE_PATTERNS.items():
+        if any(re.search(pattern, text) for pattern in patterns):
+            found.add("hair_style:" + canonical)
+
+    hair_terms = {"hair"}
+    for color in _colors_near_terms(text, hair_terms, before_words=3, after_words=4):
+        found.add("hair_color:" + color)
+    for color in _color_set(text):
+        if re.search(r"\b" + re.escape(color) + r"[- ]haired\b", text):
+            found.add("hair_color:" + color)
+    return found
 
 
 def _viewpoint_set(text):
     text = str(text or "").lower()
     found = set()
-    if re.search(r"\b(?:from behind|behind|back view|rear view|from back)\b", text):
+    if re.search(
+        r"\b(?:from behind|from the back|behind|back view|rear view|from back|seen from behind|seen from the back)\b",
+        text,
+    ) or re.search(
+        r"\bthe back of (?:a |an |the )?(?:\w+\s+){0,3}(?:person|man|woman|boy|girl|male|female)\b",
+        text,
+    ):
         found.add("back")
-    if re.search(r"\b(?:from front|front view|facing front)\b", text):
+    if re.search(
+        r"\b(?:from front|from the front|front view|facing front|seen from the front)\b",
+        text,
+    ) or re.search(
+        r"\bthe front of (?:a |an |the )?(?:\w+\s+){0,3}(?:person|man|woman|boy|girl|male|female)\b",
+        text,
+    ):
         found.add("front")
-    if re.search(r"\b(?:from side|side view|profile view|in profile)\b", text):
+    if re.search(r"\b(?:from side|from the side|side view|profile view|in profile)\b", text):
         found.add("side")
     return found
 
@@ -448,14 +567,130 @@ def _gender_set(text):
     return _term_set(text, GENDER_WORDS)
 
 
-def _has_gender_conflict(source_gender, synth_gender):
+def _gender_age_set(text):
+    return _gender_set(text)
+
+
+def _has_gender_age_conflict(source_gender, synth_gender):
     if not source_gender:
         return bool(synth_gender)
+    if not synth_gender:
+        return False
     if source_gender & MALE_WORDS and synth_gender & FEMALE_WORDS:
         return True
     if source_gender & FEMALE_WORDS and synth_gender & MALE_WORDS:
         return True
+    if source_gender & CHILD_GENDER_WORDS and synth_gender & ADULT_GENDER_WORDS:
+        return True
+    if source_gender & ADULT_GENDER_WORDS and synth_gender & CHILD_GENDER_WORDS:
+        return True
     return False
+
+
+def _format_terms(terms):
+    return ",".join(sorted(str(term) for term in terms))
+
+
+def audit_caption_pair(source_caption, synth_caption):
+    source_caption = _normalize_text(source_caption)
+    synth_caption = _normalize_text(synth_caption)
+    issues = OrderedDict(
+        [
+            ("new_color", set()),
+            ("deleted_color", set()),
+            ("new_bag", set()),
+            ("deleted_bag", set()),
+            ("new_shoe", set()),
+            ("deleted_shoe", set()),
+            ("shoe_color_changed", set()),
+            ("clothing_type_changed", set()),
+            ("new_clothing", set()),
+            ("deleted_clothing", set()),
+            ("new_body", set()),
+            ("changed_body", set()),
+            ("deleted_body", set()),
+            ("new_hair", set()),
+            ("changed_hair", set()),
+            ("deleted_hair", set()),
+            ("changed_gender_age", set()),
+            ("new_view", set()),
+            ("new_action", set()),
+        ]
+    )
+
+    source_colors = _color_set(source_caption)
+    synth_colors = _color_set(synth_caption)
+    issues["new_color"].update(synth_colors - source_colors)
+    issues["deleted_color"].update(source_colors - synth_colors)
+
+    source_bags = _bag_set(source_caption)
+    synth_bags = _bag_set(synth_caption)
+    issues["new_bag"].update(synth_bags - source_bags)
+    issues["deleted_bag"].update(_required_bag_set(source_caption) - _required_bag_set(synth_caption))
+
+    source_shoes = _shoe_set(source_caption)
+    synth_shoes = _shoe_set(synth_caption)
+    issues["new_shoe"].update(synth_shoes - source_shoes)
+    issues["deleted_shoe"].update(source_shoes - synth_shoes)
+
+    source_shoe_colors = _shoe_color_set(source_caption)
+    synth_shoe_colors = _shoe_color_set(synth_caption)
+    if source_shoe_colors and synth_shoe_colors and source_shoe_colors != synth_shoe_colors:
+        issues["shoe_color_changed"].add(
+            _format_terms(source_shoe_colors) + "=>" + _format_terms(synth_shoe_colors)
+        )
+
+    source_clothing = _clothing_set(source_caption)
+    synth_clothing = _clothing_set(synth_caption)
+    new_clothing = synth_clothing - source_clothing
+    deleted_clothing = source_clothing - synth_clothing
+    issues["new_clothing"].update(new_clothing)
+    issues["deleted_clothing"].update(deleted_clothing)
+    changed_clothing = (new_clothing | deleted_clothing) - {"generic_clothing"}
+    if changed_clothing:
+        issues["clothing_type_changed"].update(changed_clothing)
+
+    source_body = _body_build_set(source_caption)
+    synth_body = _body_build_set(synth_caption)
+    issues["new_body"].update(synth_body - source_body)
+    issues["deleted_body"].update(source_body - synth_body)
+    if source_body and synth_body and source_body != synth_body:
+        issues["changed_body"].add(_format_terms(source_body) + "=>" + _format_terms(synth_body))
+
+    source_hair = _hair_attr_set(source_caption)
+    synth_hair = _hair_attr_set(synth_caption)
+    issues["new_hair"].update(synth_hair - source_hair)
+    issues["deleted_hair"].update(source_hair - synth_hair)
+    for prefix in ("hair_length:", "hair_color:", "hair_style:"):
+        source_values = {term for term in source_hair if term.startswith(prefix)}
+        synth_values = {term for term in synth_hair if term.startswith(prefix)}
+        if source_values and synth_values and source_values != synth_values:
+            issues["changed_hair"].add(
+                _format_terms(source_values) + "=>" + _format_terms(synth_values)
+            )
+
+    source_gender = _gender_age_set(source_caption)
+    synth_gender = _gender_age_set(synth_caption)
+    if _has_gender_age_conflict(source_gender, synth_gender):
+        if not source_gender:
+            issues["changed_gender_age"].add("new=>" + _format_terms(synth_gender))
+        else:
+            issues["changed_gender_age"].add(
+                _format_terms(source_gender) + "=>" + _format_terms(synth_gender)
+            )
+
+    source_views = _viewpoint_set(source_caption)
+    synth_views = _viewpoint_set(synth_caption)
+    issues["new_view"].update(synth_views - source_views)
+
+    source_actions = _action_set(source_caption)
+    synth_actions = _action_set(synth_caption)
+    new_actions = synth_actions - source_actions
+    if _source_allows_hold_or_carry(source_caption):
+        new_actions = new_actions - {"holding", "carrying", "using"}
+    issues["new_action"].update(new_actions)
+
+    return OrderedDict((name, terms) for name, terms in issues.items() if terms)
 
 
 def _richness_score(caption):
@@ -691,73 +926,10 @@ def local_filter(source_caption, synth_caption):
         if re.search(pattern, lowered):
             return False, "first_person"
 
-    source_colors = _color_set(source_caption)
-    synth_colors = _color_set(synth_caption)
-    new_colors = synth_colors - source_colors
-    if new_colors:
-        return False, "new_color:" + ",".join(sorted(new_colors))
-    deleted_colors = source_colors - synth_colors
-    if deleted_colors:
-        return False, "deleted_color:" + ",".join(sorted(deleted_colors))
-
-    source_bags = _bag_set(source_caption)
-    synth_bags = _bag_set(synth_caption)
-    new_bags = synth_bags - source_bags
-    if new_bags:
-        return False, "new_bag:" + ",".join(sorted(new_bags))
-    required_source_bags = _required_bag_set(source_caption)
-    if required_source_bags:
-        required_synth_bags = _required_bag_set(synth_caption)
-        missing_bags = required_source_bags - required_synth_bags
-        if missing_bags:
-            return False, "deleted_bag:" + ",".join(sorted(missing_bags))
-
-    source_shoes = _shoe_set(source_caption)
-    synth_shoes = _shoe_set(synth_caption)
-    new_shoes = synth_shoes - source_shoes
-    if new_shoes:
-        return False, "new_shoe:" + ",".join(sorted(new_shoes))
-    missing_shoes = source_shoes - synth_shoes
-    if missing_shoes:
-        return False, "deleted_shoe:" + ",".join(sorted(missing_shoes))
-
-    source_clothing = _clothing_set(source_caption)
-    synth_clothing = _clothing_set(synth_caption)
-    new_clothing = synth_clothing - source_clothing
-    if new_clothing:
-        return False, "new_clothing:" + ",".join(sorted(new_clothing))
-    deleted_clothing = source_clothing - synth_clothing
-    if deleted_clothing:
-        return False, "deleted_clothing:" + ",".join(sorted(deleted_clothing))
-
-    source_body = _body_build_set(source_caption)
-    synth_body = _body_build_set(synth_caption)
-    new_body = synth_body - source_body
-    if new_body:
-        return False, "new_body:" + ",".join(sorted(new_body))
-
-    source_views = _viewpoint_set(source_caption)
-    synth_views = _viewpoint_set(synth_caption)
-    new_views = synth_views - source_views
-    if new_views:
-        return False, "new_view:" + ",".join(sorted(new_views))
-
-    source_actions = _action_set(source_caption)
-    synth_actions = _action_set(synth_caption)
-    new_actions = synth_actions - source_actions
-    allowed_new_actions = set()
-    if _source_allows_hold_or_carry(source_caption):
-        allowed_new_actions.update({"holding", "carrying", "using"})
-    new_actions = new_actions - allowed_new_actions
-    if new_actions:
-        return False, "new_action:" + ",".join(sorted(new_actions))
-
-    source_gender = _gender_set(source_caption)
-    synth_gender = _gender_set(synth_caption)
-    if _has_gender_conflict(source_gender, synth_gender):
-        if not source_gender:
-            return False, "new_gender:" + ",".join(sorted(synth_gender))
-        return False, "gender_conflict"
+    issues = audit_caption_pair(source_caption, synth_caption)
+    if issues:
+        reason, terms = next(iter(issues.items()))
+        return False, reason + ":" + _format_terms(terms)
 
     return True, "pass"
 
