@@ -444,6 +444,153 @@ class Evaluator():
             _stable_hash(top1),
         )
 
+    def _build_eval_order_hash(self, qids, gids, similarity):
+        return _stable_hash(
+            {
+                "txt_pids": qids.detach().cpu().view(-1).tolist(),
+                "img_pids": gids.detach().cpu().view(-1).tolist(),
+                "score_shape": _tensor_shape(similarity),
+            }
+        )
+
+    def _score_semantics(
+        self,
+        use_qalr,
+        use_transport_rerank,
+        use_uspc_slot_rerank,
+        use_mtp_eval_fusion,
+    ):
+        if use_transport_rerank:
+            return "transport_rerank_score"
+        if use_qalr:
+            return "qalr_rank_score"
+        if use_uspc_slot_rerank:
+            return "uspc_slot_rerank_score"
+        if use_mtp_eval_fusion:
+            return "global_cosine_similarity_with_mtp_eval_fusion"
+        return "global_cosine_similarity"
+
+    def _collect_qalr_args(self, model_args):
+        return {
+            "rerank_topk": int(getattr(model_args, "rerank_topk", 128)),
+            "rerank_alpha": float(getattr(model_args, "rerank_alpha", 0.2)),
+            "rerank_token_topm": int(
+                getattr(model_args, "rerank_token_topm", 8)
+            ),
+            "rerank_patch_topr": int(
+                getattr(model_args, "rerank_patch_topr", 4)
+            ),
+            "use_qalr_score_norm": bool(
+                getattr(model_args, "use_qalr_score_norm", False)
+            ),
+            "qalr_score_norm_type": str(
+                getattr(model_args, "qalr_score_norm_type", "zscore")
+            ),
+            "use_qalr_query_gate": bool(
+                getattr(model_args, "use_qalr_query_gate", False)
+            ),
+            "qalr_query_gate_type": str(
+                getattr(model_args, "qalr_query_gate_type", "top12_margin")
+            ),
+            "qalr_query_gate_margin": float(
+                getattr(model_args, "qalr_query_gate_margin", 0.05)
+            ),
+            "use_qalr_focus_topn": bool(
+                getattr(model_args, "use_qalr_focus_topn", False)
+            ),
+            "qalr_focus_topn": int(getattr(model_args, "qalr_focus_topn", 16)),
+        }
+
+    def _maybe_save_eval_scores(
+        self,
+        model_args,
+        similarity,
+        raw_similarity,
+        qids,
+        gids,
+        metrics,
+        use_qalr,
+        use_transport_rerank,
+        use_uspc_slot_rerank,
+        use_mtp_eval_fusion,
+    ):
+        if model_args is None or not bool(
+            getattr(model_args, "save_eval_scores", False)
+        ):
+            return
+        if self.source == "train_validation":
+            self.logger.warning(
+                "[EVAL_SCORE_DUMP] skipped during train_validation"
+            )
+            return
+
+        save_file = str(getattr(model_args, "eval_scores_file", "")).strip()
+        if not save_file:
+            raise ValueError(
+                "--save_eval_scores=True requires --eval_scores_file to be set."
+            )
+
+        sim_cpu = similarity.detach().cpu().float()
+        txt_pids = qids.detach().cpu().long().view(-1)
+        img_pids = gids.detach().cpu().long().view(-1)
+        order_hash = self._build_eval_order_hash(txt_pids, img_pids, sim_cpu)
+        score_semantics = self._score_semantics(
+            use_qalr=use_qalr,
+            use_transport_rerank=use_transport_rerank,
+            use_uspc_slot_rerank=use_uspc_slot_rerank,
+            use_mtp_eval_fusion=use_mtp_eval_fusion,
+        )
+        metadata = {
+            "dataset_name": str(getattr(model_args, "dataset_name", "")),
+            "eval_dataset": str(getattr(model_args, "eval_dataset", "")),
+            "score_shape": list(sim_cpu.shape),
+            "score_semantics": score_semantics,
+            "use_qalr": bool(use_qalr),
+            "qalr_args": self._collect_qalr_args(model_args),
+            "use_transport_rerank": bool(use_transport_rerank),
+            "use_uspc_slot_rerank": bool(use_uspc_slot_rerank),
+            "use_modality_text_prompt": bool(use_mtp_eval_fusion),
+            "config_file": str(getattr(model_args, "config_file", "")),
+            "test_ckpt_file": str(getattr(model_args, "test_ckpt_file", "")),
+            "model_name": str(getattr(model_args, "name", "")),
+            "output_dir": str(getattr(model_args, "output_dir", "")),
+            "eval_source": str(self.source),
+            "order_hash": order_hash,
+            "raw_similarity_saved": bool(
+                getattr(model_args, "eval_scores_save_raw", False)
+            ),
+        }
+        payload = {
+            "sim": sim_cpu,
+            "txt_pids": txt_pids,
+            "img_pids": img_pids,
+            "txt_indices": torch.arange(sim_cpu.shape[0], dtype=torch.long),
+            "img_indices": torch.arange(sim_cpu.shape[1], dtype=torch.long),
+            "metrics": dict(metrics),
+            "metadata": metadata,
+            "order_hash": order_hash,
+        }
+        if bool(getattr(model_args, "eval_scores_save_raw", False)):
+            if raw_similarity is None:
+                raise RuntimeError(
+                    "--eval_scores_save_raw was set, but raw similarity is unavailable."
+                )
+            payload["raw_sim"] = raw_similarity.detach().cpu().float()
+
+        save_file = os.path.abspath(save_file)
+        save_dir = os.path.dirname(save_file)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        torch.save(payload, save_file)
+        self.logger.info(
+            "[EVAL_SCORE_DUMP] path=%s shape=%s order_hash=%s semantics=%s raw_saved=%s",
+            save_file,
+            list(sim_cpu.shape),
+            order_hash,
+            score_semantics,
+            bool("raw_sim" in payload),
+        )
+
     def _get_query_raw_captions(self, expected_count):
         txt_dataset = getattr(self.txt_loader, "dataset", None)
         raw_captions = getattr(txt_dataset, "captions", None)
@@ -1229,5 +1376,17 @@ class Evaluator():
             "mAP": float(t2i_mAP),
             "mINP": float(t2i_mINP),
         }
+        self._maybe_save_eval_scores(
+            model_args=model_args,
+            similarity=similarity,
+            raw_similarity=baseline_similarity,
+            qids=qids,
+            gids=gids,
+            metrics=self.last_eval_result,
+            use_qalr=use_qalr,
+            use_transport_rerank=use_transport_rerank,
+            use_uspc_slot_rerank=use_uspc_slot_rerank,
+            use_mtp_eval_fusion=use_mtp_eval_fusion,
+        )
         
         return t2i_cmc[0]

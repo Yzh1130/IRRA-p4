@@ -110,6 +110,24 @@ if __name__ == "__main__":
         help="build eval dataloaders through the same training validation branch used by train.py",
     )
     parser.add_argument(
+        "--save_eval_scores",
+        default=False,
+        action="store_true",
+        help="save the final text-to-image eval score matrix for offline ensemble",
+    )
+    parser.add_argument(
+        "--eval_scores_file",
+        type=str,
+        default="",
+        help="output .pt file for --save_eval_scores",
+    )
+    parser.add_argument(
+        "--eval_scores_save_raw",
+        default=False,
+        action="store_true",
+        help="also save the pre-rerank raw similarity matrix when dumping eval scores",
+    )
+    parser.add_argument(
         "--use_qalr",
         default=None,
         action="store_true",
@@ -288,10 +306,20 @@ if __name__ == "__main__":
         help="disable extra USPC slot rerank debug information",
     )
     cli_args = parser.parse_args()
+    if cli_args.save_eval_scores and not str(cli_args.eval_scores_file).strip():
+        raise ValueError(
+            "--save_eval_scores requires --eval_scores_file, e.g. "
+            "--eval_scores_file pack/scores/model_a.pt"
+        )
 
     args = load_train_configs(cli_args.config_file)
     args = _apply_qalr_test_overrides(args, cli_args)
     args.training = False
+    args.save_eval_scores = bool(cli_args.save_eval_scores)
+    args.eval_scores_file = str(cli_args.eval_scores_file)
+    args.eval_scores_save_raw = bool(cli_args.eval_scores_save_raw)
+    args.config_file = op.abspath(cli_args.config_file)
+    args.test_ckpt_file = ""
 
     logger = setup_logger("IRRA", save_dir=args.output_dir, if_train=args.training)
     logger.info(args)
@@ -334,6 +362,7 @@ if __name__ == "__main__":
         checkpoint = checkpointer.load(f=ckpt_file)
     if str(cli_args.test_ckpt_file).strip():
         logger.info("[TEST_CKPT_LOAD] path=%s", ckpt_file)
+    args.test_ckpt_file = ckpt_file
     best_epoch = int(checkpoint.get("epoch", 1)) if isinstance(checkpoint, dict) else 1
     apply_img_local_filter_stage(
         model, args, best_epoch, logger=None, prefix="INFERENCE"
