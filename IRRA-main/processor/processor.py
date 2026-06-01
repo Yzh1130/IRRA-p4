@@ -10,7 +10,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets.bases import tokenize
 from model import build_model, objectives
-from model.objectives import compute_uspc_loss
+from model.objectives import (
+    compute_dcalign_lite_loss,
+    compute_uspc_loss,
+    resolve_dcalign_lite_lambda,
+)
 from utils.attribute_parser import (
     get_uspc_slot_local_attr_names,
     parse_basic_attributes,
@@ -747,6 +751,50 @@ def _uspc_should_encode_views(args):
     return _uspc_enabled(args) and float(getattr(args, "lambda_uspc", 0.0)) > 0.0
 
 
+def _dcalign_lite_enabled(args):
+    return bool(
+        getattr(args, "use_dcalign_lite", False)
+        and float(getattr(args, "lambda_dcalign", 0.0)) > 0.0
+    )
+
+
+def _dcalign_should_encode_views(args, epoch):
+    return (
+        _dcalign_lite_enabled(args)
+        and float(resolve_dcalign_lite_lambda(args=args, epoch=epoch)) > 0.0
+    )
+
+
+def _semantic_alignment_should_encode_views(args, epoch):
+    return _uspc_should_encode_views(args) or _dcalign_should_encode_views(args, epoch)
+
+
+def _empty_dcalign_lite_terms(args, reference, epoch):
+    if not torch.is_tensor(reference):
+        raise TypeError("DCAlign-lite inactive terms require a tensor reference.")
+    zero = reference.new_zeros(())
+    return {
+        "loss_dcalign": zero,
+        "loss_dcalign_raw": zero,
+        "loss_dcalign_color": zero,
+        "loss_dcalign_struct": zero,
+        "loss_dcalign_full": zero,
+        "dcalign_lambda_effective": zero.new_tensor(
+            float(resolve_dcalign_lite_lambda(args=args, epoch=epoch))
+        ),
+        "dcalign_active": zero,
+        "dcalign_color_weight": zero.new_tensor(
+            float(getattr(args, "dcalign_color_weight", 1.0))
+        ),
+        "dcalign_struct_weight": zero.new_tensor(
+            float(getattr(args, "dcalign_struct_weight", 1.0))
+        ),
+        "dcalign_full_weight": zero.new_tensor(
+            float(getattr(args, "dcalign_full_weight", 0.25))
+        ),
+    }
+
+
 def _uspc_normalize_raw_captions(raw_captions):
     if isinstance(raw_captions, str):
         return [raw_captions]
@@ -928,6 +976,55 @@ def _log_uspc_debug_status(logger, args, uspc_terms=None):
         _to_scalar(uspc_terms.get("uspc_rgb_conf_mean", 1)),
         _to_scalar(uspc_terms.get("uspc_thermal_conf_mean", 1)),
         _to_scalar(uspc_terms.get("uspc_fused_conf_mean", 1)),
+    )
+
+
+def _log_dcalign_debug_status(logger, args, epoch, dcalign_terms=None):
+    lambda_dcalign = float(getattr(args, "lambda_dcalign", 0.0))
+    lambda_effective = float(resolve_dcalign_lite_lambda(args=args, epoch=epoch))
+    color_weight = float(getattr(args, "dcalign_color_weight", 1.0))
+    struct_weight = float(getattr(args, "dcalign_struct_weight", 1.0))
+    full_weight = float(getattr(args, "dcalign_full_weight", 0.25))
+    detach_text = bool(getattr(args, "dcalign_detach_text_views", False))
+    detach_image = bool(getattr(args, "dcalign_detach_image_feats", False))
+    if dcalign_terms is None:
+        logger.info(
+            "[DCALIGN][LOSS_STATUS] active=0 lambda_dcalign=%.6f "
+            "lambda_effective=%.6f loss_dcalign=0.000000 "
+            "loss_dcalign_raw=0.000000 loss_dcalign_color=0.000000 "
+            "loss_dcalign_struct=0.000000 loss_dcalign_full=0.000000 "
+            "weights=(%.6f,%.6f,%.6f) detach_text=%s detach_image=%s",
+            lambda_dcalign,
+            lambda_effective,
+            color_weight,
+            struct_weight,
+            full_weight,
+            detach_text,
+            detach_image,
+        )
+        return
+
+    logger.info(
+        "[DCALIGN][LOSS_STATUS] active=%d lambda_dcalign=%.6f "
+        "lambda_effective=%.6f loss_dcalign=%.6f loss_dcalign_raw=%.6f "
+        "loss_dcalign_color=%.6f loss_dcalign_struct=%.6f "
+        "loss_dcalign_full=%.6f weights=(%.6f,%.6f,%.6f) "
+        "detach_text=%s detach_image=%s",
+        int(round(_to_scalar(dcalign_terms.get("dcalign_active", 0)))),
+        lambda_dcalign,
+        _to_scalar(
+            dcalign_terms.get("dcalign_lambda_effective", lambda_effective)
+        ),
+        _to_scalar(dcalign_terms.get("loss_dcalign", 0)),
+        _to_scalar(dcalign_terms.get("loss_dcalign_raw", 0)),
+        _to_scalar(dcalign_terms.get("loss_dcalign_color", 0)),
+        _to_scalar(dcalign_terms.get("loss_dcalign_struct", 0)),
+        _to_scalar(dcalign_terms.get("loss_dcalign_full", 0)),
+        _to_scalar(dcalign_terms.get("dcalign_color_weight", color_weight)),
+        _to_scalar(dcalign_terms.get("dcalign_struct_weight", struct_weight)),
+        _to_scalar(dcalign_terms.get("dcalign_full_weight", full_weight)),
+        detach_text,
+        detach_image,
     )
 
 
@@ -1902,6 +1999,11 @@ def _build_total_loss(args, ret):
                 "loss_attr_aux_weighted",
                 "loss_uspc_slot_local_raw",
                 "loss_uspc_slot_local_weighted",
+                "loss_dcalign",
+                "loss_dcalign_raw",
+                "loss_dcalign_color",
+                "loss_dcalign_struct",
+                "loss_dcalign_full",
             }:
                 continue
             total_loss = v if total_loss is None else total_loss + v
@@ -3564,6 +3666,16 @@ def do_train(
         "uspc_thermal_conf_mean": AverageMeter(),
         "uspc_fused_conf_mean": AverageMeter(),
         "uspc_active": AverageMeter(),
+        "loss_dcalign": AverageMeter(),
+        "loss_dcalign_raw": AverageMeter(),
+        "loss_dcalign_color": AverageMeter(),
+        "loss_dcalign_struct": AverageMeter(),
+        "loss_dcalign_full": AverageMeter(),
+        "dcalign_lambda_effective": AverageMeter(),
+        "dcalign_active": AverageMeter(),
+        "dcalign_color_weight": AverageMeter(),
+        "dcalign_struct_weight": AverageMeter(),
+        "dcalign_full_weight": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
         "loss_th_txt": AverageMeter(),
         "loss_txt_cons": AverageMeter(),
@@ -3669,9 +3781,12 @@ def do_train(
     best_top1 = 0.0
     mtp_text_example_logged = False
     use_uspc = _uspc_enabled(args)
+    use_dcalign_lite = _dcalign_lite_enabled(args)
     use_attr_aux = _attr_aux_enabled(args)
     use_uspc_slot_local = _uspc_slot_local_enabled(args)
-    uspc_text_tokenizer = SimpleTokenizer() if use_uspc else None
+    uspc_text_tokenizer = (
+        SimpleTokenizer() if (use_uspc or use_dcalign_lite) else None
+    )
     use_modality_text_prompt = bool(
         getattr(args, "use_modality_text_prompt", False)
     )
@@ -3682,6 +3797,7 @@ def do_train(
     for epoch in range(start_epoch, num_epoch + 1):
         start_time = time.time()
         uspc_debug_logged_this_epoch = False
+        dcalign_debug_logged_this_epoch = False
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -3749,8 +3865,14 @@ def do_train(
                 and n_iter == 0
                 and (not uspc_debug_logged_this_epoch)
             )
+            dcalign_debug_should_log = (
+                use_dcalign_lite
+                and bool(getattr(args, "dcalign_debug", False))
+                and n_iter == 0
+                and (not dcalign_debug_logged_this_epoch)
+            )
             uspc_inputs = None
-            if _uspc_should_encode_views(args):
+            if _semantic_alignment_should_encode_views(args, epoch):
                 uspc_inputs = _build_uspc_forward_inputs(
                     args,
                     model,
@@ -3883,6 +4005,34 @@ def do_train(
                 # compute_uspc_loss already applies lambda_uspc internally.
                 total_loss = total_loss + uspc_terms["loss_uspc"]
 
+            dcalign_terms = None
+            if use_dcalign_lite:
+                if _dcalign_should_encode_views(args, epoch):
+                    if uspc_inputs is None:
+                        raise RuntimeError(
+                            "DCAlign-lite loss is requested but semantic text view "
+                            "inputs were not built."
+                        )
+                    dcalign_terms = compute_dcalign_lite_loss(
+                        rgb_feat=uspc_inputs["rgb_feat"],
+                        thermal_feat=uspc_inputs["thermal_feat"],
+                        fused_feat=uspc_inputs["fused_feat"],
+                        full_text_feat=uspc_inputs["full_text_feat"],
+                        color_text_feat=uspc_inputs["color_text_feat"],
+                        struct_text_feat=uspc_inputs["struct_text_feat"],
+                        pids=batch.get("pids", None),
+                        args=args,
+                        epoch=epoch,
+                    )
+                else:
+                    dcalign_terms = _empty_dcalign_lite_terms(
+                        args,
+                        batch["images"],
+                        epoch,
+                    )
+                ret.update(dcalign_terms)
+                total_loss = total_loss + dcalign_terms["loss_dcalign"]
+
             if uspc_debug_should_log:
                 if uspc_inputs is None:
                     _log_uspc_debug_examples(
@@ -3899,6 +4049,27 @@ def do_train(
                 if uspc_terms is not None:
                     _log_uspc_debug_status(logger, args, uspc_terms=uspc_terms)
                 uspc_debug_logged_this_epoch = True
+
+            if dcalign_debug_should_log:
+                if uspc_inputs is None:
+                    _log_uspc_debug_examples(
+                        logger,
+                        _uspc_normalize_raw_captions(batch.get("raw_captions", [])),
+                        uspc_inputs=None,
+                    )
+                else:
+                    _log_uspc_debug_examples(
+                        logger,
+                        uspc_inputs["raw_captions"],
+                        uspc_inputs=uspc_inputs,
+                    )
+                _log_dcalign_debug_status(
+                    logger,
+                    args,
+                    epoch,
+                    dcalign_terms=dcalign_terms,
+                )
+                dcalign_debug_logged_this_epoch = True
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
@@ -3979,6 +4150,29 @@ def do_train(
                 ]:
                     meters[uspc_stat_name].update(
                         _to_scalar(uspc_terms.get(uspc_stat_name, 0)),
+                        1,
+                    )
+            if dcalign_terms is not None:
+                for dcalign_loss_name in [
+                    "loss_dcalign",
+                    "loss_dcalign_raw",
+                    "loss_dcalign_color",
+                    "loss_dcalign_struct",
+                    "loss_dcalign_full",
+                ]:
+                    meters[dcalign_loss_name].update(
+                        _to_scalar(dcalign_terms.get(dcalign_loss_name, 0)),
+                        batch_size,
+                    )
+                for dcalign_stat_name in [
+                    "dcalign_lambda_effective",
+                    "dcalign_active",
+                    "dcalign_color_weight",
+                    "dcalign_struct_weight",
+                    "dcalign_full_weight",
+                ]:
+                    meters[dcalign_stat_name].update(
+                        _to_scalar(dcalign_terms.get(dcalign_stat_name, 0)),
                         1,
                     )
             if "loss_rgb_txt" in ret:

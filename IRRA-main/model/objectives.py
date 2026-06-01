@@ -1277,3 +1277,161 @@ def compute_uspc_loss(
         "uspc_fused_conf_mean": fused_conf_mean,
         "uspc_active": loss_uspc.new_ones(()),
     }
+
+
+def resolve_dcalign_lite_lambda(args=None, epoch=0):
+    use_dcalign = bool(_uspc_get_arg(args, "use_dcalign_lite", False))
+    lambda_dcalign = float(_uspc_get_arg(args, "lambda_dcalign", 0.0))
+    if (not use_dcalign) or lambda_dcalign <= 0.0:
+        return 0.0
+
+    cur_epoch = int(epoch)
+    active_until_epoch = int(_uspc_get_arg(args, "dcalign_active_until_epoch", -1))
+    if active_until_epoch >= 0 and cur_epoch > active_until_epoch:
+        return 0.0
+
+    warmup_epochs = max(0, int(_uspc_get_arg(args, "dcalign_warmup_epochs", 1)))
+    if cur_epoch < warmup_epochs:
+        return 0.0
+
+    ramp_epochs = max(0, int(_uspc_get_arg(args, "dcalign_ramp_epochs", 3)))
+    if ramp_epochs <= 0:
+        return lambda_dcalign
+
+    ramp_step = max(0, cur_epoch - warmup_epochs + 1)
+    ramp_factor = min(1.0, float(ramp_step) / float(ramp_epochs))
+    return lambda_dcalign * ramp_factor
+
+
+def _dcalign_zero_output(reference, args=None, lambda_effective=0.0):
+    zero = reference.new_zeros(())
+    return {
+        "loss_dcalign": zero,
+        "loss_dcalign_raw": zero,
+        "loss_dcalign_color": zero,
+        "loss_dcalign_struct": zero,
+        "loss_dcalign_full": zero,
+        "dcalign_lambda_effective": zero.new_tensor(float(lambda_effective)),
+        "dcalign_active": zero,
+        "dcalign_color_weight": zero.new_tensor(
+            float(_uspc_get_arg(args, "dcalign_color_weight", 1.0))
+        ),
+        "dcalign_struct_weight": zero.new_tensor(
+            float(_uspc_get_arg(args, "dcalign_struct_weight", 1.0))
+        ),
+        "dcalign_full_weight": zero.new_tensor(
+            float(_uspc_get_arg(args, "dcalign_full_weight", 0.25))
+        ),
+    }
+
+
+def compute_dcalign_lite_loss(
+    rgb_feat,
+    thermal_feat,
+    fused_feat,
+    full_text_feat,
+    color_text_feat,
+    struct_text_feat,
+    pids=None,
+    args=None,
+    epoch=0,
+):
+    """
+    Compute DCAlign-lite v1.1 semantic decoupled alignment.
+
+    This reuses the same three SDM-style semantic alignments as USPC v1, but
+    keeps a separate schedule and separate loss keys so legacy --use_uspc
+    behavior stays unchanged.
+    """
+    reference = _uspc_reference_tensor(
+        rgb_feat,
+        thermal_feat,
+        fused_feat,
+        full_text_feat,
+        color_text_feat,
+        struct_text_feat,
+    )
+    lambda_effective = resolve_dcalign_lite_lambda(args=args, epoch=epoch)
+    if lambda_effective <= 0.0:
+        return _dcalign_zero_output(
+            reference,
+            args=args,
+            lambda_effective=lambda_effective,
+        )
+
+    required = {
+        "rgb_feat": rgb_feat,
+        "thermal_feat": thermal_feat,
+        "fused_feat": fused_feat,
+        "full_text_feat": full_text_feat,
+        "color_text_feat": color_text_feat,
+        "struct_text_feat": struct_text_feat,
+    }
+    for name, value in required.items():
+        _uspc_require_feature(name, value)
+
+    batch_size = rgb_feat.shape[0]
+    feat_dim = rgb_feat.shape[1]
+    for name, value in required.items():
+        if value.shape[0] != batch_size or value.shape[1] != feat_dim:
+            raise ValueError(
+                "DCAlign-lite feature shapes must all match [B, C]; "
+                f"rgb_feat={tuple(rgb_feat.shape)}, {name}={tuple(value.shape)}."
+            )
+
+    if bool(_uspc_get_arg(args, "dcalign_detach_image_feats", False)):
+        rgb_feat = rgb_feat.detach()
+        thermal_feat = thermal_feat.detach()
+        fused_feat = fused_feat.detach()
+    if bool(_uspc_get_arg(args, "dcalign_detach_text_views", False)):
+        full_text_feat = full_text_feat.detach()
+        color_text_feat = color_text_feat.detach()
+        struct_text_feat = struct_text_feat.detach()
+
+    temperature = float(_uspc_get_arg(args, "temperature", 0.02))
+    loss_color = _uspc_alignment_loss(
+        rgb_feat,
+        color_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=None,
+    )
+    loss_struct = _uspc_alignment_loss(
+        thermal_feat,
+        struct_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=None,
+    )
+    loss_full = _uspc_alignment_loss(
+        fused_feat,
+        full_text_feat,
+        pids=pids,
+        temperature=temperature,
+        sample_weight=None,
+    )
+
+    color_weight = float(_uspc_get_arg(args, "dcalign_color_weight", 1.0))
+    struct_weight = float(_uspc_get_arg(args, "dcalign_struct_weight", 1.0))
+    full_weight = float(_uspc_get_arg(args, "dcalign_full_weight", 0.25))
+    loss_raw = (
+        color_weight * loss_color
+        + struct_weight * loss_struct
+        + full_weight * loss_full
+    )
+    loss_dcalign = float(lambda_effective) * loss_raw
+
+    return {
+        "loss_dcalign": loss_dcalign,
+        "loss_dcalign_raw": loss_raw,
+        "loss_dcalign_color": loss_color,
+        "loss_dcalign_struct": loss_struct,
+        "loss_dcalign_full": loss_full,
+        "dcalign_lambda_effective": loss_dcalign.new_tensor(
+            float(lambda_effective)
+        ),
+        "dcalign_active": loss_dcalign.new_ones(()),
+        "dcalign_color_weight": loss_dcalign.new_tensor(color_weight),
+        "dcalign_struct_weight": loss_dcalign.new_tensor(struct_weight),
+        "dcalign_full_weight": loss_dcalign.new_tensor(full_weight),
+    }
