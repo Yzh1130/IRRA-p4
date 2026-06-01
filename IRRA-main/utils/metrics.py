@@ -456,12 +456,15 @@ class Evaluator():
     def _score_semantics(
         self,
         use_qalr,
+        use_qalr_v2,
         use_transport_rerank,
         use_uspc_slot_rerank,
         use_mtp_eval_fusion,
     ):
         if use_transport_rerank:
             return "transport_rerank_score"
+        if use_qalr_v2:
+            return "qalr_v2_rank_score"
         if use_qalr:
             return "qalr_rank_score"
         if use_uspc_slot_rerank:
@@ -499,6 +502,43 @@ class Evaluator():
                 getattr(model_args, "use_qalr_focus_topn", False)
             ),
             "qalr_focus_topn": int(getattr(model_args, "qalr_focus_topn", 16)),
+            "use_qalr_v2": bool(getattr(model_args, "use_qalr_v2", False)),
+            "qalr_v2_save_diag": bool(
+                getattr(model_args, "qalr_v2_save_diag", False)
+            ),
+            "qalr_v2_diag_file": str(
+                getattr(model_args, "qalr_v2_diag_file", "")
+            ),
+            "qalr_v2_alpha_min": float(
+                getattr(model_args, "qalr_v2_alpha_min", 0.0)
+            ),
+            "qalr_v2_alpha_max": float(
+                getattr(model_args, "qalr_v2_alpha_max", 0.01)
+            ),
+            "qalr_v2_margin_low": float(
+                getattr(model_args, "qalr_v2_margin_low", 0.0)
+            ),
+            "qalr_v2_margin_high": float(
+                getattr(model_args, "qalr_v2_margin_high", 0.02)
+            ),
+            "qalr_v2_freeze_top1_margin": float(
+                getattr(model_args, "qalr_v2_freeze_top1_margin", 0.02)
+            ),
+            "qalr_v2_promote_margin": float(
+                getattr(model_args, "qalr_v2_promote_margin", 0.0)
+            ),
+            "qalr_v2_modality_fuse": str(
+                getattr(model_args, "qalr_v2_modality_fuse", "concat")
+            ),
+            "qalr_v2_top1_guard": bool(
+                getattr(model_args, "qalr_v2_top1_guard", False)
+            ),
+            "qalr_v2_promote_only": bool(
+                getattr(model_args, "qalr_v2_promote_only", False)
+            ),
+            "qalr_v2_diag_only": bool(
+                getattr(model_args, "qalr_v2_diag_only", False)
+            ),
         }
 
     def _maybe_save_eval_scores(
@@ -510,6 +550,7 @@ class Evaluator():
         gids,
         metrics,
         use_qalr,
+        use_qalr_v2,
         use_transport_rerank,
         use_uspc_slot_rerank,
         use_mtp_eval_fusion,
@@ -536,6 +577,7 @@ class Evaluator():
         order_hash = self._build_eval_order_hash(txt_pids, img_pids, sim_cpu)
         score_semantics = self._score_semantics(
             use_qalr=use_qalr,
+            use_qalr_v2=use_qalr_v2,
             use_transport_rerank=use_transport_rerank,
             use_uspc_slot_rerank=use_uspc_slot_rerank,
             use_mtp_eval_fusion=use_mtp_eval_fusion,
@@ -546,6 +588,7 @@ class Evaluator():
             "score_shape": list(sim_cpu.shape),
             "score_semantics": score_semantics,
             "use_qalr": bool(use_qalr),
+            "use_qalr_v2": bool(use_qalr_v2),
             "qalr_args": self._collect_qalr_args(model_args),
             "use_transport_rerank": bool(use_transport_rerank),
             "use_uspc_slot_rerank": bool(use_uspc_slot_rerank),
@@ -589,6 +632,160 @@ class Evaluator():
             order_hash,
             score_semantics,
             bool("raw_sim" in payload),
+        )
+
+    def _compute_metric_summary(self, similarity, qids, gids):
+        t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(
+            similarity=similarity,
+            q_pids=qids,
+            g_pids=gids,
+            max_rank=10,
+            get_mAP=True,
+        )
+        return {
+            "R1": float(t2i_cmc[0].item()),
+            "R5": float(t2i_cmc[4].item()),
+            "R10": float(t2i_cmc[9].item()),
+            "mAP": float(t2i_mAP.item()),
+            "mINP": float(t2i_mINP.item()),
+        }
+
+    def _save_qalr_diagnostics(
+        self,
+        model_args,
+        rerank_stats,
+        before_metrics,
+        after_metrics,
+        use_qalr_v2,
+    ):
+        if model_args is None or not bool(
+            getattr(model_args, "qalr_v2_save_diag", False)
+        ):
+            return
+        diag_file = str(getattr(model_args, "qalr_v2_diag_file", "")).strip()
+        if not diag_file:
+            default_name = "qalr_v2_diag.json" if use_qalr_v2 else "qalr_diag.json"
+            diag_file = os.path.join(
+                str(getattr(model_args, "output_dir", ".")),
+                default_name,
+            )
+        diag_file = os.path.abspath(diag_file)
+        diag_dir = os.path.dirname(diag_file)
+        if diag_dir:
+            os.makedirs(diag_dir, exist_ok=True)
+
+        summary = dict(rerank_stats.get("diagnostic_summary", {}))
+        summary.setdefault(
+            "total_queries",
+            len(rerank_stats.get("query_diagnostics", [])),
+        )
+        summary.setdefault(
+            "changed_top1_count",
+            int(rerank_stats.get("changed_top1_count", 0)),
+        )
+        summary.setdefault("improved_top1_count", 0)
+        summary.setdefault("hurt_top1_count", 0)
+        summary.setdefault("neutral_changed_top1_count", 0)
+        summary.setdefault(
+            "net_top1_gain",
+            int(summary.get("improved_top1_count", 0))
+            - int(summary.get("hurt_top1_count", 0)),
+        )
+        for prefix, metrics in [
+            ("before", before_metrics),
+            ("after", after_metrics),
+        ]:
+            if metrics is None:
+                continue
+            for key, value in metrics.items():
+                summary[f"{prefix}_{key}"] = float(value)
+
+        payload = {
+            "summary": summary,
+            "queries": list(rerank_stats.get("query_diagnostics", [])),
+            "config": {
+                "use_qalr_v2": bool(use_qalr_v2),
+                "use_qalr": bool(getattr(model_args, "use_qalr", False)),
+                "rerank_topk": int(getattr(model_args, "rerank_topk", 128)),
+                "rerank_alpha": float(getattr(model_args, "rerank_alpha", 0.2)),
+                "rerank_token_topm": int(
+                    getattr(model_args, "rerank_token_topm", 8)
+                ),
+                "rerank_patch_topr": int(
+                    getattr(model_args, "rerank_patch_topr", 4)
+                ),
+                "use_qalr_score_norm": bool(
+                    getattr(model_args, "use_qalr_score_norm", False)
+                ),
+                "use_qalr_query_gate": bool(
+                    getattr(model_args, "use_qalr_query_gate", False)
+                ),
+                "use_qalr_focus_topn": bool(
+                    getattr(model_args, "use_qalr_focus_topn", False)
+                ),
+                "qalr_focus_topn": int(
+                    getattr(model_args, "qalr_focus_topn", 16)
+                ),
+                "qalr_v2_alpha_min": float(
+                    getattr(model_args, "qalr_v2_alpha_min", 0.0)
+                ),
+                "qalr_v2_alpha_max": float(
+                    getattr(model_args, "qalr_v2_alpha_max", 0.01)
+                ),
+                "qalr_v2_margin_low": float(
+                    getattr(model_args, "qalr_v2_margin_low", 0.0)
+                ),
+                "qalr_v2_margin_high": float(
+                    getattr(model_args, "qalr_v2_margin_high", 0.02)
+                ),
+                "qalr_v2_freeze_top1_margin": float(
+                    getattr(model_args, "qalr_v2_freeze_top1_margin", 0.02)
+                ),
+                "qalr_v2_promote_margin": float(
+                    getattr(model_args, "qalr_v2_promote_margin", 0.0)
+                ),
+                "qalr_v2_modality_fuse": str(
+                    getattr(model_args, "qalr_v2_modality_fuse", "concat")
+                ),
+                "qalr_v2_top1_guard": bool(
+                    getattr(model_args, "qalr_v2_top1_guard", False)
+                ),
+                "qalr_v2_promote_only": bool(
+                    getattr(model_args, "qalr_v2_promote_only", False)
+                ),
+                "qalr_v2_diag_only": bool(
+                    getattr(model_args, "qalr_v2_diag_only", False)
+                ),
+            },
+        }
+        with open(diag_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        self.logger.info(
+            "[QALR_V2_DIAG_DUMP] path=%s queries=%d",
+            diag_file,
+            len(payload["queries"]),
+        )
+
+    def _log_qalr_diag_summary(self, prefix, rerank_stats):
+        summary = rerank_stats.get("diagnostic_summary", {})
+        changed = int(
+            summary.get(
+                "changed_top1_count",
+                rerank_stats.get("changed_top1_count", 0),
+            )
+        )
+        improved = int(summary.get("improved_top1_count", 0))
+        hurt = int(summary.get("hurt_top1_count", 0))
+        neutral = int(summary.get("neutral_changed_top1_count", 0))
+        net = int(summary.get("net_top1_gain", improved - hurt))
+        self.logger.info(
+            "%s changed=%d improved=%d hurt=%d neutral=%d net=%d",
+            prefix,
+            changed,
+            improved,
+            hurt,
+            neutral,
+            net,
         )
 
     def _get_query_raw_captions(self, expected_count):
@@ -1040,6 +1237,9 @@ class Evaluator():
     
     def eval(self, model, i2t_metric=False, return_local_tokens=False):
         use_qalr = bool(getattr(getattr(model, "args", None), "use_qalr", False))
+        use_qalr_v2 = bool(
+            getattr(getattr(model, "args", None), "use_qalr_v2", False)
+        )
         use_transport_rerank = bool(
             getattr(getattr(model, "args", None), "use_transport_rerank", False)
         )
@@ -1049,25 +1249,27 @@ class Evaluator():
         use_mtp_eval_fusion = bool(
             getattr(getattr(model, "args", None), "use_modality_text_prompt", False)
         )
-        if use_uspc_slot_rerank and (use_qalr or use_transport_rerank):
+        if use_uspc_slot_rerank and (use_qalr or use_qalr_v2 or use_transport_rerank):
             self.logger.warning(
                 "USPC slot rerank is an inference-time rerank experiment and should "
-                "not be mixed with QALR or transport rerank. Disable --use_qalr and "
-                "--use_transport_rerank before running --use_uspc_slot_rerank."
+                "not be mixed with QALR/QALR-v2 or transport rerank. Disable "
+                "--use_qalr, --use_qalr_v2 and --use_transport_rerank before "
+                "running --use_uspc_slot_rerank."
             )
             raise RuntimeError(
-                "use_uspc_slot_rerank=True is mutually exclusive with use_qalr=True "
-                "or use_transport_rerank=True."
+                "use_uspc_slot_rerank=True is mutually exclusive with QALR, "
+                "QALR-v2 or transport rerank."
             )
         return_local_tokens = bool(
             return_local_tokens
             or use_qalr
+            or use_qalr_v2
             or use_transport_rerank
             or use_uspc_slot_rerank
         )
         model_args = getattr(model, "args", None)
         self.logger.info(
-            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
+            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_qalr_v2=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
             self.source,
             bool(getattr(model, "training", False)),
             bool(getattr(model_args, "training", False)),
@@ -1079,6 +1281,7 @@ class Evaluator():
             bool(getattr(model_args, "use_batch_uncertainty", True)),
             bool(getattr(model_args, "use_id_uncertainty", True)),
             use_qalr,
+            use_qalr_v2,
             use_transport_rerank,
             use_uspc_slot_rerank,
             use_mtp_eval_fusion,
@@ -1174,7 +1377,7 @@ class Evaluator():
                         )
                     ),
                 )
-        if use_qalr:
+        if use_qalr and not use_qalr_v2:
             use_qalr_score_norm = bool(
                 getattr(model.args, "use_qalr_score_norm", False)
             )
@@ -1215,7 +1418,12 @@ class Evaluator():
                 gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
                 gallery_thermal_patch_tokens=embedding_outputs["gallery_thermal_patch_tokens"],
                 global_similarity=similarity,
+                qids=qids,
+                gids=gids,
                 return_stats=True,
+                return_diagnostics=bool(
+                    getattr(model.args, "qalr_v2_save_diag", False)
+                ),
             )
             self.logger.info(
                 "QALR enabled: topk=%d, alpha=%.4f, token_topm=%d, patch_topr=%d, use_qalr_score_norm=%s, qalr_score_norm_type=%s, use_qalr_query_gate=%s, qalr_query_gate_type=%s, qalr_query_gate_margin=%.6f, use_qalr_focus_topn=%s, qalr_focus_topn=%d",
@@ -1289,13 +1497,157 @@ class Evaluator():
                 ]
             )
             self.logger.info(log_msg, *log_args)
+            if bool(getattr(model.args, "qalr_v2_save_diag", False)):
+                before_metrics = self._compute_metric_summary(
+                    baseline_similarity,
+                    qids,
+                    gids,
+                )
+                after_metrics = self._compute_metric_summary(similarity, qids, gids)
+                self._log_qalr_diag_summary("[QALR_V2_DIAG]", rerank_stats)
+                self._save_qalr_diagnostics(
+                    model_args=model.args,
+                    rerank_stats=rerank_stats,
+                    before_metrics=before_metrics,
+                    after_metrics=after_metrics,
+                    use_qalr_v2=False,
+                )
+
+        if use_qalr_v2:
+            use_qalr_score_norm = bool(
+                getattr(model.args, "use_qalr_score_norm", False)
+            )
+            qalr_score_norm_type = str(
+                getattr(model.args, "qalr_score_norm_type", "zscore")
+            )
+            use_qalr_query_gate = bool(
+                getattr(model.args, "use_qalr_query_gate", False)
+            )
+            qalr_query_gate_type = str(
+                getattr(model.args, "qalr_query_gate_type", "top12_margin")
+            )
+            qalr_query_gate_margin = float(
+                getattr(model.args, "qalr_query_gate_margin", 0.05)
+            )
+            use_qalr_focus_topn = bool(
+                getattr(model.args, "use_qalr_focus_topn", False)
+            )
+            qalr_focus_topn = int(getattr(model.args, "qalr_focus_topn", 16))
+            reranker = QueryAdaptiveLocalReranker(
+                topk=int(getattr(model.args, "rerank_topk", 128)),
+                alpha=float(getattr(model.args, "rerank_alpha", 0.2)),
+                token_topm=int(getattr(model.args, "rerank_token_topm", 8)),
+                patch_topr=int(getattr(model.args, "rerank_patch_topr", 4)),
+                use_score_norm=use_qalr_score_norm,
+                score_norm_type=qalr_score_norm_type,
+                use_query_gate=use_qalr_query_gate,
+                query_gate_type=qalr_query_gate_type,
+                query_gate_margin=qalr_query_gate_margin,
+                use_focus_topn=use_qalr_focus_topn,
+                focus_topn=qalr_focus_topn,
+                vocab_size=int(getattr(model.args, "vocab_size", 49408)),
+                use_qalr_v2=True,
+                qalr_v2_alpha_min=float(
+                    getattr(model.args, "qalr_v2_alpha_min", 0.0)
+                ),
+                qalr_v2_alpha_max=float(
+                    getattr(model.args, "qalr_v2_alpha_max", 0.01)
+                ),
+                qalr_v2_margin_low=float(
+                    getattr(model.args, "qalr_v2_margin_low", 0.0)
+                ),
+                qalr_v2_margin_high=float(
+                    getattr(model.args, "qalr_v2_margin_high", 0.02)
+                ),
+                qalr_v2_freeze_top1_margin=float(
+                    getattr(model.args, "qalr_v2_freeze_top1_margin", 0.02)
+                ),
+                qalr_v2_promote_margin=float(
+                    getattr(model.args, "qalr_v2_promote_margin", 0.0)
+                ),
+                qalr_v2_modality_fuse=str(
+                    getattr(model.args, "qalr_v2_modality_fuse", "concat")
+                ),
+                qalr_v2_top1_guard=bool(
+                    getattr(model.args, "qalr_v2_top1_guard", False)
+                ),
+                qalr_v2_promote_only=bool(
+                    getattr(model.args, "qalr_v2_promote_only", False)
+                ),
+                qalr_v2_diag_only=bool(
+                    getattr(model.args, "qalr_v2_diag_only", False)
+                ),
+            )
+            similarity, rerank_stats = reranker.rerank(
+                query_token_embeddings=embedding_outputs["query_token_embeddings"],
+                query_token_ids=embedding_outputs["query_token_ids"],
+                query_global_embeddings=embedding_outputs["query_global_embeddings"],
+                gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
+                gallery_thermal_patch_tokens=embedding_outputs["gallery_thermal_patch_tokens"],
+                gallery_rgb_precision_weights=embedding_outputs.get(
+                    "gallery_rgb_precision_weights", None
+                ),
+                gallery_thermal_precision_weights=embedding_outputs.get(
+                    "gallery_thermal_precision_weights", None
+                ),
+                gallery_precision_weight_valid=embedding_outputs.get(
+                    "gallery_precision_weight_valid", None
+                ),
+                global_similarity=similarity,
+                qids=qids,
+                gids=gids,
+                return_stats=True,
+                return_diagnostics=True,
+            )
+            proposed_similarity = rerank_stats.pop("_proposed_similarity", similarity)
+            before_metrics = self._compute_metric_summary(
+                baseline_similarity,
+                qids,
+                gids,
+            )
+            proposed_metrics = self._compute_metric_summary(
+                proposed_similarity,
+                qids,
+                gids,
+            )
+            if bool(getattr(model.args, "qalr_v2_diag_only", False)):
+                similarity = baseline_similarity
+                after_metrics = before_metrics
+            else:
+                after_metrics = proposed_metrics
+            self.logger.info(
+                "[QALR_V2] enabled=True diag_only=%s topk=%d alpha_max=%.6f",
+                bool(getattr(model.args, "qalr_v2_diag_only", False)),
+                int(getattr(model.args, "rerank_topk", 128)),
+                float(getattr(model.args, "qalr_v2_alpha_max", 0.01)),
+            )
+            self.logger.info(
+                "[QALR_V2_CONFIG] alpha_min=%.6f alpha_max=%.6f margin_low=%.6f margin_high=%.6f top1_guard=%s freeze_top1_margin=%.6f promote_only=%s promote_margin=%.6f modality_fuse=%s",
+                float(getattr(model.args, "qalr_v2_alpha_min", 0.0)),
+                float(getattr(model.args, "qalr_v2_alpha_max", 0.01)),
+                float(getattr(model.args, "qalr_v2_margin_low", 0.0)),
+                float(getattr(model.args, "qalr_v2_margin_high", 0.02)),
+                bool(getattr(model.args, "qalr_v2_top1_guard", False)),
+                float(getattr(model.args, "qalr_v2_freeze_top1_margin", 0.02)),
+                bool(getattr(model.args, "qalr_v2_promote_only", False)),
+                float(getattr(model.args, "qalr_v2_promote_margin", 0.0)),
+                str(getattr(model.args, "qalr_v2_modality_fuse", "concat")),
+            )
+            self._log_qalr_diag_summary("[QALR_V2_DIAG]", rerank_stats)
+            self._save_qalr_diagnostics(
+                model_args=model.args,
+                rerank_stats=rerank_stats,
+                before_metrics=before_metrics,
+                after_metrics=proposed_metrics,
+                use_qalr_v2=True,
+            )
 
         if use_transport_rerank:
-            if use_qalr:
+            if use_qalr or use_qalr_v2:
                 self.logger.warning(
-                    "Both use_qalr and use_transport_rerank are enabled. "
-                    "Transport rerank will use baseline global similarity and override "
-                    "the earlier QALR scores."
+                    "QALR/QALR-v2 and use_transport_rerank are both enabled. "
+                    "Transport rerank will use baseline global similarity and "
+                    "override the earlier QALR scores."
                 )
             reranker = build_transport_reranker(model.args)
             if reranker is None:
@@ -1384,6 +1736,7 @@ class Evaluator():
             gids=gids,
             metrics=self.last_eval_result,
             use_qalr=use_qalr,
+            use_qalr_v2=use_qalr_v2,
             use_transport_rerank=use_transport_rerank,
             use_uspc_slot_rerank=use_uspc_slot_rerank,
             use_mtp_eval_fusion=use_mtp_eval_fusion,

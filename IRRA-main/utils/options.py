@@ -250,6 +250,19 @@ def get_args():
     parser.add_argument("--qalr_query_gate_margin", type=float, default=0.05, help="margin threshold on global top1-top2 score gap for enabling QALR on a query")
     parser.add_argument("--use_qalr_focus_topn", default=False, action='store_true', help="enable focus top-n rerank inside the selected global top-K candidates")
     parser.add_argument("--qalr_focus_topn", type=int, default=16, help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk")
+    parser.add_argument("--use_qalr_v2", default=False, action='store_true', help="enable safer QALR v2 local reranking")
+    parser.add_argument("--qalr_v2_save_diag", default=False, action='store_true', help="save QALR/QALR-v2 per-query diagnostics")
+    parser.add_argument("--qalr_v2_diag_file", type=str, default="", help="QALR-v2 diagnostics json output file")
+    parser.add_argument("--qalr_v2_alpha_min", type=float, default=0.0, help="minimum adaptive alpha for QALR v2")
+    parser.add_argument("--qalr_v2_alpha_max", type=float, default=0.01, help="maximum adaptive alpha for QALR v2")
+    parser.add_argument("--qalr_v2_margin_low", type=float, default=0.0, help="margin where QALR v2 uses alpha_max")
+    parser.add_argument("--qalr_v2_margin_high", type=float, default=0.02, help="margin where QALR v2 uses alpha_min")
+    parser.add_argument("--qalr_v2_freeze_top1_margin", type=float, default=0.02, help="freeze global top1 above this margin when QALR v2 top1 guard is enabled")
+    parser.add_argument("--qalr_v2_promote_margin", type=float, default=0.0, help="minimum local advantage required to replace global top1 in QALR v2 promote-only mode")
+    parser.add_argument("--qalr_v2_modality_fuse", type=str, default="concat", choices=["concat", "avg", "rgb", "thermal", "precision"], help="QALR v2 local score modality fusion")
+    parser.add_argument("--qalr_v2_top1_guard", default=False, action='store_true', help="enable QALR v2 global top1 freeze guard")
+    parser.add_argument("--qalr_v2_promote_only", default=False, action='store_true', help="allow QALR v2 top1 replacement only with enough local advantage")
+    parser.add_argument("--qalr_v2_diag_only", default=False, action='store_true', help="compute QALR v2 diagnostics without changing final eval scores")
 
     ######################## inference-only USPC text-slot local rerank ########################
     # Evaluation-only USPC-v2C switch. This does not add training losses or checkpoint weights.

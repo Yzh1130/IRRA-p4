@@ -33,6 +33,19 @@ def _apply_qalr_test_overrides(args, cli_args):
         "qalr_query_gate_margin": 0.05,
         "use_qalr_focus_topn": False,
         "qalr_focus_topn": 16,
+        "use_qalr_v2": False,
+        "qalr_v2_save_diag": False,
+        "qalr_v2_diag_file": "",
+        "qalr_v2_alpha_min": 0.0,
+        "qalr_v2_alpha_max": 0.01,
+        "qalr_v2_margin_low": 0.0,
+        "qalr_v2_margin_high": 0.02,
+        "qalr_v2_freeze_top1_margin": 0.02,
+        "qalr_v2_promote_margin": 0.0,
+        "qalr_v2_modality_fuse": "concat",
+        "qalr_v2_top1_guard": False,
+        "qalr_v2_promote_only": False,
+        "qalr_v2_diag_only": False,
         "use_uspc_slot_rerank": False,
         "uspc_slot_rerank_topk": 50,
         "uspc_slot_rerank_alpha": 0.0,
@@ -71,6 +84,32 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.use_qalr_focus_topn = cli_args.use_qalr_focus_topn
     if cli_args.qalr_focus_topn is not None:
         args.qalr_focus_topn = cli_args.qalr_focus_topn
+    if cli_args.use_qalr_v2 is not None:
+        args.use_qalr_v2 = cli_args.use_qalr_v2
+    if cli_args.qalr_v2_save_diag is not None:
+        args.qalr_v2_save_diag = cli_args.qalr_v2_save_diag
+    if cli_args.qalr_v2_diag_file is not None:
+        args.qalr_v2_diag_file = cli_args.qalr_v2_diag_file
+    if cli_args.qalr_v2_alpha_min is not None:
+        args.qalr_v2_alpha_min = cli_args.qalr_v2_alpha_min
+    if cli_args.qalr_v2_alpha_max is not None:
+        args.qalr_v2_alpha_max = cli_args.qalr_v2_alpha_max
+    if cli_args.qalr_v2_margin_low is not None:
+        args.qalr_v2_margin_low = cli_args.qalr_v2_margin_low
+    if cli_args.qalr_v2_margin_high is not None:
+        args.qalr_v2_margin_high = cli_args.qalr_v2_margin_high
+    if cli_args.qalr_v2_freeze_top1_margin is not None:
+        args.qalr_v2_freeze_top1_margin = cli_args.qalr_v2_freeze_top1_margin
+    if cli_args.qalr_v2_promote_margin is not None:
+        args.qalr_v2_promote_margin = cli_args.qalr_v2_promote_margin
+    if cli_args.qalr_v2_modality_fuse is not None:
+        args.qalr_v2_modality_fuse = cli_args.qalr_v2_modality_fuse
+    if cli_args.qalr_v2_top1_guard is not None:
+        args.qalr_v2_top1_guard = cli_args.qalr_v2_top1_guard
+    if cli_args.qalr_v2_promote_only is not None:
+        args.qalr_v2_promote_only = cli_args.qalr_v2_promote_only
+    if cli_args.qalr_v2_diag_only is not None:
+        args.qalr_v2_diag_only = cli_args.qalr_v2_diag_only
     if cli_args.use_uspc_slot_rerank is not None:
         args.use_uspc_slot_rerank = cli_args.use_uspc_slot_rerank
     if cli_args.uspc_slot_rerank_topk is not None:
@@ -226,6 +265,120 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="only apply local rerank fusion to the first n globally ranked candidates inside rerank_topk",
+    )
+    parser.add_argument(
+        "--use_qalr_v2",
+        default=None,
+        action="store_true",
+        help="enable safer QALR v2 local reranking",
+    )
+    parser.add_argument(
+        "--no_use_qalr_v2",
+        dest="use_qalr_v2",
+        default=None,
+        action="store_false",
+        help="disable safer QALR v2 local reranking",
+    )
+    parser.add_argument(
+        "--qalr_v2_save_diag",
+        default=None,
+        action="store_true",
+        help="save QALR/QALR-v2 per-query diagnostics",
+    )
+    parser.add_argument(
+        "--no_qalr_v2_save_diag",
+        dest="qalr_v2_save_diag",
+        default=None,
+        action="store_false",
+        help="disable QALR/QALR-v2 per-query diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v2_diag_file",
+        type=str,
+        default=None,
+        help="QALR-v2 diagnostics json output file",
+    )
+    parser.add_argument(
+        "--qalr_v2_alpha_min",
+        type=float,
+        default=None,
+        help="minimum adaptive alpha for QALR v2",
+    )
+    parser.add_argument(
+        "--qalr_v2_alpha_max",
+        type=float,
+        default=None,
+        help="maximum adaptive alpha for QALR v2",
+    )
+    parser.add_argument(
+        "--qalr_v2_margin_low",
+        type=float,
+        default=None,
+        help="margin where QALR v2 uses alpha_max",
+    )
+    parser.add_argument(
+        "--qalr_v2_margin_high",
+        type=float,
+        default=None,
+        help="margin where QALR v2 uses alpha_min",
+    )
+    parser.add_argument(
+        "--qalr_v2_freeze_top1_margin",
+        type=float,
+        default=None,
+        help="freeze top1 above this global margin when QALR v2 guard is enabled",
+    )
+    parser.add_argument(
+        "--qalr_v2_promote_margin",
+        type=float,
+        default=None,
+        help="minimum local advantage required for QALR v2 top1 promotion",
+    )
+    parser.add_argument(
+        "--qalr_v2_modality_fuse",
+        type=str,
+        default=None,
+        choices=["concat", "avg", "rgb", "thermal", "precision"],
+        help="QALR v2 local score modality fusion",
+    )
+    parser.add_argument(
+        "--qalr_v2_top1_guard",
+        default=None,
+        action="store_true",
+        help="enable QALR v2 global top1 freeze guard",
+    )
+    parser.add_argument(
+        "--no_qalr_v2_top1_guard",
+        dest="qalr_v2_top1_guard",
+        default=None,
+        action="store_false",
+        help="disable QALR v2 global top1 freeze guard",
+    )
+    parser.add_argument(
+        "--qalr_v2_promote_only",
+        default=None,
+        action="store_true",
+        help="allow QALR v2 top1 replacement only with enough local advantage",
+    )
+    parser.add_argument(
+        "--no_qalr_v2_promote_only",
+        dest="qalr_v2_promote_only",
+        default=None,
+        action="store_false",
+        help="disable QALR v2 promote-only mode",
+    )
+    parser.add_argument(
+        "--qalr_v2_diag_only",
+        default=None,
+        action="store_true",
+        help="compute QALR v2 diagnostics without changing final eval scores",
+    )
+    parser.add_argument(
+        "--no_qalr_v2_diag_only",
+        dest="qalr_v2_diag_only",
+        default=None,
+        action="store_false",
+        help="disable QALR v2 diagnostic-only mode",
     )
     parser.add_argument(
         "--use_uspc_slot_rerank",
