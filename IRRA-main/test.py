@@ -46,6 +46,12 @@ def _apply_qalr_test_overrides(args, cli_args):
         "qalr_v2_top1_guard": False,
         "qalr_v2_promote_only": False,
         "qalr_v2_diag_only": False,
+        "qalr_v3_candidate_diag": False,
+        "qalr_v3_candidate_diag_file": "",
+        "qalr_v3_candidate_topk": 64,
+        "qalr_v3_candidate_token_topm": 8,
+        "qalr_v3_candidate_patch_topr": 4,
+        "qalr_v3_candidate_save_scores": False,
         "use_uspc_slot_rerank": False,
         "uspc_slot_rerank_topk": 50,
         "uspc_slot_rerank_alpha": 0.0,
@@ -110,6 +116,18 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.qalr_v2_promote_only = cli_args.qalr_v2_promote_only
     if cli_args.qalr_v2_diag_only is not None:
         args.qalr_v2_diag_only = cli_args.qalr_v2_diag_only
+    if cli_args.qalr_v3_candidate_diag is not None:
+        args.qalr_v3_candidate_diag = cli_args.qalr_v3_candidate_diag
+    if cli_args.qalr_v3_candidate_diag_file is not None:
+        args.qalr_v3_candidate_diag_file = cli_args.qalr_v3_candidate_diag_file
+    if cli_args.qalr_v3_candidate_topk is not None:
+        args.qalr_v3_candidate_topk = cli_args.qalr_v3_candidate_topk
+    if cli_args.qalr_v3_candidate_token_topm is not None:
+        args.qalr_v3_candidate_token_topm = cli_args.qalr_v3_candidate_token_topm
+    if cli_args.qalr_v3_candidate_patch_topr is not None:
+        args.qalr_v3_candidate_patch_topr = cli_args.qalr_v3_candidate_patch_topr
+    if cli_args.qalr_v3_candidate_save_scores is not None:
+        args.qalr_v3_candidate_save_scores = cli_args.qalr_v3_candidate_save_scores
     if cli_args.use_uspc_slot_rerank is not None:
         args.use_uspc_slot_rerank = cli_args.use_uspc_slot_rerank
     if cli_args.uspc_slot_rerank_topk is not None:
@@ -379,6 +397,56 @@ if __name__ == "__main__":
         default=None,
         action="store_false",
         help="disable QALR v2 diagnostic-only mode",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_diag",
+        default=None,
+        action="store_true",
+        help="save QALR v3 candidate-level oracle diagnostics",
+    )
+    parser.add_argument(
+        "--no_qalr_v3_candidate_diag",
+        dest="qalr_v3_candidate_diag",
+        default=None,
+        action="store_false",
+        help="disable QALR v3 candidate-level oracle diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_diag_file",
+        type=str,
+        default=None,
+        help="QALR v3 candidate diagnostics json output file",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_topk",
+        type=int,
+        default=None,
+        help="global top-K candidates saved for QALR v3 diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_token_topm",
+        type=int,
+        default=None,
+        help="number of salient text tokens used for QALR v3 diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_patch_topr",
+        type=int,
+        default=None,
+        help="number of top patches per token used for QALR v3 diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_candidate_save_scores",
+        default=None,
+        action="store_true",
+        help="save candidate-level score fields in QALR v3 diagnostics",
+    )
+    parser.add_argument(
+        "--no_qalr_v3_candidate_save_scores",
+        dest="qalr_v3_candidate_save_scores",
+        default=None,
+        action="store_false",
+        help="omit optional candidate-level score fields in QALR v3 diagnostics",
     )
     parser.add_argument(
         "--use_uspc_slot_rerank",

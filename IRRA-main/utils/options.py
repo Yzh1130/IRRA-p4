@@ -263,6 +263,12 @@ def get_args():
     parser.add_argument("--qalr_v2_top1_guard", default=False, action='store_true', help="enable QALR v2 global top1 freeze guard")
     parser.add_argument("--qalr_v2_promote_only", default=False, action='store_true', help="allow QALR v2 top1 replacement only with enough local advantage")
     parser.add_argument("--qalr_v2_diag_only", default=False, action='store_true', help="compute QALR v2 diagnostics without changing final eval scores")
+    parser.add_argument("--qalr_v3_candidate_diag", default=False, action='store_true', help="save QALR v3 candidate-level oracle diagnostics without changing eval scores")
+    parser.add_argument("--qalr_v3_candidate_diag_file", type=str, default="", help="QALR v3 candidate diagnostics json output file")
+    parser.add_argument("--qalr_v3_candidate_topk", type=int, default=64, help="global top-K candidates saved for QALR v3 candidate diagnostics")
+    parser.add_argument("--qalr_v3_candidate_token_topm", type=int, default=8, help="number of salient text tokens for QALR v3 candidate diagnostics")
+    parser.add_argument("--qalr_v3_candidate_patch_topr", type=int, default=4, help="number of top patches per token for QALR v3 candidate diagnostics")
+    parser.add_argument("--qalr_v3_candidate_save_scores", default=False, action='store_true', help="save candidate-level score fields in QALR v3 diagnostics")
 
     ######################## inference-only USPC text-slot local rerank ########################
     # Evaluation-only USPC-v2C switch. This does not add training losses or checkpoint weights.

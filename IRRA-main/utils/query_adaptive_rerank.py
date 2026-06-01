@@ -429,6 +429,374 @@ class QueryAdaptiveLocalReranker(object):
             return None
         return value
 
+    def _rank_positions_desc(self, scores):
+        order = torch.argsort(scores, dim=1, descending=True, stable=True)
+        ranks = torch.empty_like(order)
+        positions = (
+            torch.arange(scores.shape[1], device=scores.device)
+            .unsqueeze(0)
+            .expand_as(order)
+        )
+        ranks.scatter_(dim=1, index=order, src=positions)
+        return ranks + 1
+
+    def _candidate_precision_scores(
+        self,
+        rgb_local_scores,
+        thermal_local_scores,
+        topk_indices,
+        gallery_rgb_precision_weights=None,
+        gallery_thermal_precision_weights=None,
+        gallery_precision_weight_valid=None,
+    ):
+        if (
+            gallery_rgb_precision_weights is None
+            or gallery_thermal_precision_weights is None
+        ):
+            return None, None
+
+        rgb_weight = gallery_rgb_precision_weights[topk_indices].float()
+        thermal_weight = gallery_thermal_precision_weights[topk_indices].float()
+        weight_sum = (rgb_weight + thermal_weight).clamp_min(self.score_norm_eps)
+        rgb_weight = rgb_weight / weight_sum
+        thermal_weight = thermal_weight / weight_sum
+        precision_scores = (
+            rgb_local_scores * rgb_weight
+            + thermal_local_scores * thermal_weight
+        )
+        valid_mask = torch.ones_like(precision_scores, dtype=torch.bool)
+        if gallery_precision_weight_valid is not None:
+            valid_mask = gallery_precision_weight_valid[topk_indices].bool()
+            avg_scores = 0.5 * (rgb_local_scores + thermal_local_scores)
+            precision_scores = torch.where(valid_mask, precision_scores, avg_scores)
+        return precision_scores, valid_mask
+
+    def candidate_oracle_diagnostics(
+        self,
+        query_token_embeddings,
+        query_token_ids,
+        query_global_embeddings,
+        gallery_rgb_patch_tokens,
+        gallery_thermal_patch_tokens,
+        global_similarity,
+        qids,
+        gids,
+        gallery_rgb_precision_weights=None,
+        gallery_thermal_precision_weights=None,
+        gallery_precision_weight_valid=None,
+        save_scores=False,
+    ):
+        num_query, num_gallery = global_similarity.shape
+        effective_topk = min(self.topk, num_gallery)
+        config = {
+            "topk": int(effective_topk),
+            "requested_topk": int(self.topk),
+            "token_topm": int(self.token_topm),
+            "patch_topr": int(self.patch_topr),
+            "save_scores": bool(save_scores),
+        }
+        if num_query == 0 or num_gallery == 0 or effective_topk <= 0:
+            return {
+                "config": config,
+                "summary": {
+                    "total_queries": int(num_query),
+                    "old_top1_correct": 0,
+                    "gt_in_topk_count": 0,
+                    "wrong_old_top1_but_gt_in_topk": 0,
+                    "oracle_topk_possible_gain": 0,
+                    "oracle_topk_possible_R1": 0.0,
+                },
+                "queries": [],
+                "candidates": [],
+            }
+
+        original_order = torch.argsort(global_similarity, dim=1, descending=True)
+        topk_indices = original_order[:, :effective_topk]
+        topk_global_scores = torch.gather(global_similarity, dim=1, index=topk_indices)
+        top12_margin = self._compute_top12_margin(global_similarity)
+        top1_scores = topk_global_scores[:, 0]
+        if num_gallery >= 2:
+            top2_scores = torch.topk(
+                global_similarity, k=2, dim=1, largest=True, sorted=True
+            ).values[:, 1]
+        else:
+            top2_scores = torch.full_like(top1_scores, float("-inf"))
+
+        rgb_patch_pool = F.normalize(gallery_rgb_patch_tokens.float(), p=2, dim=-1)
+        if (
+            gallery_thermal_patch_tokens is not None
+            and gallery_thermal_patch_tokens.shape[1] > 0
+        ):
+            thermal_patch_pool = F.normalize(
+                gallery_thermal_patch_tokens.float(), p=2, dim=-1
+            )
+        else:
+            thermal_patch_pool = None
+        concat_patch_pool = F.normalize(
+            self._build_patch_pool(
+                gallery_rgb_patch_tokens, gallery_thermal_patch_tokens
+            ).float(),
+            p=2,
+            dim=-1,
+        )
+
+        salient_query_tokens, salient_token_weights = self._select_salient_tokens(
+            query_token_embeddings=query_token_embeddings,
+            query_token_ids=query_token_ids,
+            query_global_embeddings=query_global_embeddings,
+        )
+        concat_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        rgb_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        thermal_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        for q_start in range(0, num_query, self.query_chunk_size):
+            q_end = min(q_start + self.query_chunk_size, num_query)
+            query_tokens_chunk = salient_query_tokens[q_start:q_end]
+            token_weights_chunk = salient_token_weights[q_start:q_end]
+            topk_indices_chunk = topk_indices[q_start:q_end]
+            concat_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                query_tokens_chunk,
+                token_weights_chunk,
+                concat_patch_pool,
+                topk_indices_chunk,
+            )
+            rgb_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                query_tokens_chunk,
+                token_weights_chunk,
+                rgb_patch_pool,
+                topk_indices_chunk,
+            )
+            if thermal_patch_pool is None:
+                thermal_local_scores[q_start:q_end] = rgb_local_scores[q_start:q_end]
+            else:
+                thermal_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                    query_tokens_chunk,
+                    token_weights_chunk,
+                    thermal_patch_pool,
+                    topk_indices_chunk,
+                )
+
+        avg_local_scores = 0.5 * (rgb_local_scores + thermal_local_scores)
+        precision_local_scores, precision_valid_mask = self._candidate_precision_scores(
+            rgb_local_scores=rgb_local_scores,
+            thermal_local_scores=thermal_local_scores,
+            topk_indices=topk_indices,
+            gallery_rgb_precision_weights=gallery_rgb_precision_weights,
+            gallery_thermal_precision_weights=gallery_thermal_precision_weights,
+            gallery_precision_weight_valid=gallery_precision_weight_valid,
+        )
+
+        concat_ranks = self._rank_positions_desc(concat_local_scores)
+        rgb_ranks = self._rank_positions_desc(rgb_local_scores)
+        thermal_ranks = self._rank_positions_desc(thermal_local_scores)
+        avg_ranks = self._rank_positions_desc(avg_local_scores)
+        precision_ranks = (
+            self._rank_positions_desc(precision_local_scores)
+            if precision_local_scores is not None
+            else None
+        )
+
+        qids_cpu = qids.detach().cpu().long().view(-1)
+        gids_cpu = gids.detach().cpu().long().view(-1)
+        topk_indices_cpu = topk_indices.detach().cpu().long()
+        topk_global_scores_cpu = topk_global_scores.detach().cpu().float()
+        top1_scores_cpu = top1_scores.detach().cpu().float()
+        top2_scores_cpu = top2_scores.detach().cpu().float()
+        top12_margin_cpu = top12_margin.detach().cpu().float()
+        concat_scores_cpu = concat_local_scores.detach().cpu().float()
+        rgb_scores_cpu = rgb_local_scores.detach().cpu().float()
+        thermal_scores_cpu = thermal_local_scores.detach().cpu().float()
+        avg_scores_cpu = avg_local_scores.detach().cpu().float()
+        precision_scores_cpu = (
+            precision_local_scores.detach().cpu().float()
+            if precision_local_scores is not None
+            else None
+        )
+        precision_valid_cpu = (
+            precision_valid_mask.detach().cpu().bool()
+            if precision_valid_mask is not None
+            else None
+        )
+        concat_ranks_cpu = concat_ranks.detach().cpu().long()
+        rgb_ranks_cpu = rgb_ranks.detach().cpu().long()
+        thermal_ranks_cpu = thermal_ranks.detach().cpu().long()
+        avg_ranks_cpu = avg_ranks.detach().cpu().long()
+        precision_ranks_cpu = (
+            precision_ranks.detach().cpu().long()
+            if precision_ranks is not None
+            else None
+        )
+
+        queries = []
+        candidates = []
+        old_top1_correct = 0
+        gt_in_topk_count = 0
+        wrong_old_top1_but_gt_in_topk = 0
+
+        for query_index in range(num_query):
+            q_pid = int(qids_cpu[query_index].item())
+            old_top1_gallery_index = int(topk_indices_cpu[query_index, 0].item())
+            old_top1_pid = int(gids_cpu[old_top1_gallery_index].item())
+            old_top1_is_gt = old_top1_pid == q_pid
+            if old_top1_is_gt:
+                old_top1_correct += 1
+
+            candidate_pids = gids_cpu[topk_indices_cpu[query_index]]
+            gt_mask = candidate_pids.eq(q_pid)
+            has_gt_in_topk = bool(gt_mask.any().item())
+            if has_gt_in_topk:
+                gt_in_topk_count += 1
+                if not old_top1_is_gt:
+                    wrong_old_top1_but_gt_in_topk += 1
+                gt_positions = gt_mask.nonzero(as_tuple=False).view(-1)
+                best_gt_global_rank = int(gt_positions[0].item()) + 1
+                best_gt_local_concat_rank = int(
+                    concat_ranks_cpu[query_index, gt_positions].min().item()
+                )
+                best_gt_local_rgb_rank = int(
+                    rgb_ranks_cpu[query_index, gt_positions].min().item()
+                )
+                best_gt_local_thermal_rank = int(
+                    thermal_ranks_cpu[query_index, gt_positions].min().item()
+                )
+            else:
+                best_gt_global_rank = None
+                best_gt_local_concat_rank = None
+                best_gt_local_rgb_rank = None
+                best_gt_local_thermal_rank = None
+
+            queries.append(
+                {
+                    "query_index": int(query_index),
+                    "q_pid": q_pid,
+                    "old_top1_gallery_index": old_top1_gallery_index,
+                    "old_top1_pid": old_top1_pid,
+                    "old_top1_is_gt": bool(old_top1_is_gt),
+                    "has_gt_in_topk": bool(has_gt_in_topk),
+                    "best_gt_global_rank": best_gt_global_rank,
+                    "best_gt_local_concat_rank": best_gt_local_concat_rank,
+                    "best_gt_local_rgb_rank": best_gt_local_rgb_rank,
+                    "best_gt_local_thermal_rank": best_gt_local_thermal_rank,
+                    "topk": int(effective_topk),
+                    "token_topm": int(self.token_topm),
+                    "patch_topr": int(self.patch_topr),
+                }
+            )
+
+            old_concat_score = concat_scores_cpu[query_index, 0].item()
+            old_rgb_score = rgb_scores_cpu[query_index, 0].item()
+            old_thermal_score = thermal_scores_cpu[query_index, 0].item()
+            for candidate_rank in range(effective_topk):
+                candidate_gallery_index = int(
+                    topk_indices_cpu[query_index, candidate_rank].item()
+                )
+                candidate_pid = int(gids_cpu[candidate_gallery_index].item())
+                is_gt_match = candidate_pid == q_pid
+                candidate = {
+                    "query_index": int(query_index),
+                    "q_pid": q_pid,
+                    "candidate_rank_global": int(candidate_rank + 1),
+                    "candidate_gallery_index": candidate_gallery_index,
+                    "candidate_pid": candidate_pid,
+                    "is_gt_match": bool(is_gt_match),
+                    "is_old_top1": bool(candidate_rank == 0),
+                    "global_score": self._safe_float(
+                        topk_global_scores_cpu[query_index, candidate_rank].item()
+                    ),
+                    "global_top1_score": self._safe_float(
+                        top1_scores_cpu[query_index].item()
+                    ),
+                    "global_top2_score": self._safe_float(
+                        top2_scores_cpu[query_index].item()
+                    ),
+                    "global_top12_margin": self._safe_float(
+                        top12_margin_cpu[query_index].item()
+                    ),
+                    "local_concat_score": self._safe_float(
+                        concat_scores_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_rgb_score": self._safe_float(
+                        rgb_scores_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_thermal_score": self._safe_float(
+                        thermal_scores_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_avg_score": self._safe_float(
+                        avg_scores_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_precision_score": (
+                        self._safe_float(
+                            precision_scores_cpu[
+                                query_index, candidate_rank
+                            ].item()
+                        )
+                        if precision_scores_cpu is not None
+                        else None
+                    ),
+                    "local_precision_valid": (
+                        bool(precision_valid_cpu[query_index, candidate_rank].item())
+                        if precision_valid_cpu is not None
+                        else False
+                    ),
+                    "local_concat_rank_within_topk": int(
+                        concat_ranks_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_rgb_rank_within_topk": int(
+                        rgb_ranks_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_thermal_rank_within_topk": int(
+                        thermal_ranks_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_avg_rank_within_topk": int(
+                        avg_ranks_cpu[query_index, candidate_rank].item()
+                    ),
+                    "local_precision_rank_within_topk": (
+                        int(precision_ranks_cpu[query_index, candidate_rank].item())
+                        if precision_ranks_cpu is not None
+                        else None
+                    ),
+                    "local_gap_to_old_top1_concat": self._safe_float(
+                        concat_scores_cpu[query_index, candidate_rank].item()
+                        - old_concat_score
+                    ),
+                    "local_gap_to_old_top1_rgb": self._safe_float(
+                        rgb_scores_cpu[query_index, candidate_rank].item()
+                        - old_rgb_score
+                    ),
+                    "local_gap_to_old_top1_thermal": self._safe_float(
+                        thermal_scores_cpu[query_index, candidate_rank].item()
+                        - old_thermal_score
+                    ),
+                    "local_gap_to_old_top1_avg": self._safe_float(
+                        avg_scores_cpu[query_index, candidate_rank].item()
+                        - avg_scores_cpu[query_index, 0].item()
+                    ),
+                    "old_top1_gallery_index": old_top1_gallery_index,
+                    "old_top1_pid": old_top1_pid,
+                    "old_top1_is_gt": bool(old_top1_is_gt),
+                }
+                candidates.append(candidate)
+
+        oracle_possible_gain = int(wrong_old_top1_but_gt_in_topk)
+        oracle_possible_r1 = (
+            100.0 * float(old_top1_correct + oracle_possible_gain) / float(num_query)
+            if num_query > 0
+            else 0.0
+        )
+        summary = {
+            "total_queries": int(num_query),
+            "old_top1_correct": int(old_top1_correct),
+            "gt_in_topk_count": int(gt_in_topk_count),
+            "wrong_old_top1_but_gt_in_topk": int(wrong_old_top1_but_gt_in_topk),
+            "oracle_topk_possible_gain": int(oracle_possible_gain),
+            "oracle_topk_possible_R1": float(oracle_possible_r1),
+        }
+        return {
+            "config": config,
+            "summary": summary,
+            "queries": queries,
+            "candidates": candidates,
+        }
+
     def _build_focus_candidate_mask(self, global_similarity, topk_indices, effective_topk):
         num_query = global_similarity.shape[0]
         if not self.use_focus_topn:

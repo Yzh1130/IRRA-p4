@@ -539,6 +539,21 @@ class Evaluator():
             "qalr_v2_diag_only": bool(
                 getattr(model_args, "qalr_v2_diag_only", False)
             ),
+            "qalr_v3_candidate_diag": bool(
+                getattr(model_args, "qalr_v3_candidate_diag", False)
+            ),
+            "qalr_v3_candidate_topk": int(
+                getattr(model_args, "qalr_v3_candidate_topk", 64)
+            ),
+            "qalr_v3_candidate_token_topm": int(
+                getattr(model_args, "qalr_v3_candidate_token_topm", 8)
+            ),
+            "qalr_v3_candidate_patch_topr": int(
+                getattr(model_args, "qalr_v3_candidate_patch_topr", 4)
+            ),
+            "qalr_v3_candidate_save_scores": bool(
+                getattr(model_args, "qalr_v3_candidate_save_scores", False)
+            ),
         }
 
     def _maybe_save_eval_scores(
@@ -589,6 +604,9 @@ class Evaluator():
             "score_semantics": score_semantics,
             "use_qalr": bool(use_qalr),
             "use_qalr_v2": bool(use_qalr_v2),
+            "use_qalr_v3_candidate_diag": bool(
+                getattr(model_args, "qalr_v3_candidate_diag", False)
+            ),
             "qalr_args": self._collect_qalr_args(model_args),
             "use_transport_rerank": bool(use_transport_rerank),
             "use_uspc_slot_rerank": bool(use_uspc_slot_rerank),
@@ -786,6 +804,38 @@ class Evaluator():
             hurt,
             neutral,
             net,
+        )
+
+    def _save_qalr_v3_candidate_diagnostics(self, model_args, payload):
+        if model_args is None or not bool(
+            getattr(model_args, "qalr_v3_candidate_diag", False)
+        ):
+            return
+        diag_file = str(
+            getattr(model_args, "qalr_v3_candidate_diag_file", "")
+        ).strip()
+        if not diag_file:
+            diag_file = os.path.join(
+                str(getattr(model_args, "output_dir", ".")),
+                "qalr_v3_candidate_diag.json",
+            )
+        diag_file = os.path.abspath(diag_file)
+        diag_dir = os.path.dirname(diag_file)
+        if diag_dir:
+            os.makedirs(diag_dir, exist_ok=True)
+        with open(diag_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+        summary = payload.get("summary", {})
+        self.logger.info(
+            "[QALR_V3_CANDIDATE_DIAG] path=%s total=%d old_top1_correct=%d gt_in_topk=%d wrong_old_top1_but_gt_in_topk=%d oracle_gain=%d oracle_R1=%.6f",
+            diag_file,
+            int(summary.get("total_queries", 0)),
+            int(summary.get("old_top1_correct", 0)),
+            int(summary.get("gt_in_topk_count", 0)),
+            int(summary.get("wrong_old_top1_but_gt_in_topk", 0)),
+            int(summary.get("oracle_topk_possible_gain", 0)),
+            float(summary.get("oracle_topk_possible_R1", 0.0)),
         )
 
     def _get_query_raw_captions(self, expected_count):
@@ -1240,6 +1290,13 @@ class Evaluator():
         use_qalr_v2 = bool(
             getattr(getattr(model, "args", None), "use_qalr_v2", False)
         )
+        use_qalr_v3_candidate_diag = bool(
+            getattr(
+                getattr(model, "args", None),
+                "qalr_v3_candidate_diag",
+                False,
+            )
+        )
         use_transport_rerank = bool(
             getattr(getattr(model, "args", None), "use_transport_rerank", False)
         )
@@ -1264,12 +1321,13 @@ class Evaluator():
             return_local_tokens
             or use_qalr
             or use_qalr_v2
+            or use_qalr_v3_candidate_diag
             or use_transport_rerank
             or use_uspc_slot_rerank
         )
         model_args = getattr(model, "args", None)
         self.logger.info(
-            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_qalr_v2=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
+            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_qalr_v2=%s qalr_v3_candidate_diag=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
             self.source,
             bool(getattr(model, "training", False)),
             bool(getattr(model_args, "training", False)),
@@ -1282,6 +1340,7 @@ class Evaluator():
             bool(getattr(model_args, "use_id_uncertainty", True)),
             use_qalr,
             use_qalr_v2,
+            use_qalr_v3_candidate_diag,
             use_transport_rerank,
             use_uspc_slot_rerank,
             use_mtp_eval_fusion,
@@ -1322,6 +1381,56 @@ class Evaluator():
                 + beta * (qfeats_th @ gfeats_th.t())
             )
         baseline_similarity = similarity.clone()
+        if use_qalr_v3_candidate_diag:
+            candidate_diag_reranker = QueryAdaptiveLocalReranker(
+                topk=int(getattr(model.args, "qalr_v3_candidate_topk", 64)),
+                alpha=0.0,
+                token_topm=int(
+                    getattr(model.args, "qalr_v3_candidate_token_topm", 8)
+                ),
+                patch_topr=int(
+                    getattr(model.args, "qalr_v3_candidate_patch_topr", 4)
+                ),
+                vocab_size=int(getattr(model.args, "vocab_size", 49408)),
+            )
+            candidate_diag_payload = candidate_diag_reranker.candidate_oracle_diagnostics(
+                query_token_embeddings=embedding_outputs["query_token_embeddings"],
+                query_token_ids=embedding_outputs["query_token_ids"],
+                query_global_embeddings=embedding_outputs["query_global_embeddings"],
+                gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
+                gallery_thermal_patch_tokens=embedding_outputs[
+                    "gallery_thermal_patch_tokens"
+                ],
+                gallery_rgb_precision_weights=embedding_outputs.get(
+                    "gallery_rgb_precision_weights", None
+                ),
+                gallery_thermal_precision_weights=embedding_outputs.get(
+                    "gallery_thermal_precision_weights", None
+                ),
+                gallery_precision_weight_valid=embedding_outputs.get(
+                    "gallery_precision_weight_valid", None
+                ),
+                global_similarity=baseline_similarity,
+                qids=qids,
+                gids=gids,
+                save_scores=bool(
+                    getattr(model.args, "qalr_v3_candidate_save_scores", False)
+                ),
+            )
+            candidate_diag_payload["config"].update(
+                {
+                    "dataset_name": str(getattr(model.args, "dataset_name", "")),
+                    "eval_dataset": str(getattr(model.args, "eval_dataset", "")),
+                    "config_file": str(getattr(model.args, "config_file", "")),
+                    "test_ckpt_file": str(getattr(model.args, "test_ckpt_file", "")),
+                    "model_name": str(getattr(model.args, "name", "")),
+                    "score_source": "pre_qalr_global_similarity",
+                }
+            )
+            self._save_qalr_v3_candidate_diagnostics(
+                model_args=model.args,
+                payload=candidate_diag_payload,
+            )
         if use_uspc_slot_rerank:
             similarity, uspc_slot_rerank_stats = self._apply_uspc_slot_rerank(
                 model=model,
