@@ -280,6 +280,21 @@ def get_args():
     parser.add_argument("--qalr_v3_gate_local_gap_min", type=float, default=0.01, help="minimum local score gap over old top1 required for QALR v3 gate")
     parser.add_argument("--qalr_v3_gate_save_diag", default=False, action='store_true', help="save QALR v3 gate per-query diagnostics")
     parser.add_argument("--qalr_v3_gate_diag_file", type=str, default="", help="QALR v3 gate diagnostics json output file")
+    parser.add_argument("--use_qalr_v3_two_stage_gate", default=False, action='store_true', help="enable QALR v3 two-stage gated top1 promotion rerank")
+    parser.add_argument("--qalr_v3_stage1_mode", type=str, default="avg", choices=["concat", "avg", "rgb", "thermal"], help="QALR v3 two-stage gate stage1 local score mode")
+    parser.add_argument("--qalr_v3_stage1_global_margin_max", type=float, default=0.008, help="stage1 maximum global top1-top2 margin")
+    parser.add_argument("--qalr_v3_stage1_local_gap_min", type=float, default=0.015, help="stage1 minimum local score gap over old top1")
+    parser.add_argument("--qalr_v3_stage2_mode", type=str, default="avg", choices=["concat", "avg", "rgb", "thermal"], help="QALR v3 two-stage gate stage2 local score mode")
+    parser.add_argument("--qalr_v3_stage2_global_margin_min", type=float, default=0.008, help="stage2 minimum global top1-top2 margin")
+    parser.add_argument("--qalr_v3_stage2_global_margin_max", type=float, default=0.010, help="stage2 maximum global top1-top2 margin")
+    parser.add_argument("--qalr_v3_stage2_local_gap_min", type=float, default=0.011, help="stage2 minimum local score gap over old top1")
+    parser.add_argument("--qalr_v3_two_stage_topk", type=int, default=64, help="global top-K candidate pool for QALR v3 two-stage gate")
+    parser.add_argument("--qalr_v3_two_stage_candidate_rank_max", type=int, default=2, help="maximum global candidate rank allowed for QALR v3 two-stage gate")
+    parser.add_argument("--qalr_v3_two_stage_local_rank_max", type=int, default=1, help="maximum local rank allowed for QALR v3 two-stage gate")
+    parser.add_argument("--qalr_v3_two_stage_token_topm", type=int, default=8, help="number of salient text tokens for QALR v3 two-stage gate")
+    parser.add_argument("--qalr_v3_two_stage_patch_topr", type=int, default=4, help="number of top patches per token for QALR v3 two-stage gate")
+    parser.add_argument("--qalr_v3_two_stage_save_diag", default=False, action='store_true', help="save QALR v3 two-stage gate per-query diagnostics")
+    parser.add_argument("--qalr_v3_two_stage_diag_file", type=str, default="", help="QALR v3 two-stage gate diagnostics json output file")
 
     ######################## inference-only USPC text-slot local rerank ########################
     # Evaluation-only USPC-v2C switch. This does not add training losses or checkpoint weights.

@@ -63,6 +63,21 @@ def _apply_qalr_test_overrides(args, cli_args):
         "qalr_v3_gate_local_gap_min": 0.01,
         "qalr_v3_gate_save_diag": False,
         "qalr_v3_gate_diag_file": "",
+        "use_qalr_v3_two_stage_gate": False,
+        "qalr_v3_stage1_mode": "avg",
+        "qalr_v3_stage1_global_margin_max": 0.008,
+        "qalr_v3_stage1_local_gap_min": 0.015,
+        "qalr_v3_stage2_mode": "avg",
+        "qalr_v3_stage2_global_margin_min": 0.008,
+        "qalr_v3_stage2_global_margin_max": 0.010,
+        "qalr_v3_stage2_local_gap_min": 0.011,
+        "qalr_v3_two_stage_topk": 64,
+        "qalr_v3_two_stage_candidate_rank_max": 2,
+        "qalr_v3_two_stage_local_rank_max": 1,
+        "qalr_v3_two_stage_token_topm": 8,
+        "qalr_v3_two_stage_patch_topr": 4,
+        "qalr_v3_two_stage_save_diag": False,
+        "qalr_v3_two_stage_diag_file": "",
         "use_uspc_slot_rerank": False,
         "uspc_slot_rerank_topk": 50,
         "uspc_slot_rerank_alpha": 0.0,
@@ -161,6 +176,36 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.qalr_v3_gate_save_diag = cli_args.qalr_v3_gate_save_diag
     if cli_args.qalr_v3_gate_diag_file is not None:
         args.qalr_v3_gate_diag_file = cli_args.qalr_v3_gate_diag_file
+    if cli_args.use_qalr_v3_two_stage_gate is not None:
+        args.use_qalr_v3_two_stage_gate = cli_args.use_qalr_v3_two_stage_gate
+    if cli_args.qalr_v3_stage1_mode is not None:
+        args.qalr_v3_stage1_mode = cli_args.qalr_v3_stage1_mode
+    if cli_args.qalr_v3_stage1_global_margin_max is not None:
+        args.qalr_v3_stage1_global_margin_max = cli_args.qalr_v3_stage1_global_margin_max
+    if cli_args.qalr_v3_stage1_local_gap_min is not None:
+        args.qalr_v3_stage1_local_gap_min = cli_args.qalr_v3_stage1_local_gap_min
+    if cli_args.qalr_v3_stage2_mode is not None:
+        args.qalr_v3_stage2_mode = cli_args.qalr_v3_stage2_mode
+    if cli_args.qalr_v3_stage2_global_margin_min is not None:
+        args.qalr_v3_stage2_global_margin_min = cli_args.qalr_v3_stage2_global_margin_min
+    if cli_args.qalr_v3_stage2_global_margin_max is not None:
+        args.qalr_v3_stage2_global_margin_max = cli_args.qalr_v3_stage2_global_margin_max
+    if cli_args.qalr_v3_stage2_local_gap_min is not None:
+        args.qalr_v3_stage2_local_gap_min = cli_args.qalr_v3_stage2_local_gap_min
+    if cli_args.qalr_v3_two_stage_topk is not None:
+        args.qalr_v3_two_stage_topk = cli_args.qalr_v3_two_stage_topk
+    if cli_args.qalr_v3_two_stage_candidate_rank_max is not None:
+        args.qalr_v3_two_stage_candidate_rank_max = cli_args.qalr_v3_two_stage_candidate_rank_max
+    if cli_args.qalr_v3_two_stage_local_rank_max is not None:
+        args.qalr_v3_two_stage_local_rank_max = cli_args.qalr_v3_two_stage_local_rank_max
+    if cli_args.qalr_v3_two_stage_token_topm is not None:
+        args.qalr_v3_two_stage_token_topm = cli_args.qalr_v3_two_stage_token_topm
+    if cli_args.qalr_v3_two_stage_patch_topr is not None:
+        args.qalr_v3_two_stage_patch_topr = cli_args.qalr_v3_two_stage_patch_topr
+    if cli_args.qalr_v3_two_stage_save_diag is not None:
+        args.qalr_v3_two_stage_save_diag = cli_args.qalr_v3_two_stage_save_diag
+    if cli_args.qalr_v3_two_stage_diag_file is not None:
+        args.qalr_v3_two_stage_diag_file = cli_args.qalr_v3_two_stage_diag_file
     if cli_args.use_uspc_slot_rerank is not None:
         args.use_uspc_slot_rerank = cli_args.use_uspc_slot_rerank
     if cli_args.uspc_slot_rerank_topk is not None:
@@ -561,6 +606,112 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="QALR v3 gate diagnostics json output file",
+    )
+    parser.add_argument(
+        "--use_qalr_v3_two_stage_gate",
+        default=None,
+        action="store_true",
+        help="enable QALR v3 two-stage gated top1 promotion rerank",
+    )
+    parser.add_argument(
+        "--no_use_qalr_v3_two_stage_gate",
+        dest="use_qalr_v3_two_stage_gate",
+        default=None,
+        action="store_false",
+        help="disable QALR v3 two-stage gated top1 promotion rerank",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage1_mode",
+        type=str,
+        default=None,
+        choices=["concat", "avg", "rgb", "thermal"],
+        help="QALR v3 two-stage gate stage1 local score mode",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage1_global_margin_max",
+        type=float,
+        default=None,
+        help="stage1 maximum global top1-top2 margin",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage1_local_gap_min",
+        type=float,
+        default=None,
+        help="stage1 minimum local score gap over old top1",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage2_mode",
+        type=str,
+        default=None,
+        choices=["concat", "avg", "rgb", "thermal"],
+        help="QALR v3 two-stage gate stage2 local score mode",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage2_global_margin_min",
+        type=float,
+        default=None,
+        help="stage2 minimum global top1-top2 margin",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage2_global_margin_max",
+        type=float,
+        default=None,
+        help="stage2 maximum global top1-top2 margin",
+    )
+    parser.add_argument(
+        "--qalr_v3_stage2_local_gap_min",
+        type=float,
+        default=None,
+        help="stage2 minimum local score gap over old top1",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_topk",
+        type=int,
+        default=None,
+        help="global top-K candidate pool for QALR v3 two-stage gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_candidate_rank_max",
+        type=int,
+        default=None,
+        help="maximum global candidate rank allowed for QALR v3 two-stage gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_local_rank_max",
+        type=int,
+        default=None,
+        help="maximum local rank allowed for QALR v3 two-stage gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_token_topm",
+        type=int,
+        default=None,
+        help="number of salient text tokens used for QALR v3 two-stage gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_patch_topr",
+        type=int,
+        default=None,
+        help="number of top patches per token used for QALR v3 two-stage gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_save_diag",
+        default=None,
+        action="store_true",
+        help="save QALR v3 two-stage gate per-query diagnostics",
+    )
+    parser.add_argument(
+        "--no_qalr_v3_two_stage_save_diag",
+        dest="qalr_v3_two_stage_save_diag",
+        default=None,
+        action="store_false",
+        help="disable QALR v3 two-stage gate diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_two_stage_diag_file",
+        type=str,
+        default=None,
+        help="QALR v3 two-stage gate diagnostics json output file",
     )
     parser.add_argument(
         "--use_uspc_slot_rerank",
