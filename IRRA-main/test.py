@@ -52,6 +52,17 @@ def _apply_qalr_test_overrides(args, cli_args):
         "qalr_v3_candidate_token_topm": 8,
         "qalr_v3_candidate_patch_topr": 4,
         "qalr_v3_candidate_save_scores": False,
+        "use_qalr_v3_gate": False,
+        "qalr_v3_gate_mode": "concat",
+        "qalr_v3_gate_topk": 64,
+        "qalr_v3_gate_token_topm": 8,
+        "qalr_v3_gate_patch_topr": 4,
+        "qalr_v3_gate_candidate_rank_max": 2,
+        "qalr_v3_gate_local_rank_max": 1,
+        "qalr_v3_gate_global_margin_max": 0.01,
+        "qalr_v3_gate_local_gap_min": 0.01,
+        "qalr_v3_gate_save_diag": False,
+        "qalr_v3_gate_diag_file": "",
         "use_uspc_slot_rerank": False,
         "uspc_slot_rerank_topk": 50,
         "uspc_slot_rerank_alpha": 0.0,
@@ -128,6 +139,28 @@ def _apply_qalr_test_overrides(args, cli_args):
         args.qalr_v3_candidate_patch_topr = cli_args.qalr_v3_candidate_patch_topr
     if cli_args.qalr_v3_candidate_save_scores is not None:
         args.qalr_v3_candidate_save_scores = cli_args.qalr_v3_candidate_save_scores
+    if cli_args.use_qalr_v3_gate is not None:
+        args.use_qalr_v3_gate = cli_args.use_qalr_v3_gate
+    if cli_args.qalr_v3_gate_mode is not None:
+        args.qalr_v3_gate_mode = cli_args.qalr_v3_gate_mode
+    if cli_args.qalr_v3_gate_topk is not None:
+        args.qalr_v3_gate_topk = cli_args.qalr_v3_gate_topk
+    if cli_args.qalr_v3_gate_token_topm is not None:
+        args.qalr_v3_gate_token_topm = cli_args.qalr_v3_gate_token_topm
+    if cli_args.qalr_v3_gate_patch_topr is not None:
+        args.qalr_v3_gate_patch_topr = cli_args.qalr_v3_gate_patch_topr
+    if cli_args.qalr_v3_gate_candidate_rank_max is not None:
+        args.qalr_v3_gate_candidate_rank_max = cli_args.qalr_v3_gate_candidate_rank_max
+    if cli_args.qalr_v3_gate_local_rank_max is not None:
+        args.qalr_v3_gate_local_rank_max = cli_args.qalr_v3_gate_local_rank_max
+    if cli_args.qalr_v3_gate_global_margin_max is not None:
+        args.qalr_v3_gate_global_margin_max = cli_args.qalr_v3_gate_global_margin_max
+    if cli_args.qalr_v3_gate_local_gap_min is not None:
+        args.qalr_v3_gate_local_gap_min = cli_args.qalr_v3_gate_local_gap_min
+    if cli_args.qalr_v3_gate_save_diag is not None:
+        args.qalr_v3_gate_save_diag = cli_args.qalr_v3_gate_save_diag
+    if cli_args.qalr_v3_gate_diag_file is not None:
+        args.qalr_v3_gate_diag_file = cli_args.qalr_v3_gate_diag_file
     if cli_args.use_uspc_slot_rerank is not None:
         args.use_uspc_slot_rerank = cli_args.use_uspc_slot_rerank
     if cli_args.uspc_slot_rerank_topk is not None:
@@ -447,6 +480,87 @@ if __name__ == "__main__":
         default=None,
         action="store_false",
         help="omit optional candidate-level score fields in QALR v3 diagnostics",
+    )
+    parser.add_argument(
+        "--use_qalr_v3_gate",
+        default=None,
+        action="store_true",
+        help="enable QALR v3 gated top1 promotion rerank",
+    )
+    parser.add_argument(
+        "--no_use_qalr_v3_gate",
+        dest="use_qalr_v3_gate",
+        default=None,
+        action="store_false",
+        help="disable QALR v3 gated top1 promotion rerank",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_mode",
+        type=str,
+        default=None,
+        choices=["concat", "avg", "rgb", "thermal"],
+        help="QALR v3 gate local score mode",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_topk",
+        type=int,
+        default=None,
+        help="global top-K candidate pool for QALR v3 gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_token_topm",
+        type=int,
+        default=None,
+        help="number of salient text tokens used for QALR v3 gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_patch_topr",
+        type=int,
+        default=None,
+        help="number of top patches per token used for QALR v3 gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_candidate_rank_max",
+        type=int,
+        default=None,
+        help="maximum global candidate rank allowed for QALR v3 gate promotion",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_local_rank_max",
+        type=int,
+        default=None,
+        help="maximum local rank allowed for QALR v3 gate promotion",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_global_margin_max",
+        type=float,
+        default=None,
+        help="maximum global top1-top2 margin allowed for QALR v3 gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_local_gap_min",
+        type=float,
+        default=None,
+        help="minimum local score gap over old top1 required for QALR v3 gate",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_save_diag",
+        default=None,
+        action="store_true",
+        help="save QALR v3 gate per-query diagnostics",
+    )
+    parser.add_argument(
+        "--no_qalr_v3_gate_save_diag",
+        dest="qalr_v3_gate_save_diag",
+        default=None,
+        action="store_false",
+        help="disable QALR v3 gate diagnostics",
+    )
+    parser.add_argument(
+        "--qalr_v3_gate_diag_file",
+        type=str,
+        default=None,
+        help="QALR v3 gate diagnostics json output file",
     )
     parser.add_argument(
         "--use_uspc_slot_rerank",

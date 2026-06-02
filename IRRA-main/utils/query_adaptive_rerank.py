@@ -797,6 +797,371 @@ class QueryAdaptiveLocalReranker(object):
             "candidates": candidates,
         }
 
+    def gate_rerank(
+        self,
+        query_token_embeddings,
+        query_token_ids,
+        query_global_embeddings,
+        gallery_rgb_patch_tokens,
+        gallery_thermal_patch_tokens,
+        global_similarity,
+        qids=None,
+        gids=None,
+        mode="concat",
+        candidate_rank_max=2,
+        local_rank_max=1,
+        global_margin_max=0.01,
+        local_gap_min=0.01,
+        return_stats=False,
+        return_diagnostics=False,
+    ):
+        mode = str(mode).lower()
+        if mode not in {"concat", "avg", "rgb", "thermal"}:
+            raise ValueError(f"Unsupported qalr_v3_gate_mode={mode!r}.")
+
+        candidate_rank_max = int(candidate_rank_max)
+        local_rank_max = int(local_rank_max)
+        global_margin_max = float(global_margin_max)
+        local_gap_min = float(local_gap_min)
+
+        num_query, num_gallery = global_similarity.shape
+        if (
+            num_query == 0
+            or num_gallery == 0
+            or candidate_rank_max <= 1
+            or local_rank_max <= 0
+        ):
+            stats = {
+                "diagnostic_summary": {
+                    "total_queries": int(num_query),
+                    "changed_top1_count": 0,
+                    "improved_top1_count": 0,
+                    "hurt_top1_count": 0,
+                    "neutral_changed_top1_count": 0,
+                    "net_top1_gain": 0,
+                },
+                "query_diagnostics": [],
+                "effective_topk": int(min(self.topk, num_gallery))
+                if num_gallery > 0
+                else 0,
+                "qalr_v3_gate_mode": mode,
+                "qalr_v3_gate_candidate_rank_max": int(candidate_rank_max),
+                "qalr_v3_gate_local_rank_max": int(local_rank_max),
+                "qalr_v3_gate_global_margin_max": float(global_margin_max),
+                "qalr_v3_gate_local_gap_min": float(local_gap_min),
+            }
+            if return_stats:
+                return global_similarity, stats
+            return global_similarity
+
+        effective_topk = min(self.topk, num_gallery)
+        original_order = torch.argsort(global_similarity, dim=1, descending=True)
+        topk_indices = original_order[:, :effective_topk]
+        top12_margin = self._compute_top12_margin(global_similarity)
+
+        rgb_patch_pool = F.normalize(gallery_rgb_patch_tokens.float(), p=2, dim=-1)
+        if (
+            gallery_thermal_patch_tokens is not None
+            and gallery_thermal_patch_tokens.shape[1] > 0
+        ):
+            thermal_patch_pool = F.normalize(
+                gallery_thermal_patch_tokens.float(), p=2, dim=-1
+            )
+        else:
+            thermal_patch_pool = None
+        concat_patch_pool = F.normalize(
+            self._build_patch_pool(
+                gallery_rgb_patch_tokens, gallery_thermal_patch_tokens
+            ).float(),
+            p=2,
+            dim=-1,
+        )
+
+        salient_query_tokens, salient_token_weights = self._select_salient_tokens(
+            query_token_embeddings=query_token_embeddings,
+            query_token_ids=query_token_ids,
+            query_global_embeddings=query_global_embeddings,
+        )
+        concat_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        rgb_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        thermal_local_scores = global_similarity.new_zeros((num_query, effective_topk))
+        for q_start in range(0, num_query, self.query_chunk_size):
+            q_end = min(q_start + self.query_chunk_size, num_query)
+            query_tokens_chunk = salient_query_tokens[q_start:q_end]
+            token_weights_chunk = salient_token_weights[q_start:q_end]
+            topk_indices_chunk = topk_indices[q_start:q_end]
+            concat_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                query_tokens_chunk,
+                token_weights_chunk,
+                concat_patch_pool,
+                topk_indices_chunk,
+            )
+            rgb_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                query_tokens_chunk,
+                token_weights_chunk,
+                rgb_patch_pool,
+                topk_indices_chunk,
+            )
+            if thermal_patch_pool is None:
+                thermal_local_scores[q_start:q_end] = rgb_local_scores[q_start:q_end]
+            else:
+                thermal_local_scores[q_start:q_end] = self._compute_local_scores_from_pool(
+                    query_tokens_chunk,
+                    token_weights_chunk,
+                    thermal_patch_pool,
+                    topk_indices_chunk,
+                )
+
+        avg_local_scores = 0.5 * (rgb_local_scores + thermal_local_scores)
+        if mode == "concat":
+            local_scores = concat_local_scores
+        elif mode == "avg":
+            local_scores = avg_local_scores
+        elif mode == "rgb":
+            local_scores = rgb_local_scores
+        else:
+            local_scores = thermal_local_scores
+
+        local_ranks = self._rank_positions_desc(local_scores)
+        position = (
+            torch.arange(effective_topk, device=global_similarity.device)
+            .unsqueeze(0)
+            .expand(num_query, -1)
+        )
+        candidate_rank = position + 1
+        local_gap = local_scores - local_scores[:, :1]
+        eligible_mask = (
+            (position > 0)
+            & (candidate_rank <= candidate_rank_max)
+            & (local_ranks <= local_rank_max)
+            & (top12_margin.unsqueeze(1) < global_margin_max)
+            & (local_gap > local_gap_min)
+        )
+
+        selection_scores = local_scores.masked_fill(~eligible_mask, float("-inf"))
+        selected_local_scores, selected_positions = selection_scores.max(dim=1)
+        has_selection = torch.isfinite(selected_local_scores)
+        ranking_order = original_order.clone()
+        for query_index in has_selection.nonzero(as_tuple=False).view(-1):
+            query_index = int(query_index.item())
+            selected_pos = int(selected_positions[query_index].item())
+            selected_index = topk_indices[query_index, selected_pos]
+            current_order = ranking_order[query_index]
+            remaining_order = current_order[current_order != selected_index]
+            ranking_order[query_index] = torch.cat(
+                [selected_index.view(1), remaining_order],
+                dim=0,
+            )
+
+        rank_scores = torch.arange(
+            num_gallery,
+            0,
+            -1,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        ).unsqueeze(0).expand(num_query, -1)
+        reranked_similarity = torch.empty(
+            global_similarity.shape,
+            device=global_similarity.device,
+            dtype=torch.float32,
+        )
+        reranked_similarity.scatter_(
+            dim=1,
+            index=ranking_order,
+            src=rank_scores,
+        )
+
+        queries, summary = self._build_gate_diagnostics(
+            qids=qids,
+            gids=gids,
+            original_order=original_order,
+            ranking_order=ranking_order,
+            topk_indices=topk_indices,
+            local_scores=local_scores,
+            local_ranks=local_ranks,
+            local_gap=local_gap,
+            top12_margin=top12_margin,
+            selected_positions=selected_positions,
+            has_selection=has_selection,
+            mode=mode,
+            candidate_rank_max=candidate_rank_max,
+            local_rank_max=local_rank_max,
+            global_margin_max=global_margin_max,
+            local_gap_min=local_gap_min,
+            include_queries=return_diagnostics,
+        )
+        topk_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, :effective_topk], dim=1).values,
+            torch.sort(original_order[:, :effective_topk], dim=1).values,
+        )
+        tail_membership_safe = torch.equal(
+            torch.sort(ranking_order[:, effective_topk:], dim=1).values,
+            torch.sort(original_order[:, effective_topk:], dim=1).values,
+        )
+        stats = {
+            "diagnostic_summary": summary,
+            "query_diagnostics": queries,
+            "effective_topk": int(effective_topk),
+            "changed_top1_count": int(summary.get("changed_top1_count", 0)),
+            "qalr_v3_gate_enabled": True,
+            "qalr_v3_gate_mode": mode,
+            "qalr_v3_gate_candidate_rank_max": int(candidate_rank_max),
+            "qalr_v3_gate_local_rank_max": int(local_rank_max),
+            "qalr_v3_gate_global_margin_max": float(global_margin_max),
+            "qalr_v3_gate_local_gap_min": float(local_gap_min),
+            "qalr_v3_gate_topk_boundary_safe": bool(
+                topk_membership_safe and tail_membership_safe
+            ),
+        }
+        if return_stats:
+            return reranked_similarity, stats
+        return reranked_similarity
+
+    def _build_gate_diagnostics(
+        self,
+        qids,
+        gids,
+        original_order,
+        ranking_order,
+        topk_indices,
+        local_scores,
+        local_ranks,
+        local_gap,
+        top12_margin,
+        selected_positions,
+        has_selection,
+        mode,
+        candidate_rank_max,
+        local_rank_max,
+        global_margin_max,
+        local_gap_min,
+        include_queries,
+    ):
+        original_cpu = original_order.detach().cpu().long()
+        ranking_cpu = ranking_order.detach().cpu().long()
+        topk_cpu = topk_indices.detach().cpu().long()
+        local_scores_cpu = local_scores.detach().cpu().float()
+        local_ranks_cpu = local_ranks.detach().cpu().long()
+        local_gap_cpu = local_gap.detach().cpu().float()
+        margin_cpu = top12_margin.detach().cpu().float()
+        selected_cpu = selected_positions.detach().cpu().long()
+        has_selection_cpu = has_selection.detach().cpu().bool()
+        qids_cpu = qids.detach().cpu().long().view(-1) if qids is not None else None
+        gids_cpu = gids.detach().cpu().long().view(-1) if gids is not None else None
+
+        queries = []
+        changed_count = 0
+        improved_count = 0
+        hurt_count = 0
+        neutral_count = 0
+        old_correct_count = 0
+        new_correct_count = 0
+        for query_index in range(original_cpu.shape[0]):
+            old_top1_index = int(original_cpu[query_index, 0].item())
+            new_top1_index = int(ranking_cpu[query_index, 0].item())
+            changed_top1 = old_top1_index != new_top1_index
+
+            q_pid = None
+            old_top1_pid = None
+            new_top1_pid = None
+            gt_match_old = False
+            gt_match_new = False
+            if qids_cpu is not None and gids_cpu is not None:
+                q_pid = int(qids_cpu[query_index].item())
+                old_top1_pid = int(gids_cpu[old_top1_index].item())
+                new_top1_pid = int(gids_cpu[new_top1_index].item())
+                gt_match_old = old_top1_pid == q_pid
+                gt_match_new = new_top1_pid == q_pid
+                if gt_match_old:
+                    old_correct_count += 1
+                if gt_match_new:
+                    new_correct_count += 1
+
+            improved_top1 = (not gt_match_old) and gt_match_new
+            hurt_top1 = gt_match_old and (not gt_match_new)
+            neutral_changed_top1 = (
+                changed_top1 and (not improved_top1) and (not hurt_top1)
+            )
+            if changed_top1:
+                changed_count += 1
+            if improved_top1:
+                improved_count += 1
+            if hurt_top1:
+                hurt_count += 1
+            if neutral_changed_top1:
+                neutral_count += 1
+
+            selected_candidate_global_rank = None
+            selected_candidate_local_rank = None
+            selected_local_gap = None
+            if bool(has_selection_cpu[query_index].item()):
+                selected_pos = int(selected_cpu[query_index].item())
+                selected_candidate_global_rank = selected_pos + 1
+                selected_candidate_local_rank = int(
+                    local_ranks_cpu[query_index, selected_pos].item()
+                )
+                selected_local_gap = self._safe_float(
+                    local_gap_cpu[query_index, selected_pos].item()
+                )
+
+            if include_queries:
+                queries.append(
+                    {
+                        "query_index": int(query_index),
+                        "q_pid": q_pid,
+                        "old_top1_index": old_top1_index,
+                        "old_top1_pid": old_top1_pid,
+                        "new_top1_index": new_top1_index,
+                        "new_top1_pid": new_top1_pid,
+                        "changed_top1": bool(changed_top1),
+                        "improved_top1": bool(improved_top1),
+                        "hurt_top1": bool(hurt_top1),
+                        "neutral_changed_top1": bool(neutral_changed_top1),
+                        "global_top12_margin": self._safe_float(
+                            margin_cpu[query_index].item()
+                        ),
+                        "local_gap": selected_local_gap,
+                        "local_score_old_top1": self._safe_float(
+                            local_scores_cpu[query_index, 0].item()
+                        ),
+                        "local_score_new_top1": self._lookup_topk_local_score(
+                            topk_cpu[query_index],
+                            local_scores_cpu[query_index],
+                            new_top1_index,
+                        ),
+                        "selected_candidate_global_rank": selected_candidate_global_rank,
+                        "selected_candidate_local_rank": selected_candidate_local_rank,
+                        "gate_mode": str(mode),
+                        "gate_candidate_rank_max": int(candidate_rank_max),
+                        "gate_local_rank_max": int(local_rank_max),
+                        "gate_global_margin_max": float(global_margin_max),
+                        "gate_local_gap_min": float(local_gap_min),
+                    }
+                )
+
+        total_queries = int(original_cpu.shape[0])
+        summary = {
+            "total_queries": total_queries,
+            "changed_top1_count": int(changed_count),
+            "improved_top1_count": int(improved_count),
+            "hurt_top1_count": int(hurt_count),
+            "neutral_changed_top1_count": int(neutral_count),
+            "net_top1_gain": int(improved_count - hurt_count),
+            "old_top1_correct": int(old_correct_count),
+            "new_top1_correct": int(new_correct_count),
+            "old_R1": (
+                100.0 * float(old_correct_count) / float(total_queries)
+                if total_queries > 0 and qids_cpu is not None and gids_cpu is not None
+                else None
+            ),
+            "R1": (
+                100.0 * float(new_correct_count) / float(total_queries)
+                if total_queries > 0 and qids_cpu is not None and gids_cpu is not None
+                else None
+            ),
+        }
+        return queries, summary
+
     def _build_focus_candidate_mask(self, global_similarity, topk_indices, effective_topk):
         num_query = global_similarity.shape[0]
         if not self.use_focus_topn:

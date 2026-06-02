@@ -269,6 +269,17 @@ def get_args():
     parser.add_argument("--qalr_v3_candidate_token_topm", type=int, default=8, help="number of salient text tokens for QALR v3 candidate diagnostics")
     parser.add_argument("--qalr_v3_candidate_patch_topr", type=int, default=4, help="number of top patches per token for QALR v3 candidate diagnostics")
     parser.add_argument("--qalr_v3_candidate_save_scores", default=False, action='store_true', help="save candidate-level score fields in QALR v3 diagnostics")
+    parser.add_argument("--use_qalr_v3_gate", default=False, action='store_true', help="enable QALR v3 gated top1 promotion rerank")
+    parser.add_argument("--qalr_v3_gate_mode", type=str, default="concat", choices=["concat", "avg", "rgb", "thermal"], help="QALR v3 gate local score mode")
+    parser.add_argument("--qalr_v3_gate_topk", type=int, default=64, help="global top-K candidate pool for QALR v3 gate")
+    parser.add_argument("--qalr_v3_gate_token_topm", type=int, default=8, help="number of salient text tokens for QALR v3 gate")
+    parser.add_argument("--qalr_v3_gate_patch_topr", type=int, default=4, help="number of top patches per token for QALR v3 gate")
+    parser.add_argument("--qalr_v3_gate_candidate_rank_max", type=int, default=2, help="maximum global candidate rank allowed for QALR v3 gate promotion")
+    parser.add_argument("--qalr_v3_gate_local_rank_max", type=int, default=1, help="maximum local rank allowed for QALR v3 gate promotion")
+    parser.add_argument("--qalr_v3_gate_global_margin_max", type=float, default=0.01, help="maximum global top1-top2 margin allowed for QALR v3 gate")
+    parser.add_argument("--qalr_v3_gate_local_gap_min", type=float, default=0.01, help="minimum local score gap over old top1 required for QALR v3 gate")
+    parser.add_argument("--qalr_v3_gate_save_diag", default=False, action='store_true', help="save QALR v3 gate per-query diagnostics")
+    parser.add_argument("--qalr_v3_gate_diag_file", type=str, default="", help="QALR v3 gate diagnostics json output file")
 
     ######################## inference-only USPC text-slot local rerank ########################
     # Evaluation-only USPC-v2C switch. This does not add training losses or checkpoint weights.

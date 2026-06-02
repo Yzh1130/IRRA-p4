@@ -457,12 +457,15 @@ class Evaluator():
         self,
         use_qalr,
         use_qalr_v2,
+        use_qalr_v3_gate,
         use_transport_rerank,
         use_uspc_slot_rerank,
         use_mtp_eval_fusion,
     ):
         if use_transport_rerank:
             return "transport_rerank_score"
+        if use_qalr_v3_gate:
+            return "qalr_v3_gate_rank_score"
         if use_qalr_v2:
             return "qalr_v2_rank_score"
         if use_qalr:
@@ -554,6 +557,39 @@ class Evaluator():
             "qalr_v3_candidate_save_scores": bool(
                 getattr(model_args, "qalr_v3_candidate_save_scores", False)
             ),
+            "use_qalr_v3_gate": bool(
+                getattr(model_args, "use_qalr_v3_gate", False)
+            ),
+            "qalr_v3_gate_mode": str(
+                getattr(model_args, "qalr_v3_gate_mode", "concat")
+            ),
+            "qalr_v3_gate_topk": int(
+                getattr(model_args, "qalr_v3_gate_topk", 64)
+            ),
+            "qalr_v3_gate_token_topm": int(
+                getattr(model_args, "qalr_v3_gate_token_topm", 8)
+            ),
+            "qalr_v3_gate_patch_topr": int(
+                getattr(model_args, "qalr_v3_gate_patch_topr", 4)
+            ),
+            "qalr_v3_gate_candidate_rank_max": int(
+                getattr(model_args, "qalr_v3_gate_candidate_rank_max", 2)
+            ),
+            "qalr_v3_gate_local_rank_max": int(
+                getattr(model_args, "qalr_v3_gate_local_rank_max", 1)
+            ),
+            "qalr_v3_gate_global_margin_max": float(
+                getattr(model_args, "qalr_v3_gate_global_margin_max", 0.01)
+            ),
+            "qalr_v3_gate_local_gap_min": float(
+                getattr(model_args, "qalr_v3_gate_local_gap_min", 0.01)
+            ),
+            "qalr_v3_gate_save_diag": bool(
+                getattr(model_args, "qalr_v3_gate_save_diag", False)
+            ),
+            "qalr_v3_gate_diag_file": str(
+                getattr(model_args, "qalr_v3_gate_diag_file", "")
+            ),
         }
 
     def _maybe_save_eval_scores(
@@ -566,6 +602,7 @@ class Evaluator():
         metrics,
         use_qalr,
         use_qalr_v2,
+        use_qalr_v3_gate,
         use_transport_rerank,
         use_uspc_slot_rerank,
         use_mtp_eval_fusion,
@@ -593,6 +630,7 @@ class Evaluator():
         score_semantics = self._score_semantics(
             use_qalr=use_qalr,
             use_qalr_v2=use_qalr_v2,
+            use_qalr_v3_gate=use_qalr_v3_gate,
             use_transport_rerank=use_transport_rerank,
             use_uspc_slot_rerank=use_uspc_slot_rerank,
             use_mtp_eval_fusion=use_mtp_eval_fusion,
@@ -604,6 +642,7 @@ class Evaluator():
             "score_semantics": score_semantics,
             "use_qalr": bool(use_qalr),
             "use_qalr_v2": bool(use_qalr_v2),
+            "use_qalr_v3_gate": bool(use_qalr_v3_gate),
             "use_qalr_v3_candidate_diag": bool(
                 getattr(model_args, "qalr_v3_candidate_diag", False)
             ),
@@ -836,6 +875,70 @@ class Evaluator():
             int(summary.get("wrong_old_top1_but_gt_in_topk", 0)),
             int(summary.get("oracle_topk_possible_gain", 0)),
             float(summary.get("oracle_topk_possible_R1", 0.0)),
+        )
+
+    def _save_qalr_v3_gate_diagnostics(self, model_args, rerank_stats):
+        if model_args is None or not bool(
+            getattr(model_args, "qalr_v3_gate_save_diag", False)
+        ):
+            return
+        diag_file = str(getattr(model_args, "qalr_v3_gate_diag_file", "")).strip()
+        if not diag_file:
+            diag_file = os.path.join(
+                str(getattr(model_args, "output_dir", ".")),
+                "qalr_v3_gate_diag.json",
+            )
+        diag_file = os.path.abspath(diag_file)
+        diag_dir = os.path.dirname(diag_file)
+        if diag_dir:
+            os.makedirs(diag_dir, exist_ok=True)
+
+        summary = dict(rerank_stats.get("diagnostic_summary", {}))
+        payload = {
+            "summary": summary,
+            "queries": list(rerank_stats.get("query_diagnostics", [])),
+            "config": {
+                "use_qalr_v3_gate": bool(
+                    getattr(model_args, "use_qalr_v3_gate", False)
+                ),
+                "qalr_v3_gate_mode": str(
+                    getattr(model_args, "qalr_v3_gate_mode", "concat")
+                ),
+                "qalr_v3_gate_topk": int(
+                    getattr(model_args, "qalr_v3_gate_topk", 64)
+                ),
+                "qalr_v3_gate_token_topm": int(
+                    getattr(model_args, "qalr_v3_gate_token_topm", 8)
+                ),
+                "qalr_v3_gate_patch_topr": int(
+                    getattr(model_args, "qalr_v3_gate_patch_topr", 4)
+                ),
+                "qalr_v3_gate_candidate_rank_max": int(
+                    getattr(model_args, "qalr_v3_gate_candidate_rank_max", 2)
+                ),
+                "qalr_v3_gate_local_rank_max": int(
+                    getattr(model_args, "qalr_v3_gate_local_rank_max", 1)
+                ),
+                "qalr_v3_gate_global_margin_max": float(
+                    getattr(model_args, "qalr_v3_gate_global_margin_max", 0.01)
+                ),
+                "qalr_v3_gate_local_gap_min": float(
+                    getattr(model_args, "qalr_v3_gate_local_gap_min", 0.01)
+                ),
+                "dataset_name": str(getattr(model_args, "dataset_name", "")),
+                "eval_dataset": str(getattr(model_args, "eval_dataset", "")),
+                "config_file": str(getattr(model_args, "config_file", "")),
+                "test_ckpt_file": str(getattr(model_args, "test_ckpt_file", "")),
+                "model_name": str(getattr(model_args, "name", "")),
+                "score_source": "pre_qalr_v3_gate_global_similarity",
+            },
+        }
+        with open(diag_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        self.logger.info(
+            "[QALR_V3_GATE_DIAG_DUMP] path=%s queries=%d",
+            diag_file,
+            len(payload["queries"]),
         )
 
     def _get_query_raw_captions(self, expected_count):
@@ -1297,6 +1400,9 @@ class Evaluator():
                 False,
             )
         )
+        use_qalr_v3_gate = bool(
+            getattr(getattr(model, "args", None), "use_qalr_v3_gate", False)
+        )
         use_transport_rerank = bool(
             getattr(getattr(model, "args", None), "use_transport_rerank", False)
         )
@@ -1306,28 +1412,32 @@ class Evaluator():
         use_mtp_eval_fusion = bool(
             getattr(getattr(model, "args", None), "use_modality_text_prompt", False)
         )
-        if use_uspc_slot_rerank and (use_qalr or use_qalr_v2 or use_transport_rerank):
+        if use_uspc_slot_rerank and (
+            use_qalr or use_qalr_v2 or use_qalr_v3_gate or use_transport_rerank
+        ):
             self.logger.warning(
                 "USPC slot rerank is an inference-time rerank experiment and should "
                 "not be mixed with QALR/QALR-v2 or transport rerank. Disable "
-                "--use_qalr, --use_qalr_v2 and --use_transport_rerank before "
+                "--use_qalr, --use_qalr_v2, --use_qalr_v3_gate and "
+                "--use_transport_rerank before "
                 "running --use_uspc_slot_rerank."
             )
             raise RuntimeError(
                 "use_uspc_slot_rerank=True is mutually exclusive with QALR, "
-                "QALR-v2 or transport rerank."
+                "QALR-v2, QALR-v3 gate or transport rerank."
             )
         return_local_tokens = bool(
             return_local_tokens
             or use_qalr
             or use_qalr_v2
             or use_qalr_v3_candidate_diag
+            or use_qalr_v3_gate
             or use_transport_rerank
             or use_uspc_slot_rerank
         )
         model_args = getattr(model, "args", None)
         self.logger.info(
-            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_qalr_v2=%s qalr_v3_candidate_diag=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
+            "[EVAL_MODEL_FLAGS] source=%s model_training=%s args_training=%s eval_use_fused_mu=%s eval_use_mu_only=%s use_precision_fusion=%s use_global_uncertainty=%s use_rgbt_add_fusion=%s use_batch_uncertainty=%s use_id_uncertainty=%s use_qalr=%s use_qalr_v2=%s qalr_v3_candidate_diag=%s use_qalr_v3_gate=%s use_transport_rerank=%s use_uspc_slot_rerank=%s use_modality_text_prompt=%s",
             self.source,
             bool(getattr(model, "training", False)),
             bool(getattr(model_args, "training", False)),
@@ -1341,6 +1451,7 @@ class Evaluator():
             use_qalr,
             use_qalr_v2,
             use_qalr_v3_candidate_diag,
+            use_qalr_v3_gate,
             use_transport_rerank,
             use_uspc_slot_rerank,
             use_mtp_eval_fusion,
@@ -1431,6 +1542,74 @@ class Evaluator():
                 model_args=model.args,
                 payload=candidate_diag_payload,
             )
+        if use_qalr_v3_gate:
+            gate_reranker = QueryAdaptiveLocalReranker(
+                topk=int(getattr(model.args, "qalr_v3_gate_topk", 64)),
+                alpha=0.0,
+                token_topm=int(getattr(model.args, "qalr_v3_gate_token_topm", 8)),
+                patch_topr=int(getattr(model.args, "qalr_v3_gate_patch_topr", 4)),
+                vocab_size=int(getattr(model.args, "vocab_size", 49408)),
+            )
+            similarity, gate_stats = gate_reranker.gate_rerank(
+                query_token_embeddings=embedding_outputs["query_token_embeddings"],
+                query_token_ids=embedding_outputs["query_token_ids"],
+                query_global_embeddings=embedding_outputs["query_global_embeddings"],
+                gallery_rgb_patch_tokens=embedding_outputs["gallery_rgb_patch_tokens"],
+                gallery_thermal_patch_tokens=embedding_outputs[
+                    "gallery_thermal_patch_tokens"
+                ],
+                global_similarity=similarity,
+                qids=qids,
+                gids=gids,
+                mode=str(getattr(model.args, "qalr_v3_gate_mode", "concat")),
+                candidate_rank_max=int(
+                    getattr(model.args, "qalr_v3_gate_candidate_rank_max", 2)
+                ),
+                local_rank_max=int(
+                    getattr(model.args, "qalr_v3_gate_local_rank_max", 1)
+                ),
+                global_margin_max=float(
+                    getattr(model.args, "qalr_v3_gate_global_margin_max", 0.01)
+                ),
+                local_gap_min=float(
+                    getattr(model.args, "qalr_v3_gate_local_gap_min", 0.01)
+                ),
+                return_stats=True,
+                return_diagnostics=bool(
+                    getattr(model.args, "qalr_v3_gate_save_diag", False)
+                ),
+            )
+            if use_qalr or use_qalr_v2:
+                self.logger.warning(
+                    "QALR v3 gate is enabled together with old QALR/QALR-v2. "
+                    "QALR v3 gate takes precedence and earlier QALR variants are skipped."
+                )
+            gate_summary = gate_stats.get("diagnostic_summary", {})
+            self.logger.info(
+                "[QALR_V3_GATE] enabled=True mode=%s topk=%d token_topm=%d patch_topr=%d candidate_rank_max=%d local_rank_max=%d global_margin_max=%.6f local_gap_min=%.6f topk_boundary_safe=%s",
+                str(getattr(model.args, "qalr_v3_gate_mode", "concat")),
+                int(getattr(model.args, "qalr_v3_gate_topk", 64)),
+                int(getattr(model.args, "qalr_v3_gate_token_topm", 8)),
+                int(getattr(model.args, "qalr_v3_gate_patch_topr", 4)),
+                int(getattr(model.args, "qalr_v3_gate_candidate_rank_max", 2)),
+                int(getattr(model.args, "qalr_v3_gate_local_rank_max", 1)),
+                float(getattr(model.args, "qalr_v3_gate_global_margin_max", 0.01)),
+                float(getattr(model.args, "qalr_v3_gate_local_gap_min", 0.01)),
+                str(gate_stats.get("qalr_v3_gate_topk_boundary_safe", False)),
+            )
+            self.logger.info(
+                "[QALR_V3_GATE_DIAG] changed=%d improved=%d hurt=%d neutral=%d net=%d R1=%s",
+                int(gate_summary.get("changed_top1_count", 0)),
+                int(gate_summary.get("improved_top1_count", 0)),
+                int(gate_summary.get("hurt_top1_count", 0)),
+                int(gate_summary.get("neutral_changed_top1_count", 0)),
+                int(gate_summary.get("net_top1_gain", 0)),
+                str(gate_summary.get("R1", None)),
+            )
+            self._save_qalr_v3_gate_diagnostics(
+                model_args=model.args,
+                rerank_stats=gate_stats,
+            )
         if use_uspc_slot_rerank:
             similarity, uspc_slot_rerank_stats = self._apply_uspc_slot_rerank(
                 model=model,
@@ -1486,7 +1665,7 @@ class Evaluator():
                         )
                     ),
                 )
-        if use_qalr and not use_qalr_v2:
+        if use_qalr and not use_qalr_v2 and not use_qalr_v3_gate:
             use_qalr_score_norm = bool(
                 getattr(model.args, "use_qalr_score_norm", False)
             )
@@ -1622,7 +1801,7 @@ class Evaluator():
                     use_qalr_v2=False,
                 )
 
-        if use_qalr_v2:
+        if use_qalr_v2 and not use_qalr_v3_gate:
             use_qalr_score_norm = bool(
                 getattr(model.args, "use_qalr_score_norm", False)
             )
@@ -1752,9 +1931,9 @@ class Evaluator():
             )
 
         if use_transport_rerank:
-            if use_qalr or use_qalr_v2:
+            if use_qalr or use_qalr_v2 or use_qalr_v3_gate:
                 self.logger.warning(
-                    "QALR/QALR-v2 and use_transport_rerank are both enabled. "
+                    "QALR/QALR-v2/QALR-v3 gate and use_transport_rerank are both enabled. "
                     "Transport rerank will use baseline global similarity and "
                     "override the earlier QALR scores."
                 )
@@ -1846,6 +2025,7 @@ class Evaluator():
             metrics=self.last_eval_result,
             use_qalr=use_qalr,
             use_qalr_v2=use_qalr_v2,
+            use_qalr_v3_gate=use_qalr_v3_gate,
             use_transport_rerank=use_transport_rerank,
             use_uspc_slot_rerank=use_uspc_slot_rerank,
             use_mtp_eval_fusion=use_mtp_eval_fusion,
