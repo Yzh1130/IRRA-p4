@@ -120,6 +120,13 @@ def parse_args():
     parser.add_argument("--holdout_pid_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit_queries", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument(
+        "--force_fp32_cpu",
+        default=True,
+        action="store_true",
+        help="force model.float() when the resolved device is CPU",
+    )
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
     return parser.parse_args()
 
@@ -134,6 +141,26 @@ def set_seed(seed):
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+
+
+def resolve_device(device_arg):
+    device_arg = str(device_arg).lower()
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device=cuda was requested, but CUDA is not available.")
+    return device
+
+
+def log_runtime_device_state(lines, model, device, split_name=None):
+    first_param = next(model.parameters())
+    prefix = "[QALR_V4_GATE_DATASET]"
+    if split_name is not None:
+        log_line(lines, f"{prefix} split={split_name}")
+    log_line(lines, f"{prefix} device={device}")
+    log_line(lines, f"{prefix} model_param_device={first_param.device}")
+    log_line(lines, f"{prefix} model_param_dtype={first_param.dtype}")
 
 
 def instantiate_dataset(args):
@@ -266,7 +293,7 @@ def empty_payload(split_name, metadata, topk):
     )
 
 
-def build_candidate_payload(model, eval_dict, args, split_name, split_pids):
+def build_candidate_payload(model, eval_dict, args, split_name, split_pids, log_lines=None):
     metadata = {
         "dataset_split_name": str(split_name),
         "dataset_name": str(getattr(args, "dataset_name", "")),
@@ -284,6 +311,13 @@ def build_candidate_payload(model, eval_dict, args, split_name, split_pids):
 
     img_loader, txt_loader = build_loaders(eval_dict, args)
     evaluator = Evaluator(img_loader, txt_loader, source=f"qalr_v4_gate_{split_name}")
+    if log_lines is not None:
+        log_runtime_device_state(
+            log_lines,
+            model=model,
+            device=torch.device(str(getattr(args, "device", "cpu"))),
+            split_name=split_name,
+        )
     embedding_outputs = evaluator._compute_embedding(
         model,
         return_local_tokens=True,
@@ -416,10 +450,12 @@ def main():
     log_lines = []
     load_project_modules()
     set_seed(cli_args.seed)
+    device = resolve_device(cli_args.device)
 
     args = load_train_configs(cli_args.config_file)
     args.training = False
     args.distributed = False
+    args.device = str(device)
     args.config_file = op.abspath(cli_args.config_file)
     args.test_ckpt_file = op.abspath(cli_args.ckpt_file)
     args.qalr_v4_source_split = str(cli_args.split)
@@ -438,6 +474,9 @@ def main():
     log_line(log_lines, f"holdout_pid_ratio={cli_args.holdout_pid_ratio}")
     log_line(log_lines, f"seed={cli_args.seed}")
     log_line(log_lines, f"limit_queries={cli_args.limit_queries}")
+    log_line(log_lines, f"device_arg={cli_args.device}")
+    log_line(log_lines, f"resolved_device={device}")
+    log_line(log_lines, f"force_fp32_cpu={bool(cli_args.force_fp32_cpu)}")
 
     dataset = instantiate_dataset(args)
     full_eval_dict = build_eval_style_split(dataset, cli_args.split)
@@ -467,9 +506,11 @@ def main():
     num_classes = len(dataset.train_id_container)
     model = build_model(args, num_classes=num_classes)
     load_checkpoint_for_eval(model, args, cli_args.ckpt_file)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
+    if device.type == "cpu" and bool(cli_args.force_fp32_cpu):
+        model.float()
     model.eval()
+    log_runtime_device_state(log_lines, model=model, device=device)
 
     with torch.no_grad():
         train_payload = build_candidate_payload(
@@ -478,6 +519,7 @@ def main():
             args=args,
             split_name="train",
             split_pids=train_pids,
+            log_lines=log_lines,
         )
         holdout_payload = build_candidate_payload(
             model=model,
@@ -485,6 +527,7 @@ def main():
             args=args,
             split_name="holdout",
             split_pids=holdout_pids,
+            log_lines=log_lines,
         )
 
     train_path = op.join(cli_args.out_dir, "train_candidates.pt")
