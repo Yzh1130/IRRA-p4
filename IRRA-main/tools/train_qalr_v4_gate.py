@@ -22,8 +22,8 @@ from utils.qalr_v4_gate import (
 )
 
 
-THRESHOLDS = [0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.98]
-CANDIDATE_RANK_MAX_VALUES = [2, 3, 5]
+THRESHOLDS = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98]
+CANDIDATE_RANK_MAX_VALUES = [2, 3, 5, 10]
 
 
 def parse_args():
@@ -46,6 +46,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--target_type", type=str, default="promote", choices=["match", "promote"])
+    parser.add_argument(
+        "--ignore_old_top1_candidate",
+        default=True,
+        action="store_true",
+        help="ignore candidate_global_rank=1 rows when target_type=promote",
+    )
+    parser.add_argument("--old_correct_negative_weight", type=float, default=1.0)
+    parser.add_argument("--neutral_negative_weight", type=float, default=0.25)
+    parser.add_argument("--hurt_negative_weight", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -96,15 +106,19 @@ def validate_feature_names(train_payload, holdout_payload):
     return train_names
 
 
-def weighted_bce_loss(logits, labels, pos_weight):
-    return F.binary_cross_entropy_with_logits(
+def weighted_bce_loss(logits, labels, pos_weight, sample_weight=None):
+    loss = F.binary_cross_entropy_with_logits(
         logits,
         labels.float(),
         pos_weight=pos_weight.to(logits.device),
+        reduction="none",
     )
+    if sample_weight is not None:
+        loss = loss * sample_weight.to(logits.device).float()
+    return loss.mean()
 
 
-def focal_loss(logits, labels, pos_weight, gamma=2.0):
+def focal_loss(logits, labels, pos_weight, sample_weight=None, gamma=2.0):
     labels = labels.float()
     bce = F.binary_cross_entropy_with_logits(
         logits,
@@ -114,14 +128,17 @@ def focal_loss(logits, labels, pos_weight, gamma=2.0):
     )
     probs = torch.sigmoid(logits)
     pt = torch.where(labels > 0.5, probs, 1.0 - probs)
-    return ((1.0 - pt).pow(float(gamma)) * bce).mean()
+    loss = (1.0 - pt).pow(float(gamma)) * bce
+    if sample_weight is not None:
+        loss = loss * sample_weight.to(logits.device).float()
+    return loss.mean()
 
 
-def compute_loss(logits, labels, pos_weight, loss_name):
+def compute_loss(logits, labels, pos_weight, loss_name, sample_weight=None):
     if loss_name == "weighted_bce":
-        return weighted_bce_loss(logits, labels, pos_weight)
+        return weighted_bce_loss(logits, labels, pos_weight, sample_weight=sample_weight)
     if loss_name == "focal":
-        return focal_loss(logits, labels, pos_weight)
+        return focal_loss(logits, labels, pos_weight, sample_weight=sample_weight)
     raise ValueError(f"Unsupported loss={loss_name!r}.")
 
 
@@ -138,11 +155,17 @@ def predict_logits(model, features, batch_size, device):
 
 
 @torch.no_grad()
-def evaluate_loss(model, features, labels, pos_weight, loss_name, batch_size, device):
+def evaluate_loss(model, features, labels, sample_weights, pos_weight, loss_name, batch_size, device):
     if features.shape[0] == 0:
         return 0.0
     logits = predict_logits(model, features, batch_size=batch_size, device=device)
-    loss = compute_loss(logits, labels.float(), pos_weight.cpu(), loss_name)
+    loss = compute_loss(
+        logits,
+        labels.float(),
+        pos_weight.cpu(),
+        loss_name,
+        sample_weight=sample_weights,
+    )
     return float(loss.item())
 
 
@@ -173,6 +196,81 @@ def binary_auc(scores, labels):
     return float(auc.item())
 
 
+def prepare_training_targets(payload, args):
+    match_labels = payload["labels"].float()
+    num_rows = int(match_labels.numel())
+    if str(args.target_type) == "match":
+        return {
+            "labels": match_labels,
+            "sample_weights": torch.ones(num_rows, dtype=torch.float32),
+            "train_mask": torch.ones(num_rows, dtype=torch.bool),
+            "stats": {
+                "target_type": "match",
+                "action_positive_count": int(match_labels.sum().item()),
+                "action_negative_count": int(num_rows - int(match_labels.sum().item())),
+                "ignored_old_top1_count": 0,
+            },
+        }
+
+    q_pids = payload["q_pids"].long()
+    candidate_pids = payload["candidate_pids"].long()
+    candidate_global_ranks = payload["candidate_global_ranks"].long()
+    groups = payload["groups"]
+    starts = groups["starts"].long()
+    ends = groups["ends"].long()
+
+    labels = torch.zeros(num_rows, dtype=torch.float32)
+    sample_weights = torch.ones(num_rows, dtype=torch.float32)
+    train_mask = torch.ones(num_rows, dtype=torch.bool)
+    ignored_old_top1_count = 0
+
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        if end <= start:
+            continue
+        q_pid = int(q_pids[start].item())
+        ranks = candidate_global_ranks[start:end]
+        old_rel = ranks.eq(1).nonzero(as_tuple=False).view(-1)
+        old_offset = int(old_rel[0].item()) if old_rel.numel() else 0
+        old_index = int(start + old_offset)
+        old_top1_correct = int(candidate_pids[old_index].item()) == q_pid
+
+        for row_index in range(int(start), int(end)):
+            is_old_top1 = int(candidate_global_ranks[row_index].item()) == 1
+            is_match = int(candidate_pids[row_index].item()) == q_pid
+            if is_old_top1 and bool(args.ignore_old_top1_candidate):
+                train_mask[row_index] = False
+                ignored_old_top1_count += 1
+                continue
+            if (not old_top1_correct) and is_match and (not is_old_top1):
+                labels[row_index] = 1.0
+                sample_weights[row_index] = 1.0
+            else:
+                labels[row_index] = 0.0
+                if old_top1_correct and is_match:
+                    sample_weights[row_index] = float(args.neutral_negative_weight)
+                elif old_top1_correct and (not is_match):
+                    sample_weights[row_index] = float(args.hurt_negative_weight)
+                elif (not old_top1_correct) and (not is_match):
+                    sample_weights[row_index] = float(args.hurt_negative_weight)
+                else:
+                    sample_weights[row_index] = float(args.old_correct_negative_weight)
+
+    valid_labels = labels[train_mask]
+    positive_count = int(valid_labels.sum().item())
+    negative_count = int(valid_labels.numel() - positive_count)
+    return {
+        "labels": labels,
+        "sample_weights": sample_weights,
+        "train_mask": train_mask,
+        "stats": {
+            "target_type": "promote",
+            "action_positive_count": int(positive_count),
+            "action_negative_count": int(negative_count),
+            "ignored_old_top1_count": int(ignored_old_top1_count),
+        },
+    }
+
+
 def threshold_search(payload, probs):
     groups = payload["groups"]
     q_pids = payload["q_pids"].long()
@@ -200,8 +298,10 @@ def threshold_search(payload, probs):
                 old_correct = old_pid == q_pid
 
                 local_probs = probs[start:end]
-                eligible = ranks.le(int(candidate_rank_max)) & local_probs.ge(
-                    float(threshold)
+                eligible = (
+                    ranks.gt(1)
+                    & ranks.le(int(candidate_rank_max))
+                    & local_probs.ge(float(threshold))
                 )
                 if not bool(eligible.any().item()):
                     continue
@@ -307,9 +407,15 @@ def main():
     feature_names = validate_feature_names(train_payload, holdout_payload)
 
     train_features = train_payload["features"].float()
-    train_labels = train_payload["labels"].float()
     holdout_features = holdout_payload["features"].float()
-    holdout_labels = holdout_payload["labels"].float()
+    train_targets = prepare_training_targets(train_payload, args)
+    holdout_targets = prepare_training_targets(holdout_payload, args)
+    train_labels_all = train_targets["labels"].float()
+    train_sample_weights_all = train_targets["sample_weights"].float()
+    train_mask = train_targets["train_mask"].bool()
+    holdout_labels_all = holdout_targets["labels"].float()
+    holdout_sample_weights_all = holdout_targets["sample_weights"].float()
+    holdout_mask = holdout_targets["train_mask"].bool()
 
     if train_features.shape[0] == 0:
         raise ValueError("train payload has no candidates.")
@@ -320,10 +426,17 @@ def main():
     train_features_norm = apply_feature_normalizer(train_features, mean, std)
     holdout_features_norm = apply_feature_normalizer(holdout_features, mean, std)
 
+    train_features_for_loss = train_features_norm[train_mask]
+    train_labels = train_labels_all[train_mask]
+    train_sample_weights = train_sample_weights_all[train_mask]
+    holdout_features_for_loss = holdout_features_norm[holdout_mask]
+    holdout_labels = holdout_labels_all[holdout_mask]
+    holdout_sample_weights = holdout_sample_weights_all[holdout_mask]
+
     positive_count = int(train_labels.sum().item())
     negative_count = int(train_labels.numel() - positive_count)
     if positive_count <= 0:
-        raise ValueError("train payload has no positive candidates.")
+        raise ValueError("train payload has no positive action candidates.")
     pos_weight = torch.tensor(
         float(negative_count) / float(positive_count),
         dtype=torch.float32,
@@ -342,7 +455,7 @@ def main():
         weight_decay=float(args.weight_decay),
     )
 
-    train_set = TensorDataset(train_features_norm, train_labels)
+    train_set = TensorDataset(train_features_for_loss, train_labels, train_sample_weights)
     generator = torch.Generator()
     generator.manual_seed(int(args.seed))
     train_loader = DataLoader(
@@ -361,9 +474,15 @@ def main():
         "weight_decay": float(args.weight_decay),
         "batch_size": int(args.batch_size),
         "seed": int(args.seed),
+        "target_type": str(args.target_type),
+        "ignore_old_top1_candidate": bool(args.ignore_old_top1_candidate),
+        "old_correct_negative_weight": float(args.old_correct_negative_weight),
+        "neutral_negative_weight": float(args.neutral_negative_weight),
+        "hurt_negative_weight": float(args.hurt_negative_weight),
         "train_pt": op.abspath(args.train_pt),
         "holdout_pt": op.abspath(args.holdout_pt),
         "pos_weight": float(pos_weight.item()),
+        "training_args": dict(vars(args)),
     }
 
     log_line(log_lines, "[QALR_V4_GATE_TRAIN] start")
@@ -371,8 +490,25 @@ def main():
     log_line(log_lines, f"train_candidates={train_features.shape[0]}")
     log_line(log_lines, f"holdout_candidates={holdout_features.shape[0]}")
     log_line(log_lines, f"num_features={input_dim}")
-    log_line(log_lines, f"positive_count={positive_count}")
-    log_line(log_lines, f"negative_count={negative_count}")
+    log_line(log_lines, f"target_type={args.target_type}")
+    log_line(log_lines, f"action_positive_count={positive_count}")
+    log_line(log_lines, f"action_negative_count={negative_count}")
+    log_line(
+        log_lines,
+        f"ignored_old_top1_count={train_targets['stats'].get('ignored_old_top1_count', 0)}",
+    )
+    log_line(
+        log_lines,
+        f"holdout_ignored_old_top1_count={holdout_targets['stats'].get('ignored_old_top1_count', 0)}",
+    )
+    log_line(
+        log_lines,
+        (
+            f"negative_weights old_correct={args.old_correct_negative_weight:.6f} "
+            f"neutral={args.neutral_negative_weight:.6f} "
+            f"hurt={args.hurt_negative_weight:.6f}"
+        ),
+    )
     log_line(log_lines, f"pos_weight={float(pos_weight.item()):.6f}")
     log_line(log_lines, "feature_names=" + ", ".join(feature_names))
 
@@ -384,11 +520,18 @@ def main():
         model.train()
         loss_sum = 0.0
         seen = 0
-        for batch_features, batch_labels in train_loader:
+        for batch_features, batch_labels, batch_weights in train_loader:
             batch_features = batch_features.to(device)
             batch_labels = batch_labels.to(device)
+            batch_weights = batch_weights.to(device)
             logits = model(batch_features)
-            loss = compute_loss(logits, batch_labels, pos_weight, args.loss)
+            loss = compute_loss(
+                logits,
+                batch_labels,
+                pos_weight,
+                args.loss,
+                sample_weight=batch_weights,
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -399,8 +542,9 @@ def main():
         train_loss = loss_sum / float(max(seen, 1))
         holdout_loss = evaluate_loss(
             model,
-            holdout_features_norm,
+            holdout_features_for_loss,
             holdout_labels,
+            holdout_sample_weights,
             pos_weight,
             args.loss,
             args.batch_size,
@@ -413,7 +557,7 @@ def main():
             device=device,
         )
         holdout_probs = torch.sigmoid(holdout_logits)
-        holdout_auc = binary_auc(holdout_probs, holdout_labels.long())
+        holdout_auc = binary_auc(holdout_probs[holdout_mask], holdout_labels.long())
         rows, best_row = threshold_search(holdout_payload, holdout_probs)
         for row in rows:
             threshold_rows_all.append({"epoch": int(epoch), **row})
@@ -435,7 +579,10 @@ def main():
                 "holdout_loss": float(holdout_loss),
                 "holdout_auc": holdout_auc,
                 "best_threshold": dict(best_row),
+                "best_candidate_rank_max": int(best_row["candidate_rank_max"]),
             }
+            config["best_threshold"] = float(best_row["threshold"])
+            config["best_candidate_rank_max"] = int(best_row["candidate_rank_max"])
             save_gate_checkpoint(
                 op.join(args.out_dir, "best_gate.pt"),
                 model=model,
@@ -492,6 +639,10 @@ def main():
         },
         "config": config,
         "best_metrics": dict(best_metrics or {}),
+        "target_stats": {
+            "train": dict(train_targets["stats"]),
+            "holdout": dict(holdout_targets["stats"]),
+        },
         "train_metadata": dict(train_payload.get("metadata", {})),
         "holdout_metadata": dict(holdout_payload.get("metadata", {})),
     }
