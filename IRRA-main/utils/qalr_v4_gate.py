@@ -2,6 +2,7 @@ import math
 from collections import OrderedDict
 
 import torch
+from torch import nn
 
 
 QALR_V4_FEATURE_NAMES = [
@@ -96,6 +97,95 @@ QALR_V4_FEATURE_DEFINITIONS = OrderedDict(
         ("thermal_avg_gap", "local_thermal_score - local_avg_score."),
     ]
 )
+
+
+class QALRV4GateMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, dropout=0.1):
+        super().__init__()
+        input_dim = int(input_dim)
+        hidden_dim = int(hidden_dim)
+        dropout = float(dropout)
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be > 0, got {input_dim}.")
+        if hidden_dim < 2:
+            raise ValueError(f"hidden_dim must be >= 2, got {hidden_dim}.")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features):
+        return self.net(features).squeeze(-1)
+
+
+def compute_feature_normalizer(features, eps=1e-6):
+    if features.dim() != 2:
+        raise ValueError(
+            f"features must have shape [N, D], got {tuple(features.shape)}."
+        )
+    if features.shape[0] == 0:
+        raise ValueError("Cannot compute feature normalizer from empty features.")
+    features = features.float()
+    mean = features.mean(dim=0)
+    std = features.std(dim=0, unbiased=False).clamp_min(float(eps))
+    return mean, std
+
+
+def apply_feature_normalizer(features, mean, std):
+    return (features.float() - mean.to(features.device).float()) / std.to(
+        features.device
+    ).float().clamp_min(1e-6)
+
+
+def save_gate_checkpoint(
+    path,
+    model,
+    mean,
+    std,
+    feature_names,
+    config,
+    metrics=None,
+):
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "mean": mean.detach().cpu().float(),
+        "std": std.detach().cpu().float(),
+        "feature_names": list(feature_names),
+        "config": dict(config),
+        "metrics": dict(metrics or {}),
+    }
+    torch.save(checkpoint, path)
+
+
+def load_gate_checkpoint(path, map_location="cpu"):
+    checkpoint = torch.load(path, map_location=map_location)
+    config = dict(checkpoint.get("config", {}))
+    feature_names = list(checkpoint.get("feature_names", []))
+    input_dim = int(config.get("input_dim", len(feature_names)))
+    hidden_dim = int(config.get("hidden_dim", 64))
+    dropout = float(config.get("dropout", 0.1))
+    model = QALRV4GateMLP(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    return {
+        "model": model,
+        "mean": checkpoint["mean"].float(),
+        "std": checkpoint["std"].float(),
+        "feature_names": feature_names,
+        "config": config,
+        "metrics": dict(checkpoint.get("metrics", {})),
+        "raw": checkpoint,
+    }
 
 
 def qalr_v4_feature_meta(topk):
