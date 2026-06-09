@@ -842,6 +842,95 @@ class IRRA(nn.Module):
         text_mu, text_logvar = self._encode_text_global_gaussian(text_global_raw)
         return text_tokens, text_global_raw, text_mu, text_logvar
 
+    def _append_mga_text_outputs(
+        self,
+        batch,
+        ret,
+        ids_key,
+        valid_key,
+        weight_key,
+        feat_key,
+        ret_valid_key,
+        ret_weight_key,
+    ):
+        if ids_key not in batch:
+            return
+
+        _, _, text_feat, _ = self._encode_caption_ids_with_uncertainty(
+            batch[ids_key]
+        )
+        ret[feat_key] = text_feat
+
+        valid = batch.get(valid_key, None)
+        if torch.is_tensor(valid):
+            ret[ret_valid_key] = valid.to(device=text_feat.device).reshape(-1).bool()
+        else:
+            ret[ret_valid_key] = torch.ones(
+                text_feat.shape[0],
+                device=text_feat.device,
+                dtype=torch.bool,
+            )
+
+        weight = batch.get(weight_key, None)
+        if torch.is_tensor(weight):
+            ret[ret_weight_key] = weight.to(
+                device=text_feat.device,
+                dtype=text_feat.dtype,
+            ).reshape(-1)
+        else:
+            ret[ret_weight_key] = torch.ones(
+                text_feat.shape[0],
+                device=text_feat.device,
+                dtype=text_feat.dtype,
+            )
+
+    def _append_mga_aux_text_outputs(self, batch, ret):
+        if bool(getattr(self.args, "use_mga_pseudo", False)):
+            self._append_mga_text_outputs(
+                batch=batch,
+                ret=ret,
+                ids_key="mga_pseudo_ids",
+                valid_key="mga_has_pseudo",
+                weight_key="mga_pseudo_weight",
+                feat_key="mga_pseudo_text_feat",
+                ret_valid_key="mga_pseudo_valid",
+                ret_weight_key="mga_pseudo_weight",
+            )
+
+        if bool(getattr(self.args, "use_mga_attr_align", False)):
+            self._append_mga_text_outputs(
+                batch=batch,
+                ret=ret,
+                ids_key="mga_rgb_color_ids",
+                valid_key="mga_has_rgb_color",
+                weight_key="mga_rgb_color_weight",
+                feat_key="mga_rgb_color_text_feat",
+                ret_valid_key="mga_rgb_color_valid",
+                ret_weight_key="mga_rgb_color_weight",
+            )
+            self._append_mga_text_outputs(
+                batch=batch,
+                ret=ret,
+                ids_key="mga_t_shape_ids",
+                valid_key="mga_has_t_shape",
+                weight_key="mga_t_shape_weight",
+                feat_key="mga_t_shape_text_feat",
+                ret_valid_key="mga_t_shape_valid",
+                ret_weight_key="mga_t_shape_weight",
+            )
+
+        if bool(getattr(self.args, "use_mga_negative_loss", False)):
+            self._append_mga_text_outputs(
+                batch=batch,
+                ret=ret,
+                ids_key="mga_negative_ids",
+                valid_key="mga_has_negative",
+                weight_key="mga_negative_weight",
+                feat_key="mga_negative_text_feat",
+                ret_valid_key="mga_negative_valid",
+                ret_weight_key="mga_negative_weight",
+            )
+
     def _encode_visual_global_gaussian(
         self, rgb_global_feat, thermal_global_feat, thermal_available
     ):
@@ -2082,6 +2171,7 @@ class IRRA(nn.Module):
         )
         if hn_fused_det_feat is not None:
             ret["hn_fused_det_feat"] = hn_fused_det_feat
+        self._append_mga_aux_text_outputs(batch, ret)
         if self.use_attr_aux:
             attr_feat = p_f if self.attr_feature_source == "fused_prob" else f_det
             ret.update(self._forward_attr_heads(attr_feat))

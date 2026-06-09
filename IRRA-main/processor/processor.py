@@ -56,6 +56,8 @@ EVAL_RUNTIME_ATTR_NAMES = (
     "use_prob_sampling",
 )
 
+_MGA_WARNED_KEYS = set()
+
 
 def _to_scalar(value):
     # Convert tensor/number into python float for stable meter/log writing.
@@ -1952,7 +1954,7 @@ def apply_img_local_filter_stage(
     return applied_active
 
 
-def _build_total_loss(args, ret):
+def _build_total_loss(args, ret, epoch=None):
     """
     When use_mum is enabled:
       total_loss = loss_sdm_prob + lambda_det * loss_sdm_det + lambda_mlm * loss_mlm
@@ -2004,6 +2006,11 @@ def _build_total_loss(args, ret):
                 "loss_dcalign_color",
                 "loss_dcalign_struct",
                 "loss_dcalign_full",
+                "loss_mga_pseudo_sdm",
+                "loss_mga_rgb_color",
+                "loss_mga_t_shape",
+                "loss_mga_negative",
+                "loss_rde_consensus",
             }:
                 continue
             total_loss = v if total_loss is None else total_loss + v
@@ -2727,6 +2734,543 @@ def _get_first_tensor_from_ret(ret, keys):
         if torch.is_tensor(value):
             return value, key
     return None, "missing"
+
+
+def _mga_warn_once(key, message):
+    if key in _MGA_WARNED_KEYS:
+        return
+    _MGA_WARNED_KEYS.add(key)
+    logging.getLogger("IRRA.train").warning(message)
+
+
+def _temperature_to_tensor(temperature, reference):
+    if temperature is None:
+        return reference.new_tensor(float(0.02), dtype=torch.float32)
+    if torch.is_tensor(temperature):
+        return temperature.to(device=reference.device, dtype=torch.float32).reshape(-1)[0]
+    return reference.new_tensor(float(temperature), dtype=torch.float32)
+
+
+def weighted_sdm_or_contrastive_loss(
+    image_feat,
+    text_feat,
+    pids,
+    weights,
+    temperature=None,
+):
+    """Weighted one-to-one symmetric InfoNCE fallback for MGA auxiliary text.
+
+    This fallback does not merge same-pid positives like SDM, so duplicate pids
+    in a batch are less precisely modeled. It is used here because MGA needs
+    stable per-sample weighting.
+    """
+    if image_feat.ndim != 2 or text_feat.ndim != 2:
+        raise ValueError(
+            "weighted_sdm_or_contrastive_loss expects 2D image/text features."
+        )
+    if image_feat.shape != text_feat.shape:
+        raise ValueError(
+            "weighted_sdm_or_contrastive_loss feature shape mismatch: "
+            f"{tuple(image_feat.shape)} vs {tuple(text_feat.shape)}."
+        )
+    batch_size = image_feat.shape[0]
+    zero = image_feat.new_zeros(())
+    if batch_size < 2:
+        return zero
+
+    if weights is None:
+        weights = image_feat.new_ones(batch_size, dtype=torch.float32)
+    else:
+        weights = weights.to(device=image_feat.device, dtype=torch.float32).reshape(-1)
+    if weights.numel() != batch_size:
+        raise ValueError(
+            "weighted_sdm_or_contrastive_loss weight length mismatch: "
+            f"{weights.numel()} vs {batch_size}."
+        )
+    weights = weights.clamp(0.0, 1.0)
+    weight_sum = weights.sum().clamp_min(1e-6)
+    if float(weight_sum.detach().cpu()) <= 1e-6:
+        return zero
+
+    temp = _temperature_to_tensor(temperature, image_feat).clamp_min(1e-6)
+    image_clean = torch.nan_to_num(
+        image_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    text_clean = torch.nan_to_num(
+        text_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    image_norm = F.normalize(image_clean, p=2, dim=1)
+    text_norm = F.normalize(text_clean, p=2, dim=1)
+    logits = image_norm @ text_norm.t() / temp
+    target = torch.arange(batch_size, device=image_feat.device)
+    loss_i2t = F.cross_entropy(logits, target, reduction="none")
+    loss_t2i = F.cross_entropy(logits.t(), target, reduction="none")
+    loss = ((loss_i2t + loss_t2i) * 0.5 * weights).sum() / weight_sum
+    return loss
+
+
+def _cosine_diag_similarity(image_feat, text_feat):
+    image_clean = torch.nan_to_num(
+        image_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    text_clean = torch.nan_to_num(
+        text_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    image_norm = F.normalize(image_clean, p=2, dim=1)
+    text_norm = F.normalize(text_clean, p=2, dim=1)
+    return (image_norm * text_norm).sum(dim=1).clamp(-1.0, 1.0)
+
+
+def _empty_rde_stats(reference):
+    zero = reference.new_zeros(())
+    return {
+        "rde_clean_ratio": zero,
+        "rde_uncertain_ratio": zero,
+        "rde_noisy_ratio": zero,
+        "rde_mean_conf": zero,
+        "rde_count": 0.0,
+    }
+
+
+def get_rde_effective_weight(
+    base_weight,
+    pos_sim=None,
+    args=None,
+    epoch=None,
+):
+    base_weight = base_weight.float().reshape(-1).clamp(0.0, 1.0)
+    stats = _empty_rde_stats(base_weight)
+    if args is None or not bool(getattr(args, "use_rde_robust", False)):
+        return base_weight, stats
+
+    warmup_epochs = int(getattr(args, "rde_warmup_epochs", 10))
+    if (
+        epoch is None
+        or int(epoch) <= warmup_epochs
+    ) and not bool(getattr(args, "rde_enable_pseudo_during_warmup", False)):
+        return torch.zeros_like(base_weight), stats
+
+    conf_source = str(getattr(args, "rde_conf_source", "hybrid")).lower()
+    if pos_sim is None:
+        online_conf = base_weight
+        if conf_source in {"online_sim", "hybrid"}:
+            _mga_warn_once(
+                "rde_online_sim_missing",
+                "[RDE] pos_sim is missing; falling back to MGA base weight for "
+                "online confidence.",
+            )
+    else:
+        online_conf = ((pos_sim.to(base_weight.device).float().reshape(-1) + 1.0) * 0.5)
+        online_conf = online_conf.clamp(0.0, 1.0)
+        if online_conf.numel() != base_weight.numel():
+            _mga_warn_once(
+                "rde_online_sim_shape",
+                "[RDE] pos_sim shape does not match base_weight; falling back "
+                "to MGA base weight for online confidence.",
+            )
+            online_conf = base_weight
+
+    if conf_source == "mga_weight":
+        conf = base_weight
+    elif conf_source == "online_sim":
+        conf = online_conf
+    elif conf_source == "hybrid":
+        conf = 0.5 * base_weight + 0.5 * online_conf
+    else:
+        raise ValueError(f"Unsupported rde_conf_source={conf_source}.")
+    conf = conf.clamp(0.0, 1.0)
+
+    clean_threshold = float(getattr(args, "rde_clean_threshold", 0.70))
+    uncertain_threshold = float(getattr(args, "rde_uncertain_threshold", 0.40))
+    clean_mask = conf.ge(clean_threshold)
+    uncertain_mask = conf.ge(uncertain_threshold) & conf.lt(clean_threshold)
+    noisy_mask = conf.lt(uncertain_threshold)
+
+    effective_weight = torch.zeros_like(base_weight)
+    effective_weight = torch.where(clean_mask, base_weight, effective_weight)
+    effective_weight = torch.where(
+        uncertain_mask,
+        base_weight * float(getattr(args, "rde_uncertain_weight", 0.5)),
+        effective_weight,
+    )
+    effective_weight = torch.where(
+        noisy_mask,
+        base_weight * float(getattr(args, "rde_noisy_weight", 0.1)),
+        effective_weight,
+    )
+    count = float(base_weight.numel())
+    if count > 0:
+        stats = {
+            "rde_clean_ratio": clean_mask.float().mean(),
+            "rde_uncertain_ratio": uncertain_mask.float().mean(),
+            "rde_noisy_ratio": noisy_mask.float().mean(),
+            "rde_mean_conf": conf.mean(),
+            "rde_count": count,
+        }
+    return effective_weight.clamp(0.0, 1.0), stats
+
+
+def _merge_rde_stats_into_terms(terms, stats):
+    count = float(stats.get("rde_count", 0.0) or 0.0)
+    if count <= 0:
+        return
+    prev_count = float(terms.get("_rde_stats_count", 0.0) or 0.0)
+    total_count = prev_count + count
+    for key in (
+        "rde_clean_ratio",
+        "rde_uncertain_ratio",
+        "rde_noisy_ratio",
+        "rde_mean_conf",
+    ):
+        prev = terms.get(key, None)
+        cur = stats.get(key, None)
+        if cur is None:
+            continue
+        if prev is None or not torch.is_tensor(prev):
+            terms[key] = cur
+        else:
+            terms[key] = (prev * prev_count + cur * count) / max(total_count, 1e-6)
+    terms["_rde_stats_count"] = total_count
+
+
+def _mga_reference_tensor(ret, batch):
+    for source in (ret, batch):
+        for value in source.values():
+            if torch.is_tensor(value):
+                return value
+    raise KeyError("MGA auxiliary loss requires at least one tensor in ret or batch.")
+
+
+def _mga_empty_terms(reference):
+    zero = reference.new_zeros(())
+    return {
+        "loss_mga_pseudo_sdm": zero,
+        "loss_mga_rgb_color": zero,
+        "loss_mga_t_shape": zero,
+        "loss_mga_negative": zero,
+        "loss_rde_consensus": zero,
+        "mga_valid_pseudo_ratio": zero,
+        "mga_valid_rgb_color_ratio": zero,
+        "mga_valid_t_shape_ratio": zero,
+        "rde_clean_ratio": zero,
+        "rde_uncertain_ratio": zero,
+        "rde_noisy_ratio": zero,
+        "rde_mean_conf": zero,
+        "conf_hn_active_ratio": zero,
+        "_rde_stats_count": 0.0,
+    }
+
+
+def _mga_valid_ratio(valid, reference):
+    if valid is None:
+        return reference.new_zeros(())
+    valid = valid.to(device=reference.device).reshape(-1)
+    if valid.numel() == 0:
+        return reference.new_zeros(())
+    return valid.float().mean()
+
+
+def _mga_subset_for_alignment(
+    image_feat,
+    text_feat,
+    valid,
+    weights,
+    min_valid,
+    warn_key,
+):
+    zero = image_feat.new_zeros(())
+    if valid is None:
+        return None, None, None, zero
+    valid = valid.to(device=image_feat.device).reshape(-1).bool()
+    batch_size = image_feat.shape[0]
+    if (
+        text_feat.shape[0] != batch_size
+        or valid.numel() != batch_size
+        or (weights is not None and weights.reshape(-1).numel() != batch_size)
+    ):
+        _mga_warn_once(
+            warn_key,
+            "[MGA] skipping auxiliary loss because feature/valid/weight batch "
+            "dimensions do not match.",
+        )
+        return None, None, None, zero
+    if int(valid.sum().item()) < int(min_valid):
+        return None, None, None, zero
+    if weights is None:
+        weights = image_feat.new_ones(batch_size, dtype=torch.float32)
+    else:
+        weights = weights.to(device=image_feat.device, dtype=torch.float32).reshape(-1)
+    weights = weights.clamp(0.0, 1.0)
+    if float(weights[valid].sum().detach().cpu()) <= 1e-6:
+        return None, None, None, zero
+    return image_feat[valid], text_feat[valid], weights[valid], zero
+
+
+def _compute_confidence_hard_negative_terms(args, ret, batch, reference):
+    if not bool(getattr(args, "use_confidence_hard_negative", False)):
+        return {}
+
+    _mga_warn_once(
+        "conf_hn_original_caption_only",
+        "[CONF_HN] current hard-negative branches use original captions/features; "
+        "no pseudo hard-negative mask is applied. conf_hn_active_ratio reports "
+        "pseudo confidence eligibility only.",
+    )
+    zero = reference.new_zeros(())
+    valid = ret.get("mga_pseudo_valid", batch.get("mga_has_pseudo", None))
+    weight = ret.get("mga_pseudo_weight", batch.get("mga_pseudo_weight", None))
+    if valid is None or weight is None:
+        return {"conf_hn_active_ratio": zero}
+
+    valid = valid.to(device=reference.device).reshape(-1).bool()
+    weight = weight.to(device=reference.device, dtype=torch.float32).reshape(-1)
+    if valid.numel() != weight.numel() or valid.numel() == 0 or not valid.any():
+        return {"conf_hn_active_ratio": zero}
+
+    min_conf = float(getattr(args, "conf_hn_min_weight", 0.5))
+    active = weight[valid].ge(min_conf)
+    return {"conf_hn_active_ratio": active.float().mean()}
+
+
+def _compute_mga_aux_terms(args, ret, batch, epoch):
+    use_pseudo = bool(getattr(args, "use_mga_pseudo", False))
+    use_attr = bool(getattr(args, "use_mga_attr_align", False))
+    use_negative = bool(getattr(args, "use_mga_negative_loss", False))
+    use_rde = bool(getattr(args, "use_rde_robust", False))
+    use_conf_hn = bool(getattr(args, "use_confidence_hard_negative", False))
+    if not (use_pseudo or use_attr or use_negative or use_rde or use_conf_hn):
+        return {}
+
+    reference = _mga_reference_tensor(ret, batch)
+    terms = _mga_empty_terms(reference)
+    terms.update(_compute_confidence_hard_negative_terms(args, ret, batch, reference))
+    temperature = ret.get("temperature", None)
+    pids = batch.get("pids", None)
+
+    if use_pseudo:
+        valid = ret.get("mga_pseudo_valid", batch.get("mga_has_pseudo", None))
+        terms["mga_valid_pseudo_ratio"] = _mga_valid_ratio(valid, reference)
+        pseudo_valid_mask = None
+        pseudo_image_feat = None
+        pseudo_text_feat = None
+        pseudo_effective_weight = None
+        if (
+            (
+                float(getattr(args, "lambda_mga_pseudo_sdm", 0.0)) > 0.0
+                or use_rde
+                or float(getattr(args, "lambda_rde_consensus", 0.0)) > 0.0
+            )
+            and "fused_det_feat" in ret
+            and "mga_pseudo_text_feat" in ret
+        ):
+            image_feat, text_feat, weights, zero = _mga_subset_for_alignment(
+                ret["fused_det_feat"],
+                ret["mga_pseudo_text_feat"],
+                valid,
+                ret.get("mga_pseudo_weight", None),
+                min_valid=2,
+                warn_key="pseudo_shape",
+            )
+            if image_feat is not None:
+                pseudo_valid_mask = valid.to(
+                    device=ret["fused_det_feat"].device
+                ).reshape(-1).bool()
+                pseudo_image_feat = image_feat
+                pseudo_text_feat = text_feat
+                pos_sim = _cosine_diag_similarity(image_feat, text_feat)
+                effective_weight, rde_stats = get_rde_effective_weight(
+                    weights,
+                    pos_sim=pos_sim,
+                    args=args,
+                    epoch=epoch,
+                )
+                pseudo_effective_weight = effective_weight
+                if use_rde:
+                    _merge_rde_stats_into_terms(terms, rde_stats)
+                if float(getattr(args, "lambda_mga_pseudo_sdm", 0.0)) > 0.0:
+                    terms["loss_mga_pseudo_sdm"] = weighted_sdm_or_contrastive_loss(
+                        image_feat,
+                        text_feat,
+                        pids,
+                        effective_weight,
+                        temperature=temperature,
+                    )
+            else:
+                terms["loss_mga_pseudo_sdm"] = zero
+
+        if (
+            use_rde
+            and float(getattr(args, "lambda_rde_consensus", 0.0)) > 0.0
+            and epoch is not None
+            and int(epoch) > int(getattr(args, "rde_warmup_epochs", 10))
+            and pseudo_valid_mask is not None
+            and pseudo_effective_weight is not None
+            and "text_det_feat" in ret
+        ):
+            active_mask = pseudo_effective_weight.gt(0.0)
+            if active_mask.any():
+                orig_text_feat = ret["text_det_feat"][pseudo_valid_mask][active_mask]
+                fused_feat = pseudo_image_feat[active_mask]
+                pseudo_feat = pseudo_text_feat[active_mask]
+                active_weight = pseudo_effective_weight[active_mask].to(
+                    device=fused_feat.device,
+                    dtype=fused_feat.dtype,
+                )
+                sim_orig = _cosine_diag_similarity(fused_feat, orig_text_feat)
+                sim_pseudo = _cosine_diag_similarity(fused_feat, pseudo_feat)
+                consistency_gap = (sim_orig - sim_pseudo).abs()
+                terms["loss_rde_consensus"] = (
+                    active_weight * consistency_gap.to(active_weight.dtype)
+                ).mean()
+
+    if use_attr:
+        rgb_valid = ret.get("mga_rgb_color_valid", batch.get("mga_has_rgb_color", None))
+        t_valid = ret.get("mga_t_shape_valid", batch.get("mga_has_t_shape", None))
+        terms["mga_valid_rgb_color_ratio"] = _mga_valid_ratio(rgb_valid, reference)
+        terms["mga_valid_t_shape_ratio"] = _mga_valid_ratio(t_valid, reference)
+
+        if (
+            float(getattr(args, "lambda_mga_rgb_color", 0.0)) > 0.0
+            and "mga_rgb_color_text_feat" in ret
+        ):
+            rgb_feat, rgb_source = _get_first_tensor_from_ret(
+                ret, ("rgb_mu", "v_rgb_c", "rgb_det_feat")
+            )
+            if rgb_feat is None:
+                _mga_warn_once(
+                    "rgb_feature_missing",
+                    "[MGA] skipping loss_mga_rgb_color because no RGB global "
+                    "feature key is available (tried rgb_mu, v_rgb_c, rgb_det_feat).",
+                )
+            else:
+                image_feat, text_feat, weights, zero = _mga_subset_for_alignment(
+                    rgb_feat,
+                    ret["mga_rgb_color_text_feat"],
+                    rgb_valid,
+                    ret.get("mga_rgb_color_weight", None),
+                    min_valid=2,
+                    warn_key="rgb_color_shape",
+                )
+                if image_feat is not None:
+                    pos_sim = _cosine_diag_similarity(image_feat, text_feat)
+                    effective_weight, rde_stats = get_rde_effective_weight(
+                        weights,
+                        pos_sim=pos_sim,
+                        args=args,
+                        epoch=epoch,
+                    )
+                    if use_rde:
+                        _merge_rde_stats_into_terms(terms, rde_stats)
+                    terms["loss_mga_rgb_color"] = weighted_sdm_or_contrastive_loss(
+                        image_feat,
+                        text_feat,
+                        pids,
+                        effective_weight,
+                        temperature=temperature,
+                    )
+                    terms["mga_rgb_color_feature_source"] = rgb_source
+                else:
+                    terms["loss_mga_rgb_color"] = zero
+
+        if (
+            float(getattr(args, "lambda_mga_t_shape", 0.0)) > 0.0
+            and "mga_t_shape_text_feat" in ret
+        ):
+            thermal_feat, thermal_source = _get_first_tensor_from_ret(
+                ret, ("thermal_mu", "v_t_c", "thermal_det_feat")
+            )
+            if thermal_feat is None:
+                _mga_warn_once(
+                    "thermal_feature_missing",
+                    "[MGA] skipping loss_mga_t_shape because no thermal global "
+                    "feature key is available (tried thermal_mu, v_t_c, thermal_det_feat).",
+                )
+            else:
+                image_feat, text_feat, weights, zero = _mga_subset_for_alignment(
+                    thermal_feat,
+                    ret["mga_t_shape_text_feat"],
+                    t_valid,
+                    ret.get("mga_t_shape_weight", None),
+                    min_valid=2,
+                    warn_key="t_shape_shape",
+                )
+                if image_feat is not None:
+                    pos_sim = _cosine_diag_similarity(image_feat, text_feat)
+                    effective_weight, rde_stats = get_rde_effective_weight(
+                        weights,
+                        pos_sim=pos_sim,
+                        args=args,
+                        epoch=epoch,
+                    )
+                    if use_rde:
+                        _merge_rde_stats_into_terms(terms, rde_stats)
+                    terms["loss_mga_t_shape"] = weighted_sdm_or_contrastive_loss(
+                        image_feat,
+                        text_feat,
+                        pids,
+                        effective_weight,
+                        temperature=temperature,
+                    )
+                    terms["mga_t_shape_feature_source"] = thermal_source
+                else:
+                    terms["loss_mga_t_shape"] = zero
+
+    if (
+        use_negative
+        and float(getattr(args, "lambda_mga_negative", 0.0)) > 0.0
+        and "fused_det_feat" in ret
+        and "mga_negative_text_feat" in ret
+    ):
+        neg_valid = ret.get("mga_negative_valid", batch.get("mga_has_negative", None))
+        image_feat, text_feat, weights, zero = _mga_subset_for_alignment(
+            ret["fused_det_feat"],
+            ret["mga_negative_text_feat"],
+            neg_valid,
+            ret.get("mga_negative_weight", None),
+            min_valid=1,
+            warn_key="negative_shape",
+        )
+        if image_feat is not None:
+            image_clean = torch.nan_to_num(
+                image_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            text_clean = torch.nan_to_num(
+                text_feat.float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            image_norm = F.normalize(image_clean, p=2, dim=1)
+            text_norm = F.normalize(text_clean, p=2, dim=1)
+            sim = (image_norm * text_norm).sum(dim=1)
+            margin = float(getattr(args, "mga_neg_margin", 0.2))
+            terms["loss_mga_negative"] = (
+                F.relu(sim - margin) * weights.to(sim.device, dtype=sim.dtype)
+            ).mean()
+        else:
+            terms["loss_mga_negative"] = zero
+
+    return terms
+
+
+def _add_mga_aux_to_total_loss(args, total_loss, ret):
+    if bool(getattr(args, "use_mga_pseudo", False)):
+        lambda_pseudo = float(getattr(args, "lambda_mga_pseudo_sdm", 0.0))
+        if lambda_pseudo > 0.0 and "loss_mga_pseudo_sdm" in ret:
+            total_loss = total_loss + lambda_pseudo * ret["loss_mga_pseudo_sdm"]
+    if bool(getattr(args, "use_mga_attr_align", False)):
+        lambda_rgb = float(getattr(args, "lambda_mga_rgb_color", 0.0))
+        lambda_t = float(getattr(args, "lambda_mga_t_shape", 0.0))
+        if lambda_rgb > 0.0 and "loss_mga_rgb_color" in ret:
+            total_loss = total_loss + lambda_rgb * ret["loss_mga_rgb_color"]
+        if lambda_t > 0.0 and "loss_mga_t_shape" in ret:
+            total_loss = total_loss + lambda_t * ret["loss_mga_t_shape"]
+    if bool(getattr(args, "use_mga_negative_loss", False)):
+        lambda_negative = float(getattr(args, "lambda_mga_negative", 0.0))
+        if lambda_negative > 0.0 and "loss_mga_negative" in ret:
+            total_loss = total_loss + lambda_negative * ret["loss_mga_negative"]
+    if bool(getattr(args, "use_rde_robust", False)):
+        lambda_consensus = float(getattr(args, "lambda_rde_consensus", 0.0))
+        if lambda_consensus > 0.0 and "loss_rde_consensus" in ret:
+            total_loss = total_loss + lambda_consensus * ret["loss_rde_consensus"]
+    return total_loss
 
 
 def _compute_inbatch_hard_negative_terms(args, ret, batch, epoch):
@@ -3679,6 +4223,19 @@ def do_train(
         "loss_rgb_txt": AverageMeter(),
         "loss_th_txt": AverageMeter(),
         "loss_txt_cons": AverageMeter(),
+        "loss_mga_pseudo_sdm": AverageMeter(),
+        "loss_mga_rgb_color": AverageMeter(),
+        "loss_mga_t_shape": AverageMeter(),
+        "loss_mga_negative": AverageMeter(),
+        "loss_rde_consensus": AverageMeter(),
+        "mga_valid_pseudo_ratio": AverageMeter(),
+        "mga_valid_rgb_color_ratio": AverageMeter(),
+        "mga_valid_t_shape_ratio": AverageMeter(),
+        "rde_clean_ratio": AverageMeter(),
+        "rde_uncertain_ratio": AverageMeter(),
+        "rde_noisy_ratio": AverageMeter(),
+        "rde_mean_conf": AverageMeter(),
+        "conf_hn_active_ratio": AverageMeter(),
         "effective_lambda_rgb_txt": AverageMeter(),
         "effective_lambda_th_txt": AverageMeter(),
         "effective_lambda_txt_cons": AverageMeter(),
@@ -3881,7 +4438,7 @@ def do_train(
                     tokenizer=uspc_text_tokenizer,
                 )
             ret.update(_compute_uncertainty_alignment_terms(args, ret, batch))
-            original_total_loss = _build_total_loss(args, ret)
+            original_total_loss = _build_total_loss(args, ret, epoch=epoch)
             ret.update(_compute_rgbt_moe_adapter_terms(args, ret, batch, epoch))
             if getattr(args, "use_hard_negative_loss", False):
                 ret.update(_compute_inbatch_hard_negative_terms(args, ret, batch, epoch))
@@ -3908,6 +4465,10 @@ def do_train(
                     args, total_loss, ret, epoch
                 )
             total_loss = _add_mtp_terms_to_total_loss(args, total_loss, ret, epoch)
+            mga_terms = _compute_mga_aux_terms(args, ret, batch, epoch)
+            if mga_terms:
+                ret.update(mga_terms)
+                total_loss = _add_mga_aux_to_total_loss(args, total_loss, ret)
             attr_terms = None
             if use_attr_aux:
                 attr_terms = _compute_attr_aux_terms(args, ret, batch, epoch)
@@ -4088,6 +4649,32 @@ def do_train(
             meters["loss_mlm"].update(
                 _to_scalar(ret.get("loss_mlm", ret.get("mlm_loss", 0))), batch_size
             )
+            if mga_terms:
+                for mga_loss_name in [
+                    "loss_mga_pseudo_sdm",
+                    "loss_mga_rgb_color",
+                    "loss_mga_t_shape",
+                    "loss_mga_negative",
+                    "loss_rde_consensus",
+                ]:
+                    meters[mga_loss_name].update(
+                        _to_scalar(mga_terms.get(mga_loss_name, 0)),
+                        batch_size,
+                    )
+                for mga_ratio_name in [
+                    "mga_valid_pseudo_ratio",
+                    "mga_valid_rgb_color_ratio",
+                    "mga_valid_t_shape_ratio",
+                    "rde_clean_ratio",
+                    "rde_uncertain_ratio",
+                    "rde_noisy_ratio",
+                    "rde_mean_conf",
+                    "conf_hn_active_ratio",
+                ]:
+                    meters[mga_ratio_name].update(
+                        _to_scalar(mga_terms.get(mga_ratio_name, 0)),
+                        1,
+                    )
             if attr_terms is not None:
                 meters["loss_attr_aux_raw"].update(
                     _to_scalar(attr_terms.get("loss_attr_aux_raw", 0)),
@@ -4580,6 +5167,18 @@ def do_train(
                         info_str += ", [SYNTH_WEIGHT][BATCH] missing"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
+
+            debug_max_train_batches = int(
+                getattr(args, "debug_max_train_batches", 0)
+            )
+            if debug_max_train_batches > 0 and (n_iter + 1) >= debug_max_train_batches:
+                logger.info(
+                    "[DEBUG] stop epoch after %d train batches because "
+                    "debug_max_train_batches=%d",
+                    n_iter + 1,
+                    debug_max_train_batches,
+                )
+                break
 
         tb_writer.add_scalar("lr", scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar("temperature", _to_scalar(ret["temperature"]), epoch)

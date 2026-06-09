@@ -3,9 +3,11 @@ from torch.utils.data import Dataset
 import os.path as osp
 import logging
 import torch
+import hashlib
 from utils.iotools import read_image
 from utils.simple_tokenizer import SimpleTokenizer
 from utils.mtp_text import build_full_text, build_rgb_text, build_thermal_text
+from .mga_pseudo import compute_pseudo_weight, normalize_rgb_path_key
 from prettytable import PrettyTable
 import random
 import regex as re
@@ -66,6 +68,245 @@ def _safe_raw_caption(caption):
     if isinstance(caption, str):
         return caption
     return str(caption)
+
+
+def _clamp_probability(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(0.0, min(1.0, value))
+
+
+class MGAPseudoMixin:
+    def _init_mga_pseudo(
+        self,
+        mga_pseudo_records=None,
+        mga_min_weight=0.0,
+        mga_pseudo_sample_prob=0.35,
+        mga_attr_sample_prob=0.5,
+    ):
+        self.mga_pseudo_records = mga_pseudo_records or {}
+        self.use_mga_pseudo = bool(self.mga_pseudo_records)
+        self.mga_min_weight = max(0.0, float(mga_min_weight))
+        self.mga_pseudo_sample_prob = _clamp_probability(
+            mga_pseudo_sample_prob,
+            default=0.35,
+        )
+        self.mga_attr_sample_prob = _clamp_probability(
+            mga_attr_sample_prob,
+            default=0.5,
+        )
+
+    def _mga_caption_hashes(self, caption):
+        caption = _safe_raw_caption(caption)
+        normalized = " ".join(caption.split())
+        candidates = []
+        for text in (normalized, normalized.lower()):
+            digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            if digest not in candidates:
+                candidates.append(digest)
+        return candidates
+
+    def _lookup_mga_record(self, image_id, img_path, caption):
+        if not self.use_mga_pseudo:
+            return None
+        keys = []
+        if image_id is not None:
+            keys.append(str(image_id).strip())
+        rgb_key = normalize_rgb_path_key(img_path)
+        if rgb_key is not None:
+            keys.append(rgb_key)
+        keys.extend(self._mga_caption_hashes(caption))
+
+        seen = set()
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            record = self.mga_pseudo_records.get(key, None)
+            if record is not None:
+                return record
+        return None
+
+    def _select_mga_item(self, items, min_weight, rng):
+        if items is None:
+            return None
+        if rng is None:
+            rng = random
+        candidates = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = _safe_raw_caption(item.get("text", "")).strip()
+            if text == "":
+                continue
+            weight = compute_pseudo_weight(item)
+            if weight < float(min_weight):
+                continue
+            candidates.append((item, weight))
+        if not candidates:
+            return None
+
+        total_weight = sum(weight for _, weight in candidates)
+        if total_weight <= 0.0:
+            index = min(int(rng.random() * len(candidates)), len(candidates) - 1)
+            return candidates[index][0]
+
+        threshold = rng.random() * total_weight
+        cumulative = 0.0
+        for item, weight in candidates:
+            cumulative += weight
+            if cumulative >= threshold:
+                return item
+        return candidates[-1][0]
+
+    def _sample_mga_item(self, record, field_name, sample_prob, rng, force_select=False):
+        if record is None:
+            return None
+        if rng is None:
+            rng = random
+        if (not force_select) and rng.random() > float(sample_prob):
+            return None
+        return self._select_mga_item(
+            record.get(field_name, []),
+            min_weight=self.mga_min_weight,
+            rng=rng,
+        )
+
+    def _tokenize_mga_text(self, text):
+        return tokenize(
+            text,
+            tokenizer=self.tokenizer,
+            text_length=self.text_length,
+            truncate=self.truncate,
+        )
+
+    def _mga_empty_fields(self):
+        empty_ids = self._tokenize_mga_text("")
+        return {
+            "mga_has_pseudo": False,
+            "mga_pseudo_text": "",
+            "mga_pseudo_weight": 0.0,
+            "mga_pseudo_kind": "",
+            "mga_pseudo_ids": empty_ids.clone(),
+            "mga_has_rgb_color": False,
+            "mga_rgb_color_text": "",
+            "mga_rgb_color_weight": 0.0,
+            "mga_rgb_color_ids": empty_ids.clone(),
+            "mga_has_t_shape": False,
+            "mga_t_shape_text": "",
+            "mga_t_shape_weight": 0.0,
+            "mga_t_shape_ids": empty_ids.clone(),
+            "mga_has_negative": False,
+            "mga_negative_text": "",
+            "mga_negative_weight": 0.0,
+            "mga_negative_ids": empty_ids.clone(),
+        }
+
+    def _fill_mga_text_fields(self, fields, prefix, item, kind_key=None):
+        if item is None:
+            return fields
+        text = _safe_raw_caption(item.get("text", "")).strip()
+        if text == "":
+            return fields
+        weight = compute_pseudo_weight(item)
+        fields[f"mga_has_{prefix}"] = True
+        fields[f"mga_{prefix}_text"] = text
+        fields[f"mga_{prefix}_weight"] = float(weight)
+        fields[f"mga_{prefix}_ids"] = self._tokenize_mga_text(text)
+        if kind_key is not None:
+            fields[kind_key] = str(item.get("kind", ""))
+        return fields
+
+    def _build_mga_pseudo_fields(
+        self,
+        image_id,
+        img_path,
+        caption,
+        rng=None,
+        force_select=False,
+    ):
+        if not self.use_mga_pseudo:
+            return {}
+        record = self._lookup_mga_record(image_id, img_path, caption)
+        fields = self._mga_empty_fields()
+        if record is None:
+            return fields
+
+        pseudo_item = self._sample_mga_item(
+            record,
+            "pseudo_texts",
+            self.mga_pseudo_sample_prob,
+            rng,
+            force_select=force_select,
+        )
+        rgb_item = self._sample_mga_item(
+            record,
+            "rgb_color_texts",
+            self.mga_attr_sample_prob,
+            rng,
+            force_select=force_select,
+        )
+        t_shape_item = self._sample_mga_item(
+            record,
+            "thermal_shape_texts",
+            self.mga_attr_sample_prob,
+            rng,
+            force_select=force_select,
+        )
+        negative_item = self._sample_mga_item(
+            record,
+            "negative_texts",
+            self.mga_pseudo_sample_prob,
+            rng,
+            force_select=force_select,
+        )
+
+        self._fill_mga_text_fields(
+            fields,
+            "pseudo",
+            pseudo_item,
+            kind_key="mga_pseudo_kind",
+        )
+        self._fill_mga_text_fields(fields, "rgb_color", rgb_item)
+        self._fill_mga_text_fields(fields, "t_shape", t_shape_item)
+        self._fill_mga_text_fields(fields, "negative", negative_item)
+        return fields
+
+    def _add_mga_pseudo_to_ret(self, ret, image_id, img_path, caption):
+        fields = self._build_mga_pseudo_fields(
+            image_id=image_id,
+            img_path=img_path,
+            caption=caption,
+        )
+        if fields:
+            ret.update(fields)
+        return ret
+
+    def debug_mga_pseudo_sample(self, index, rng=None):
+        sample = self.dataset[index]
+        if len(sample) == 5:
+            _, image_id, img_path, _, caption = sample
+        else:
+            _, image_id, img_path, caption = sample
+        fields = self._build_mga_pseudo_fields(
+            image_id=image_id,
+            img_path=img_path,
+            caption=caption,
+            rng=rng,
+            force_select=True,
+        )
+        if not fields:
+            return None
+        fields.update(
+            {
+                "image_id": image_id,
+                "rgb_path": img_path,
+                "raw_caption": _safe_raw_caption(caption),
+            }
+        )
+        return fields
 
 
 class OfflineHardNegativeMixin:
@@ -182,7 +423,7 @@ class OfflineHardNegativeMixin:
         return ret
 
 
-class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
+class ImageTextDataset(MGAPseudoMixin, OfflineHardNegativeMixin, Dataset):
     def __init__(self,
                  dataset,
                  transform=None,
@@ -195,7 +436,11 @@ class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
                  offline_hardneg=None,
                  offline_hn_num_neg=1,
                  offline_hn_topk_train=20,
-                 offline_hn_sample_mode="random"):
+                 offline_hn_sample_mode="random",
+                 mga_pseudo_records=None,
+                 mga_min_weight=0.0,
+                 mga_pseudo_sample_prob=0.35,
+                 mga_attr_sample_prob=0.5):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -215,6 +460,12 @@ class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
                 f"{len(self.caption_weight)} and {len(self.dataset)}."
             )
         self.tokenizer = SimpleTokenizer()
+        self._init_mga_pseudo(
+            mga_pseudo_records=mga_pseudo_records,
+            mga_min_weight=mga_min_weight,
+            mga_pseudo_sample_prob=mga_pseudo_sample_prob,
+            mga_attr_sample_prob=mga_attr_sample_prob,
+        )
         self._init_offline_hardneg(
             offline_hardneg=offline_hardneg,
             offline_hn_num_neg=offline_hn_num_neg,
@@ -296,6 +547,12 @@ class ImageTextDataset(OfflineHardNegativeMixin, Dataset):
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 
+        self._add_mga_pseudo_to_ret(
+            ret,
+            image_id=image_id,
+            img_path=img_path,
+            caption=caption,
+        )
         self._add_offline_hardneg_to_ret(ret, pid=pid, img_path=img_path)
         return ret
 
@@ -376,7 +633,7 @@ class TextDataset(Dataset):
         return pid, caption
 
 
-class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
+class ImageTextMLMDataset(MGAPseudoMixin, OfflineHardNegativeMixin, Dataset):
     def __init__(self,
                  dataset,
                  transform=None,
@@ -389,7 +646,11 @@ class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
                  offline_hardneg=None,
                  offline_hn_num_neg=1,
                  offline_hn_topk_train=20,
-                 offline_hn_sample_mode="random"):
+                 offline_hn_sample_mode="random",
+                 mga_pseudo_records=None,
+                 mga_min_weight=0.0,
+                 mga_pseudo_sample_prob=0.35,
+                 mga_attr_sample_prob=0.5):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -410,6 +671,12 @@ class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
             )
 
         self.tokenizer = SimpleTokenizer()
+        self._init_mga_pseudo(
+            mga_pseudo_records=mga_pseudo_records,
+            mga_min_weight=mga_min_weight,
+            mga_pseudo_sample_prob=mga_pseudo_sample_prob,
+            mga_attr_sample_prob=mga_attr_sample_prob,
+        )
         self._init_offline_hardneg(
             offline_hardneg=offline_hardneg,
             offline_hn_num_neg=offline_hn_num_neg,
@@ -495,6 +762,12 @@ class ImageTextMLMDataset(OfflineHardNegativeMixin, Dataset):
         if t_img_path is not None:
             ret['thermal_images'] = t_img
 
+        self._add_mga_pseudo_to_ret(
+            ret,
+            image_id=image_id,
+            img_path=img_path,
+            caption=caption,
+        )
         self._add_offline_hardneg_to_ret(ret, pid=pid, img_path=img_path)
         return ret
 

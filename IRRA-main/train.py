@@ -124,6 +124,37 @@ if __name__ == "__main__":
             "[SYNTH_WEIGHT] apply_to_unc=%s",
             bool(getattr(args, "synth_weight_apply_to_unc", False)),
         )
+        logger.info(
+            "[MGA_RDE] use_mga_pseudo=%s mga_pseudo_json=%s",
+            bool(getattr(args, "use_mga_pseudo", False)),
+            str(getattr(args, "mga_pseudo_json", "")),
+        )
+        logger.info(
+            "[MGA_RDE] use_mga_attr_align=%s use_mga_negative_loss=%s",
+            bool(getattr(args, "use_mga_attr_align", False)),
+            bool(getattr(args, "use_mga_negative_loss", False)),
+        )
+        logger.info(
+            "[MGA_RDE] lambda_mga_pseudo_sdm=%.6f lambda_mga_rgb_color=%.6f lambda_mga_t_shape=%.6f lambda_mga_negative=%.6f mga_neg_margin=%.6f",
+            float(getattr(args, "lambda_mga_pseudo_sdm", 0.0)),
+            float(getattr(args, "lambda_mga_rgb_color", 0.0)),
+            float(getattr(args, "lambda_mga_t_shape", 0.0)),
+            float(getattr(args, "lambda_mga_negative", 0.0)),
+            float(getattr(args, "mga_neg_margin", 0.2)),
+        )
+        logger.info(
+            "[MGA_RDE] use_rde_robust=%s rde_warmup_epochs=%d rde_enable_pseudo_during_warmup=%s rde_conf_source=%s",
+            bool(getattr(args, "use_rde_robust", False)),
+            int(getattr(args, "rde_warmup_epochs", 10)),
+            bool(getattr(args, "rde_enable_pseudo_during_warmup", False)),
+            str(getattr(args, "rde_conf_source", "hybrid")),
+        )
+        logger.info(
+            "[MGA_RDE] lambda_rde_consensus=%.6f use_confidence_hard_negative=%s conf_hn_min_weight=%.6f",
+            float(getattr(args, "lambda_rde_consensus", 0.0)),
+            bool(getattr(args, "use_confidence_hard_negative", False)),
+            float(getattr(args, "conf_hn_min_weight", 0.5)),
+        )
     if args.training:
         save_train_configs(args.output_dir, args)
 

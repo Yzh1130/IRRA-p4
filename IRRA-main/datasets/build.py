@@ -1,5 +1,6 @@
 import logging
 import os.path as op
+import random
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
@@ -22,6 +23,7 @@ from .cuhkpedes import CUHKPEDES
 from .icfgpedes import ICFGPEDES
 from .rstpreid import RSTPReid
 from .rgbtpedes import RGBTPEDES
+from .mga_pseudo import collect_mga_pseudo_stats, load_mga_pseudo_json
 
 __factory = {
     'CUHK-PEDES': CUHKPEDES,
@@ -77,9 +79,14 @@ def collate(batch):
 
     batch_tensor_dict = {}
     for k, v in dict_batch.items():
-        # Convert Python scalars to tensors.
-        if isinstance(v[0], int):
+        # Convert booleans before integers because bool is an int subclass.
+        if isinstance(v[0], bool):
             batch_tensor_dict.update({k: torch.tensor(v)})
+        # Convert Python scalars to tensors.
+        elif isinstance(v[0], int):
+            batch_tensor_dict.update({k: torch.tensor(v)})
+        elif isinstance(v[0], float):
+            batch_tensor_dict.update({k: torch.tensor(v, dtype=torch.float32)})
         # Stack already-tensor fields along batch dimension.
         elif torch.is_tensor(v[0]):
              batch_tensor_dict.update({k: torch.stack(v)})
@@ -217,6 +224,116 @@ def _load_offline_hardneg_index(dataset, args, logger):
     }
 
 
+def _load_mga_pseudo_records(args, logger):
+    if not bool(getattr(args, "use_mga_pseudo", False)):
+        return None
+    if str(getattr(args, "dataset_name", "")) != "RGBT-PEDES":
+        logger.warning(
+            "[MGA] use_mga_pseudo=True is ignored for dataset_name=%s; "
+            "MGA pseudo fields are only enabled for RGBT-PEDES training.",
+            str(getattr(args, "dataset_name", "")),
+        )
+        return None
+
+    pseudo_json = str(getattr(args, "mga_pseudo_json", "") or "").strip()
+    if pseudo_json == "":
+        logger.warning(
+            "[MGA] use_mga_pseudo=True but --mga_pseudo_json is empty; "
+            "pseudo auxiliary fields are disabled."
+        )
+        return None
+    if not op.isfile(pseudo_json):
+        logger.warning(
+            "[MGA] mga_pseudo_json does not exist: %s; "
+            "pseudo auxiliary fields are disabled.",
+            pseudo_json,
+        )
+        return None
+
+    try:
+        records = load_mga_pseudo_json(pseudo_json, min_weight=0.0)
+    except Exception as exc:
+        logger.warning(
+            "[MGA] failed to load mga_pseudo_json=%s (%s); "
+            "pseudo auxiliary fields are disabled.",
+            pseudo_json,
+            exc,
+        )
+        return None
+
+    stats = collect_mga_pseudo_stats(records)
+    logger.info("[MGA] enabled=True")
+    logger.info("[MGA] pseudo_json=%s", pseudo_json)
+    logger.info("[MGA] records=%d", int(stats["record_count"]))
+    logger.info(
+        "[MGA] pseudo_texts=%d rgb_color_texts=%d thermal_shape_texts=%d negative_texts=%d",
+        int(stats["counts"]["pseudo_texts"]),
+        int(stats["counts"]["rgb_color_texts"]),
+        int(stats["counts"]["thermal_shape_texts"]),
+        int(stats["counts"]["negative_texts"]),
+    )
+    logger.info(
+        "[MGA] weight_mean=%.6f weight_min=%.6f weight_max=%.6f min_weight=%.6f",
+        float(stats["weight_mean"]),
+        float(stats["weight_min"]),
+        float(stats["weight_max"]),
+        float(getattr(args, "mga_min_weight", 0.3)),
+    )
+    return records
+
+
+def _truncate_debug_text(text, max_chars=120):
+    text = " ".join(str(text).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def _log_mga_debug_samples(train_set, args, logger):
+    num_samples = int(getattr(args, "mga_debug_print_samples", 0))
+    if num_samples <= 0:
+        return
+    if not hasattr(train_set, "debug_mga_pseudo_sample"):
+        logger.warning("[MGA][DEBUG] train_set does not support MGA debug samples.")
+        return
+
+    rng = random.Random(1)
+    printed = 0
+    for index in range(len(train_set)):
+        sample = train_set.debug_mga_pseudo_sample(index, rng=rng)
+        if not sample:
+            continue
+        matched = any(
+            bool(sample.get(key, False))
+            for key in (
+                "mga_has_pseudo",
+                "mga_has_rgb_color",
+                "mga_has_t_shape",
+                "mga_has_negative",
+            )
+        )
+        if not matched:
+            continue
+        logger.info(
+            "[MGA][DEBUG_SAMPLE] index=%d image_id=%s raw_caption=%s pseudo=%s pseudo_w=%.4f rgb_color=%s rgb_w=%.4f t_shape=%s t_w=%.4f negative=%s neg_w=%.4f",
+            index,
+            str(sample.get("image_id", "")),
+            _truncate_debug_text(sample.get("raw_caption", "")),
+            _truncate_debug_text(sample.get("mga_pseudo_text", "")),
+            float(sample.get("mga_pseudo_weight", 0.0)),
+            _truncate_debug_text(sample.get("mga_rgb_color_text", "")),
+            float(sample.get("mga_rgb_color_weight", 0.0)),
+            _truncate_debug_text(sample.get("mga_t_shape_text", "")),
+            float(sample.get("mga_t_shape_weight", 0.0)),
+            _truncate_debug_text(sample.get("mga_negative_text", "")),
+            float(sample.get("mga_negative_weight", 0.0)),
+        )
+        printed += 1
+        if printed >= num_samples:
+            break
+    logger.info("[MGA][DEBUG] printed_matched_samples=%d", printed)
+
+
 def _append_synth_captions_to_train(dataset, args, logger):
     use_synth = bool(getattr(args, "use_synth_caption_bank", False))
     train_mode = str(getattr(args, "synth_caption_train_mode", "append")).lower()
@@ -338,6 +455,7 @@ def build_dataloader(args, tranforms=None):
             dataset, args, logger
         )
         offline_hardneg = _load_offline_hardneg_index(dataset, args, logger)
+        mga_pseudo_records = _load_mga_pseudo_records(args, logger)
         # Build transform pipelines for train and validation.
         train_transforms = build_transforms(img_size=args.img_size,
                                             aug=args.img_aug,
@@ -367,6 +485,14 @@ def build_dataloader(args, tranforms=None):
                 offline_hn_sample_mode=str(
                     getattr(args, "offline_hn_sample_mode", "random")
                 ),
+                mga_pseudo_records=mga_pseudo_records,
+                mga_min_weight=float(getattr(args, "mga_min_weight", 0.3)),
+                mga_pseudo_sample_prob=float(
+                    getattr(args, "mga_pseudo_sample_prob", 0.35)
+                ),
+                mga_attr_sample_prob=float(
+                    getattr(args, "mga_attr_sample_prob", 0.5)
+                ),
             )
         else:
             train_set = ImageTextDataset(
@@ -389,7 +515,16 @@ def build_dataloader(args, tranforms=None):
                 offline_hn_sample_mode=str(
                     getattr(args, "offline_hn_sample_mode", "random")
                 ),
+                mga_pseudo_records=mga_pseudo_records,
+                mga_min_weight=float(getattr(args, "mga_min_weight", 0.3)),
+                mga_pseudo_sample_prob=float(
+                    getattr(args, "mga_pseudo_sample_prob", 0.35)
+                ),
+                mga_attr_sample_prob=float(
+                    getattr(args, "mga_attr_sample_prob", 0.5)
+                ),
             )
+        _log_mga_debug_samples(train_set, args, logger)
 
         if args.sampler == 'identity':
             if args.distributed:

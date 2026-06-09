@@ -22,7 +22,21 @@ from utils.qalr_v4_gate import (
 )
 
 
-THRESHOLDS = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98]
+THRESHOLDS = [
+    0.05,
+    0.10,
+    0.20,
+    0.30,
+    0.40,
+    0.50,
+    0.60,
+    0.70,
+    0.80,
+    0.90,
+    0.95,
+    0.98,
+    0.995,
+]
 CANDIDATE_RANK_MAX_VALUES = [2, 3, 5, 10]
 
 
@@ -46,7 +60,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--target_type", type=str, default="promote", choices=["match", "promote"])
+    parser.add_argument(
+        "--target_type",
+        type=str,
+        default="promote",
+        choices=["match", "promote", "residual_promote"],
+    )
     parser.add_argument(
         "--ignore_old_top1_candidate",
         default=True,
@@ -56,6 +75,23 @@ def parse_args():
     parser.add_argument("--old_correct_negative_weight", type=float, default=1.0)
     parser.add_argument("--neutral_negative_weight", type=float, default=0.25)
     parser.add_argument("--hurt_negative_weight", type=float, default=1.0)
+    parser.add_argument("--residual_stage1_margin_max", type=float, default=0.008)
+    parser.add_argument("--residual_stage1_gap_min", type=float, default=0.015)
+    parser.add_argument("--residual_stage2_margin_min", type=float, default=0.008)
+    parser.add_argument("--residual_stage2_margin_max", type=float, default=0.010)
+    parser.add_argument("--residual_stage2_gap_min", type=float, default=0.011)
+    parser.add_argument(
+        "--residual_exclude_v3_hits",
+        default=True,
+        action="store_true",
+        help="exclude all candidates from queries already hit by v3 two-stage",
+    )
+    parser.add_argument(
+        "--residual_preserve_v3_base",
+        default=True,
+        action="store_true",
+        help="do not apply residual gate on queries already changed by v3 two-stage",
+    )
     return parser.parse_args()
 
 
@@ -196,10 +232,116 @@ def binary_auc(scores, labels):
     return float(auc.item())
 
 
+def feature_column(payload, name):
+    feature_names = list(payload["feature_names"])
+    if name not in feature_names:
+        raise KeyError(f"feature {name!r} is missing from payload feature_names.")
+    return int(feature_names.index(name))
+
+
+def summarize_change(old_correct, new_correct):
+    if (not old_correct) and new_correct:
+        return "improved"
+    if old_correct and (not new_correct):
+        return "hurt"
+    return "neutral"
+
+
+def compute_v3_two_stage_outcomes(payload, args):
+    features = payload["features"].float()
+    groups = payload["groups"]
+    q_pids = payload["q_pids"].long()
+    candidate_pids = payload["candidate_pids"].long()
+    candidate_global_ranks = payload["candidate_global_ranks"].long()
+    starts = groups["starts"].long()
+    ends = groups["ends"].long()
+
+    margin_idx = feature_column(payload, "global_top12_margin")
+    gap_idx = feature_column(payload, "local_avg_gap_to_old_top1")
+    local_avg_rank_idx = feature_column(payload, "local_avg_rank")
+    local_avg_score_idx = feature_column(payload, "local_avg_score")
+
+    num_groups = int(starts.numel())
+    query_hit = torch.zeros(num_groups, dtype=torch.bool)
+    selected_indices = torch.full((num_groups,), -1, dtype=torch.long)
+    old_indices = torch.full((num_groups,), -1, dtype=torch.long)
+    changed = 0
+    improved = 0
+    hurt = 0
+    neutral = 0
+
+    for group_id, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+        if end <= start:
+            continue
+        q_pid = int(q_pids[start].item())
+        ranks = candidate_global_ranks[start:end]
+        old_rel = ranks.eq(1).nonzero(as_tuple=False).view(-1)
+        old_offset = int(old_rel[0].item()) if old_rel.numel() else 0
+        old_index = int(start + old_offset)
+        old_indices[group_id] = int(old_index)
+
+        local_features = features[start:end]
+        margin = local_features[:, margin_idx]
+        gap = local_features[:, gap_idx]
+        local_avg_rank = local_features[:, local_avg_rank_idx]
+        local_avg_score = local_features[:, local_avg_score_idx]
+
+        stage1 = (
+            margin.le(float(args.residual_stage1_margin_max))
+            & gap.ge(float(args.residual_stage1_gap_min))
+            & ranks.le(2)
+            & local_avg_rank.le(1.0)
+        )
+        stage2 = (
+            margin.ge(float(args.residual_stage2_margin_min))
+            & margin.le(float(args.residual_stage2_margin_max))
+            & gap.ge(float(args.residual_stage2_gap_min))
+            & ranks.le(2)
+            & local_avg_rank.le(1.0)
+        )
+        hit_mask = stage1 if bool(stage1.any().item()) else stage2
+        if not bool(hit_mask.any().item()):
+            continue
+
+        masked_scores = local_avg_score.clone()
+        masked_scores[~hit_mask] = -float("inf")
+        selected_offset = int(torch.argmax(masked_scores).item())
+        selected_index = int(start + selected_offset)
+        selected_indices[group_id] = int(selected_index)
+        query_hit[group_id] = True
+
+        if selected_index == old_index:
+            continue
+        changed += 1
+        old_correct = int(candidate_pids[old_index].item()) == q_pid
+        new_correct = int(candidate_pids[selected_index].item()) == q_pid
+        outcome = summarize_change(old_correct, new_correct)
+        if outcome == "improved":
+            improved += 1
+        elif outcome == "hurt":
+            hurt += 1
+        else:
+            neutral += 1
+
+    return {
+        "query_hit": query_hit,
+        "selected_indices": selected_indices,
+        "old_indices": old_indices,
+        "summary": {
+            "changed": int(changed),
+            "improved": int(improved),
+            "hurt": int(hurt),
+            "neutral": int(neutral),
+            "net": int(improved - hurt),
+        },
+    }
+
+
 def prepare_training_targets(payload, args):
     match_labels = payload["labels"].float()
     num_rows = int(match_labels.numel())
-    if str(args.target_type) == "match":
+    target_type = str(args.target_type)
+    if target_type == "match":
         return {
             "labels": match_labels,
             "sample_weights": torch.ones(num_rows, dtype=torch.float32),
@@ -209,6 +351,7 @@ def prepare_training_targets(payload, args):
                 "action_positive_count": int(match_labels.sum().item()),
                 "action_negative_count": int(num_rows - int(match_labels.sum().item())),
                 "ignored_old_top1_count": 0,
+                "ignored_v3_hit_query_count": 0,
             },
         }
 
@@ -223,10 +366,26 @@ def prepare_training_targets(payload, args):
     sample_weights = torch.ones(num_rows, dtype=torch.float32)
     train_mask = torch.ones(num_rows, dtype=torch.bool)
     ignored_old_top1_count = 0
+    ignored_v3_hit_query_count = 0
+    v3_outcomes = None
+    v3_query_hit = None
+    if target_type == "residual_promote":
+        v3_outcomes = compute_v3_two_stage_outcomes(payload, args)
+        v3_query_hit = v3_outcomes["query_hit"].bool()
 
-    for start, end in zip(starts.tolist(), ends.tolist()):
+    for group_id, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
         if end <= start:
             continue
+        if (
+            target_type == "residual_promote"
+            and bool(args.residual_exclude_v3_hits)
+            and v3_query_hit is not None
+            and bool(v3_query_hit[group_id].item())
+        ):
+            train_mask[int(start) : int(end)] = False
+            ignored_v3_hit_query_count += 1
+            continue
+
         q_pid = int(q_pids[start].item())
         ranks = candidate_global_ranks[start:end]
         old_rel = ranks.eq(1).nonzero(as_tuple=False).view(-1)
@@ -258,16 +417,20 @@ def prepare_training_targets(payload, args):
     valid_labels = labels[train_mask]
     positive_count = int(valid_labels.sum().item())
     negative_count = int(valid_labels.numel() - positive_count)
+    stats = {
+        "target_type": target_type,
+        "action_positive_count": int(positive_count),
+        "action_negative_count": int(negative_count),
+        "ignored_old_top1_count": int(ignored_old_top1_count),
+        "ignored_v3_hit_query_count": int(ignored_v3_hit_query_count),
+    }
+    if v3_outcomes is not None:
+        stats["v3_base_summary"] = dict(v3_outcomes["summary"])
     return {
         "labels": labels,
         "sample_weights": sample_weights,
         "train_mask": train_mask,
-        "stats": {
-            "target_type": "promote",
-            "action_positive_count": int(positive_count),
-            "action_negative_count": int(negative_count),
-            "ignored_old_top1_count": int(ignored_old_top1_count),
-        },
+        "stats": stats,
     }
 
 
@@ -352,11 +515,139 @@ def threshold_search(payload, probs):
     return rows, best
 
 
+def residual_threshold_search(payload, probs, args):
+    groups = payload["groups"]
+    q_pids = payload["q_pids"].long()
+    candidate_pids = payload["candidate_pids"].long()
+    candidate_global_ranks = payload["candidate_global_ranks"].long()
+    starts = groups["starts"].long()
+    ends = groups["ends"].long()
+    v3_outcomes = compute_v3_two_stage_outcomes(payload, args)
+    v3_query_hit = v3_outcomes["query_hit"].bool()
+    base_summary = dict(v3_outcomes["summary"])
+
+    rows = []
+    best = None
+    for candidate_rank_max in CANDIDATE_RANK_MAX_VALUES:
+        for threshold in THRESHOLDS:
+            residual_changed = 0
+            residual_improved = 0
+            residual_hurt = 0
+            residual_neutral = 0
+            for group_id, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+                if end <= start:
+                    continue
+                if (
+                    bool(args.residual_preserve_v3_base)
+                    and bool(v3_query_hit[group_id].item())
+                ):
+                    continue
+
+                q_pid = int(q_pids[start].item())
+                ranks = candidate_global_ranks[start:end]
+                old_rel = ranks.eq(1).nonzero(as_tuple=False).view(-1)
+                old_offset = int(old_rel[0].item()) if old_rel.numel() else 0
+                old_index = int(start + old_offset)
+                old_correct = int(candidate_pids[old_index].item()) == q_pid
+
+                local_probs = probs[start:end]
+                eligible = (
+                    ranks.gt(1)
+                    & ranks.le(int(candidate_rank_max))
+                    & local_probs.ge(float(threshold))
+                )
+                if not bool(eligible.any().item()):
+                    continue
+
+                masked_probs = local_probs.clone()
+                masked_probs[~eligible] = -1.0
+                selected_offset = int(torch.argmax(masked_probs).item())
+                selected_index = int(start + selected_offset)
+                if selected_index == old_index:
+                    continue
+
+                residual_changed += 1
+                new_correct = int(candidate_pids[selected_index].item()) == q_pid
+                outcome = summarize_change(old_correct, new_correct)
+                if outcome == "improved":
+                    residual_improved += 1
+                elif outcome == "hurt":
+                    residual_hurt += 1
+                else:
+                    residual_neutral += 1
+
+            residual_net = residual_improved - residual_hurt
+            total_changed = int(base_summary["changed"] + residual_changed)
+            total_improved = int(base_summary["improved"] + residual_improved)
+            total_hurt = int(base_summary["hurt"] + residual_hurt)
+            total_neutral = int(base_summary["neutral"] + residual_neutral)
+            total_net = int(total_improved - total_hurt)
+            score = int(total_net - 3 * total_hurt)
+            row = {
+                "candidate_rank_max": int(candidate_rank_max),
+                "threshold": float(threshold),
+                "base_changed": int(base_summary["changed"]),
+                "base_improved": int(base_summary["improved"]),
+                "base_hurt": int(base_summary["hurt"]),
+                "base_neutral": int(base_summary["neutral"]),
+                "base_net": int(base_summary["net"]),
+                "residual_changed": int(residual_changed),
+                "residual_improved": int(residual_improved),
+                "residual_hurt": int(residual_hurt),
+                "residual_neutral": int(residual_neutral),
+                "residual_net": int(residual_net),
+                "total_changed": int(total_changed),
+                "total_improved": int(total_improved),
+                "total_hurt": int(total_hurt),
+                "total_neutral": int(total_neutral),
+                "total_net": int(total_net),
+                "changed": int(total_changed),
+                "improved": int(total_improved),
+                "hurt": int(total_hurt),
+                "neutral": int(total_neutral),
+                "net": int(total_net),
+                "score": int(score),
+            }
+            rows.append(row)
+            if best is None or (
+                row["score"],
+                row["total_net"],
+                -row["total_hurt"],
+                row["residual_net"],
+                -row["residual_hurt"],
+                -row["total_changed"],
+            ) > (
+                best["score"],
+                best["total_net"],
+                -best["total_hurt"],
+                best["residual_net"],
+                -best["residual_hurt"],
+                -best["total_changed"],
+            ):
+                best = row
+    return rows, best, base_summary
+
+
 def write_threshold_tsv(path, rows):
     header = [
         "epoch",
         "candidate_rank_max",
         "threshold",
+        "base_changed",
+        "base_improved",
+        "base_hurt",
+        "base_neutral",
+        "base_net",
+        "residual_changed",
+        "residual_improved",
+        "residual_hurt",
+        "residual_neutral",
+        "residual_net",
+        "total_changed",
+        "total_improved",
+        "total_hurt",
+        "total_neutral",
+        "total_net",
         "changed",
         "improved",
         "hurt",
@@ -367,22 +658,13 @@ def write_threshold_tsv(path, rows):
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("\t".join(header) + "\n")
         for row in rows:
-            handle.write(
-                "\t".join(
-                    [
-                        str(row["epoch"]),
-                        str(row["candidate_rank_max"]),
-                        f"{row['threshold']:.2f}",
-                        str(row["changed"]),
-                        str(row["improved"]),
-                        str(row["hurt"]),
-                        str(row["neutral"]),
-                        str(row["net"]),
-                        str(row["score"]),
-                    ]
-                )
-                + "\n"
-            )
+            values = []
+            for key in header:
+                if key == "threshold":
+                    values.append(f"{float(row.get(key, 0.0)):.3f}".rstrip("0").rstrip("."))
+                else:
+                    values.append(str(row.get(key, "")))
+            handle.write("\t".join(values) + "\n")
 
 
 def main():
@@ -479,6 +761,15 @@ def main():
         "old_correct_negative_weight": float(args.old_correct_negative_weight),
         "neutral_negative_weight": float(args.neutral_negative_weight),
         "hurt_negative_weight": float(args.hurt_negative_weight),
+        "residual_v3_thresholds": {
+            "stage1_margin_max": float(args.residual_stage1_margin_max),
+            "stage1_gap_min": float(args.residual_stage1_gap_min),
+            "stage2_margin_min": float(args.residual_stage2_margin_min),
+            "stage2_margin_max": float(args.residual_stage2_margin_max),
+            "stage2_gap_min": float(args.residual_stage2_gap_min),
+            "exclude_v3_hits": bool(args.residual_exclude_v3_hits),
+            "preserve_v3_base": bool(args.residual_preserve_v3_base),
+        },
         "train_pt": op.abspath(args.train_pt),
         "holdout_pt": op.abspath(args.holdout_pt),
         "pos_weight": float(pos_weight.item()),
@@ -493,6 +784,27 @@ def main():
     log_line(log_lines, f"target_type={args.target_type}")
     log_line(log_lines, f"action_positive_count={positive_count}")
     log_line(log_lines, f"action_negative_count={negative_count}")
+    if str(args.target_type) == "residual_promote":
+        log_line(log_lines, f"residual_train_positive_count={positive_count}")
+        log_line(log_lines, f"residual_train_negative_count={negative_count}")
+        log_line(
+            log_lines,
+            (
+                "ignored_v3_hit_query_count="
+                f"{train_targets['stats'].get('ignored_v3_hit_query_count', 0)}"
+            ),
+        )
+        holdout_base = holdout_targets["stats"].get("v3_base_summary", {})
+        log_line(
+            log_lines,
+            (
+                "v3_base_holdout "
+                f"changed={holdout_base.get('changed', 0)} "
+                f"improved={holdout_base.get('improved', 0)} "
+                f"hurt={holdout_base.get('hurt', 0)} "
+                f"net={holdout_base.get('net', 0)}"
+            ),
+        )
     log_line(
         log_lines,
         f"ignored_old_top1_count={train_targets['stats'].get('ignored_old_top1_count', 0)}",
@@ -558,7 +870,14 @@ def main():
         )
         holdout_probs = torch.sigmoid(holdout_logits)
         holdout_auc = binary_auc(holdout_probs[holdout_mask], holdout_labels.long())
-        rows, best_row = threshold_search(holdout_payload, holdout_probs)
+        if str(args.target_type) == "residual_promote":
+            rows, best_row, _ = residual_threshold_search(
+                holdout_payload,
+                holdout_probs,
+                args,
+            )
+        else:
+            rows, best_row = threshold_search(holdout_payload, holdout_probs)
         for row in rows:
             threshold_rows_all.append({"epoch": int(epoch), **row})
 
@@ -596,18 +915,42 @@ def main():
             stale_epochs += 1
 
         auc_text = "NA" if holdout_auc is None else f"{holdout_auc:.6f}"
-        log_line(
-            log_lines,
-            (
-                f"epoch={epoch:03d} train_loss={train_loss:.6f} "
-                f"holdout_loss={holdout_loss:.6f} holdout_auc={auc_text} "
-                f"best_rank_max={best_row['candidate_rank_max']} "
-                f"best_threshold={best_row['threshold']:.2f} "
-                f"changed={best_row['changed']} improved={best_row['improved']} "
-                f"hurt={best_row['hurt']} neutral={best_row['neutral']} "
-                f"net={best_row['net']} score={best_row['score']}"
-            ),
-        )
+        if str(args.target_type) == "residual_promote":
+            log_line(
+                log_lines,
+                (
+                    f"epoch={epoch:03d} train_loss={train_loss:.6f} "
+                    f"holdout_loss={holdout_loss:.6f} holdout_auc={auc_text} "
+                    f"best_rank_max={best_row['candidate_rank_max']} "
+                    f"best_threshold={best_row['threshold']:.3f} "
+                    f"base={best_row['base_changed']}/"
+                    f"{best_row['base_improved']}/"
+                    f"{best_row['base_hurt']}/"
+                    f"{best_row['base_net']} "
+                    f"residual={best_row['residual_changed']}/"
+                    f"{best_row['residual_improved']}/"
+                    f"{best_row['residual_hurt']}/"
+                    f"{best_row['residual_net']} "
+                    f"total_changed={best_row['total_changed']} "
+                    f"total_improved={best_row['total_improved']} "
+                    f"total_hurt={best_row['total_hurt']} "
+                    f"total_neutral={best_row['total_neutral']} "
+                    f"total_net={best_row['total_net']} score={best_row['score']}"
+                ),
+            )
+        else:
+            log_line(
+                log_lines,
+                (
+                    f"epoch={epoch:03d} train_loss={train_loss:.6f} "
+                    f"holdout_loss={holdout_loss:.6f} holdout_auc={auc_text} "
+                    f"best_rank_max={best_row['candidate_rank_max']} "
+                    f"best_threshold={best_row['threshold']:.2f} "
+                    f"changed={best_row['changed']} improved={best_row['improved']} "
+                    f"hurt={best_row['hurt']} neutral={best_row['neutral']} "
+                    f"net={best_row['net']} score={best_row['score']}"
+                ),
+            )
 
         if args.patience > 0 and stale_epochs >= int(args.patience):
             log_line(
@@ -649,6 +992,29 @@ def main():
     with open(op.join(args.out_dir, "feature_meta.json"), "w", encoding="utf-8") as handle:
         json.dump(feature_meta, handle, indent=2, sort_keys=True)
 
+    if best_metrics and str(args.target_type) == "residual_promote":
+        best_threshold = dict(best_metrics.get("best_threshold", {}))
+        log_line(
+            log_lines,
+            (
+                "best_total_threshold_result "
+                f"rank_max={best_threshold.get('candidate_rank_max')} "
+                f"threshold={float(best_threshold.get('threshold', 0.0)):.3f} "
+                f"base_changed={best_threshold.get('base_changed')} "
+                f"base_improved={best_threshold.get('base_improved')} "
+                f"base_hurt={best_threshold.get('base_hurt')} "
+                f"base_net={best_threshold.get('base_net')} "
+                f"residual_changed={best_threshold.get('residual_changed')} "
+                f"residual_improved={best_threshold.get('residual_improved')} "
+                f"residual_hurt={best_threshold.get('residual_hurt')} "
+                f"residual_net={best_threshold.get('residual_net')} "
+                f"total_changed={best_threshold.get('total_changed')} "
+                f"total_improved={best_threshold.get('total_improved')} "
+                f"total_hurt={best_threshold.get('total_hurt')} "
+                f"total_net={best_threshold.get('total_net')} "
+                f"score={best_threshold.get('score')}"
+            ),
+        )
     if best_metrics:
         log_line(log_lines, "[BEST] " + json.dumps(best_metrics, sort_keys=True))
     with open(op.join(args.out_dir, "train_log.txt"), "w", encoding="utf-8") as handle:
