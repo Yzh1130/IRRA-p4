@@ -159,6 +159,39 @@ Validate a file with:
 python tools/validate_mga_pseudo_json.py --json path/to/pseudo.jsonl --show_examples 5
 ```
 
+## Rule-Based Pseudo JSONL Builder
+
+For first-pass E1/E2/E3 screening, you can build a conservative offline pseudo
+JSONL directly from the original RGBT-PEDES train captions. This does not use
+the network, does not call any captioning API, and does not read eval/test data
+when `--split train` is used.
+
+```bash
+mkdir -p pack/mga_pseudo
+
+python tools/build_mga_pseudo_from_captions.py \
+  --root_dir /home/IRRA-main/IRRA-main/datasets/TextReID \
+  --dataset_name RGBT-PEDES \
+  --split train \
+  --out_json pack/mga_pseudo/mga_pseudo_train_rule_v1.jsonl \
+  --debug_examples 5
+```
+
+Then validate the JSONL:
+
+```bash
+python tools/validate_mga_pseudo_json.py \
+  --json pack/mga_pseudo/mga_pseudo_train_rule_v1.jsonl \
+  --show_examples 5
+```
+
+The rule builder writes one row per split sample with the dataset-provided
+`pid`, `image_id`, `rgb_path`, `thermal_path`, and original `caption`. It always
+adds full, short, and attribute pseudo texts. RGB color and thermal shape texts
+are added only when the original caption contains matching rule terms.
+`negative_texts` is intentionally left empty in v1 to avoid incorrect negative
+supervision.
+
 ## Four-Experiment Screening
 
 Run:
