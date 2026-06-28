@@ -25,3 +25,15 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Datasets / large local files
+datasets/
+IRRA-main/datasets/
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# Local documents / experiment notes
+IRRA日志/
+*.docx
