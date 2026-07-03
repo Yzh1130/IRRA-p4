@@ -4207,9 +4207,14 @@ def _empty_mdrc_terms(reference, lambda_effective=0.0):
         "loss_mdrc_feature": zero,
         "loss_mdrc_similarity": zero,
         "loss_mdrc_weighted": zero,
+        "weighted_mdrc": zero,
         "mdrc_lambda": zero.new_tensor(float(lambda_effective)),
         "mdrc_active": zero,
         "mdrc_feature_only_degraded": zero,
+        "mdrc_delta_rgb": zero,
+        "mdrc_delta_ir": zero,
+        "mdrc_cos_clean_degraded": zero,
+        "mdrc_degraded_requires_grad": False,
         "mdrc_image_feature_key": "none",
         "mdrc_text_feature_key": "none",
     }
@@ -4240,6 +4245,15 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
         prob=float(getattr(args, "mdrc_prob", 0.5)),
         modes=getattr(args, "mdrc_degrade_modes", None),
     )
+    delta_rgb = (degraded_rgb.detach().float() - batch["images"].detach().float()).abs().mean()
+    if torch.is_tensor(degraded_ir) and "thermal_images" in batch:
+        delta_ir = (
+            degraded_ir.detach().float()
+            - batch["thermal_images"].detach().float()
+        ).abs().mean()
+    else:
+        delta_ir = delta_rgb.new_zeros(())
+
     degraded_batch = dict(batch)
     degraded_batch["images"] = degraded_rgb
     if "thermal_images" in batch:
@@ -4254,20 +4268,37 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
         "degraded image",
         required=True,
     )
+    degraded_requires_grad = bool(degraded_img_feat.requires_grad)
+    if not degraded_requires_grad:
+        raise RuntimeError(
+            "MDRC degraded image feature does not require grad. "
+            "The degraded feature-only branch must remain in the autograd graph."
+        )
 
     loss_feature = mdrc_feature_consistency(clean_img_feat.detach(), degraded_img_feat)
     loss_similarity = loss_feature.new_zeros(())
     loss_mdrc = loss_feature
-    loss_weighted = float(lambda_effective) * loss_mdrc
+    lambda_tensor = loss_mdrc.new_tensor(float(lambda_effective))
+    loss_weighted = lambda_tensor * loss_mdrc
+    cos_clean_degraded = F.cosine_similarity(
+        F.normalize(clean_img_feat.detach().float(), p=2, dim=-1, eps=1e-12),
+        F.normalize(degraded_img_feat.detach().float(), p=2, dim=-1, eps=1e-12),
+        dim=-1,
+    ).mean()
 
     return {
         "loss_mdrc": loss_mdrc,
         "loss_mdrc_feature": loss_feature,
         "loss_mdrc_similarity": loss_similarity,
         "loss_mdrc_weighted": loss_weighted,
-        "mdrc_lambda": loss_mdrc.new_tensor(float(lambda_effective)),
+        "weighted_mdrc": loss_weighted,
+        "mdrc_lambda": lambda_tensor,
         "mdrc_active": loss_mdrc.new_ones(()),
         "mdrc_feature_only_degraded": loss_mdrc.new_ones(()),
+        "mdrc_delta_rgb": delta_rgb,
+        "mdrc_delta_ir": delta_ir,
+        "mdrc_cos_clean_degraded": cos_clean_degraded,
+        "mdrc_degraded_requires_grad": degraded_requires_grad,
         "mdrc_image_feature_key": degraded_image_feature_key,
         "mdrc_text_feature_key": "disabled_v1_1",
     }
@@ -4278,7 +4309,49 @@ def _add_mdrc_to_total_loss(args, total_loss, mdrc_terms):
         return total_loss
     if not mdrc_terms:
         return total_loss
-    return total_loss + mdrc_terms["loss_mdrc_weighted"]
+    return total_loss + mdrc_terms["mdrc_lambda"] * mdrc_terms["loss_mdrc"]
+
+
+def _log_mdrc_debug_status(
+    logger,
+    args,
+    epoch,
+    n_iter,
+    baseline_loss,
+    total_loss,
+    mdrc_terms=None,
+):
+    reference = baseline_loss if torch.is_tensor(baseline_loss) else total_loss
+    empty_terms = _empty_mdrc_terms(
+        reference,
+        lambda_effective=_resolve_mdrc_lambda(args, epoch),
+    )
+    terms = mdrc_terms if mdrc_terms is not None else empty_terms
+    active = bool(_to_scalar(terms.get("mdrc_active", 0)) > 0.0)
+    reason = "active" if active else "warmup_or_disabled"
+    logger.info(
+        "[MDRC_DEBUG] active=%s reason=%s epoch=%d iter=%d "
+        "baseline_loss=%.6f loss_mdrc=%.6f lambda=%.6f "
+        "weighted_mdrc=%.6f total_loss=%.6f delta_rgb=%.6f "
+        "delta_ir=%.6f cos_clean_degraded=%.6f degraded_requires_grad=%s "
+        "feature_only_degraded=%s image_feature_key=%s text_feature_key=%s",
+        active,
+        reason,
+        int(epoch),
+        int(n_iter) + 1,
+        _to_scalar(baseline_loss),
+        _to_scalar(terms.get("loss_mdrc", 0)),
+        _to_scalar(terms.get("mdrc_lambda", 0)),
+        _to_scalar(terms.get("weighted_mdrc", terms.get("loss_mdrc_weighted", 0))),
+        _to_scalar(total_loss),
+        _to_scalar(terms.get("mdrc_delta_rgb", 0)),
+        _to_scalar(terms.get("mdrc_delta_ir", 0)),
+        _to_scalar(terms.get("mdrc_cos_clean_degraded", 0)),
+        bool(terms.get("mdrc_degraded_requires_grad", False)),
+        bool(_to_scalar(terms.get("mdrc_feature_only_degraded", 0)) > 0.0),
+        str(terms.get("mdrc_image_feature_key", "none")),
+        str(terms.get("mdrc_text_feature_key", "none")),
+    )
 
 
 def log_mdrc_config(logger, args):
@@ -4510,6 +4583,7 @@ def do_train(
         start_time = time.time()
         uspc_debug_logged_this_epoch = False
         dcalign_debug_logged_this_epoch = False
+        mdrc_debug_logged_this_epoch = False
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -4761,6 +4835,18 @@ def do_train(
                 )
                 ret.update(mdrc_terms)
                 total_loss = _add_mdrc_to_total_loss(args, total_loss, mdrc_terms)
+
+            if not mdrc_debug_logged_this_epoch:
+                _log_mdrc_debug_status(
+                    logger=logger,
+                    args=args,
+                    epoch=epoch,
+                    n_iter=n_iter,
+                    baseline_loss=baseline_total_loss,
+                    total_loss=total_loss,
+                    mdrc_terms=mdrc_terms,
+                )
+                mdrc_debug_logged_this_epoch = True
 
             if uspc_debug_should_log:
                 if uspc_inputs is None:
