@@ -263,6 +263,41 @@ if __name__ == "__main__":
         help="also save the pre-rerank raw similarity matrix when dumping eval scores",
     )
     parser.add_argument(
+        "--eval_degrade_mode",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "rgb_missing",
+            "ir_missing",
+            "rgb_noise",
+            "ir_noise",
+            "both_noise",
+            "rgb_blur",
+            "ir_blur",
+            "both_blur",
+        ],
+        help="evaluation-only temporary RGB/T degradation mode",
+    )
+    parser.add_argument(
+        "--eval_degrade_strength",
+        type=float,
+        default=1.0,
+        help="evaluation-only Gaussian noise std for *_noise degrade modes",
+    )
+    parser.add_argument(
+        "--eval_degrade_blur_kernel",
+        type=int,
+        default=7,
+        help="evaluation-only blur kernel size for *_blur degrade modes",
+    )
+    parser.add_argument(
+        "--eval_degrade_seed",
+        type=int,
+        default=2026,
+        help="evaluation-only random seed for degradation noise",
+    )
+    parser.add_argument(
         "--use_qalr",
         default=None,
         action="store_true",
@@ -797,6 +832,10 @@ if __name__ == "__main__":
             "--save_eval_scores requires --eval_scores_file, e.g. "
             "--eval_scores_file pack/scores/model_a.pt"
         )
+    if float(cli_args.eval_degrade_strength) < 0.0:
+        raise ValueError("--eval_degrade_strength must be >= 0.")
+    if int(cli_args.eval_degrade_blur_kernel) <= 0:
+        raise ValueError("--eval_degrade_blur_kernel must be > 0.")
 
     args = load_train_configs(cli_args.config_file)
     args = _apply_qalr_test_overrides(args, cli_args)
@@ -804,11 +843,22 @@ if __name__ == "__main__":
     args.save_eval_scores = bool(cli_args.save_eval_scores)
     args.eval_scores_file = str(cli_args.eval_scores_file)
     args.eval_scores_save_raw = bool(cli_args.eval_scores_save_raw)
+    args.eval_degrade_mode = str(cli_args.eval_degrade_mode)
+    args.eval_degrade_strength = float(cli_args.eval_degrade_strength)
+    args.eval_degrade_blur_kernel = int(cli_args.eval_degrade_blur_kernel)
+    args.eval_degrade_seed = int(cli_args.eval_degrade_seed)
     args.config_file = op.abspath(cli_args.config_file)
     args.test_ckpt_file = ""
 
     logger = setup_logger("IRRA", save_dir=args.output_dir, if_train=args.training)
     logger.info(args)
+    logger.info(
+        "[DEGRADE] mode=%s strength=%.6f blur_kernel=%d seed=%d",
+        args.eval_degrade_mode,
+        args.eval_degrade_strength,
+        args.eval_degrade_blur_kernel,
+        args.eval_degrade_seed,
+    )
     device = "cuda"
 
     if cli_args.use_train_validation_pipeline:

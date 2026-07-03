@@ -80,6 +80,7 @@ class Evaluator():
         self.logger = logging.getLogger("IRRA.eval")
         self.last_eval_result = None
         self._mtp_tokenizer = None
+        self._eval_degrade_generators = {}
         self.source = source
 
     def _get_mtp_tokenizer(self):
@@ -211,6 +212,94 @@ class Evaluator():
         t_feat = model.encode_image(thermal_img)
         return rgb_feat + t_feat
 
+    def _get_eval_degrade_generator(self, device, seed):
+        key = str(device)
+        if key not in self._eval_degrade_generators:
+            try:
+                generator = torch.Generator(device=device)
+            except (TypeError, RuntimeError):
+                device_type = getattr(device, "type", str(device).split(":")[0])
+                generator = torch.Generator(device=device_type)
+            self._eval_degrade_generators[key] = generator.manual_seed(int(seed))
+        return self._eval_degrade_generators[key]
+
+    def _clamp_like_eval_image(self, value, reference):
+        if not torch.is_tensor(value):
+            return value
+        if value.dim() <= 1:
+            return value
+        reduce_dims = tuple(range(1, reference.dim()))
+        ref = reference.detach().float()
+        min_value = ref.amin(dim=reduce_dims, keepdim=True).to(dtype=value.dtype)
+        max_value = ref.amax(dim=reduce_dims, keepdim=True).to(dtype=value.dtype)
+        return torch.max(torch.min(value, max_value), min_value)
+
+    def _add_eval_noise(self, tensor, strength, seed):
+        if tensor is None:
+            return None
+        if float(strength) <= 0.0:
+            return tensor
+        generator = self._get_eval_degrade_generator(tensor.device, seed)
+        noise = torch.randn(
+            tensor.shape,
+            device=tensor.device,
+            dtype=tensor.dtype,
+            generator=generator,
+        )
+        noisy = tensor + float(strength) * noise
+        return self._clamp_like_eval_image(noisy, tensor)
+
+    def _blur_eval_image(self, tensor, kernel_size):
+        if tensor is None:
+            return None
+        kernel_size = int(kernel_size)
+        if kernel_size <= 1:
+            return tensor
+        pad_total = kernel_size - 1
+        pad_left = pad_total // 2
+        pad_right = pad_total - pad_left
+        pad_top = pad_total // 2
+        pad_bottom = pad_total - pad_top
+        padded = F.pad(
+            tensor,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode="replicate",
+        )
+        return F.avg_pool2d(padded, kernel_size=kernel_size, stride=1)
+
+    def _apply_eval_degradation(self, model, img, thermal_img):
+        model_args = getattr(model, "args", None)
+        mode = str(getattr(model_args, "eval_degrade_mode", "none")).lower()
+        if mode == "none":
+            return img, thermal_img
+
+        strength = float(getattr(model_args, "eval_degrade_strength", 1.0))
+        blur_kernel = int(getattr(model_args, "eval_degrade_blur_kernel", 7))
+        seed = int(getattr(model_args, "eval_degrade_seed", 2026))
+
+        if mode == "rgb_missing":
+            img = torch.zeros_like(img)
+        elif mode == "ir_missing":
+            if thermal_img is not None:
+                thermal_img = torch.zeros_like(thermal_img)
+        elif mode == "rgb_noise":
+            img = self._add_eval_noise(img, strength, seed)
+        elif mode == "ir_noise":
+            thermal_img = self._add_eval_noise(thermal_img, strength, seed)
+        elif mode == "both_noise":
+            img = self._add_eval_noise(img, strength, seed)
+            thermal_img = self._add_eval_noise(thermal_img, strength, seed)
+        elif mode == "rgb_blur":
+            img = self._blur_eval_image(img, blur_kernel)
+        elif mode == "ir_blur":
+            thermal_img = self._blur_eval_image(thermal_img, blur_kernel)
+        elif mode == "both_blur":
+            img = self._blur_eval_image(img, blur_kernel)
+            thermal_img = self._blur_eval_image(thermal_img, blur_kernel)
+        else:
+            raise ValueError(f"Unsupported eval_degrade_mode: {mode}.")
+        return img, thermal_img
+
     def _compute_embedding(
         self, model, return_local_tokens=False, use_mtp_eval_fusion=False
     ):
@@ -290,6 +379,11 @@ class Evaluator():
                 pid, img = data
                 img = img.to(device)
                 thermal_img = None
+            img, thermal_img = self._apply_eval_degradation(
+                model,
+                img,
+                thermal_img,
+            )
             with torch.no_grad():
                 image_outputs = self._encode_gallery_feature(
                     model,
