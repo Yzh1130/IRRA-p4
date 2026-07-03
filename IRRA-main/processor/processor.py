@@ -23,6 +23,11 @@ from utils.checkpoint import load_state_dict
 from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
+from utils.mdrc import (
+    degrade_rgbt_batch,
+    mdrc_feature_consistency,
+    mdrc_similarity_consistency,
+)
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
 from utils.uspc_text_views import build_uspc_text_views
@@ -2006,6 +2011,10 @@ def _build_total_loss(args, ret, epoch=None):
                 "loss_dcalign_color",
                 "loss_dcalign_struct",
                 "loss_dcalign_full",
+                "loss_mdrc",
+                "loss_mdrc_feature",
+                "loss_mdrc_similarity",
+                "loss_mdrc_weighted",
                 "loss_mga_pseudo_sdm",
                 "loss_mga_rgb_color",
                 "loss_mga_t_shape",
@@ -4150,6 +4159,165 @@ def _compute_uncertainty_alignment_terms(args, ret, batch):
     return out
 
 
+MDRC_IMAGE_FEATURE_KEYS = (
+    "fused_det_feat",
+    "fused_prob_feat",
+    "fused_mu",
+    "fused_feat_det",
+    "fused_feat_sampled",
+)
+MDRC_TEXT_FEATURE_KEYS = (
+    "text_det_feat",
+    "text_prob_feat",
+    "text_mu",
+    "text_feat_det",
+    "text_feat_sampled",
+)
+
+
+def _mdrc_enabled(args):
+    return bool(getattr(args, "mdrc_enable", False))
+
+
+def _resolve_mdrc_lambda(args, epoch):
+    if not _mdrc_enabled(args):
+        return 0.0
+    target_lambda = float(getattr(args, "mdrc_lambda", 0.05))
+    if target_lambda <= 0.0:
+        return 0.0
+    warmup_epoch = max(0, int(getattr(args, "mdrc_warmup_epoch", 3)))
+    cur_epoch = int(epoch)
+    if warmup_epoch > 0 and cur_epoch < warmup_epoch:
+        return 0.0
+    if warmup_epoch <= 0:
+        return target_lambda
+    ramp_epochs = max(1, warmup_epoch)
+    ramp_step = max(0, cur_epoch - warmup_epoch + 1)
+    ramp_factor = min(1.0, float(ramp_step) / float(ramp_epochs))
+    return target_lambda * ramp_factor
+
+
+def _extract_mdrc_feature(ret, candidate_keys, feature_name, required=True):
+    for key in candidate_keys:
+        value = ret.get(key, None)
+        if torch.is_tensor(value) and value.dim() == 2:
+            return value, key
+    if not required:
+        return None, "none"
+    raise KeyError(
+        f"MDRC requires a 2D {feature_name} feature in one of "
+        f"{list(candidate_keys)}, but got keys: {list(ret.keys())}."
+    )
+
+
+def _empty_mdrc_terms(reference, lambda_effective=0.0):
+    zero = reference.new_zeros(())
+    return {
+        "loss_mdrc": zero,
+        "loss_mdrc_feature": zero,
+        "loss_mdrc_similarity": zero,
+        "loss_mdrc_weighted": zero,
+        "mdrc_lambda": zero.new_tensor(float(lambda_effective)),
+        "mdrc_active": zero,
+        "mdrc_image_feature_key": "none",
+        "mdrc_text_feature_key": "none",
+    }
+
+
+def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
+    """
+    MDRC v1: training-stage clean-degraded consistency.
+
+    The clean batch keeps the baseline loss path. When enabled after warmup, a
+    degraded RGB/T view is forwarded once more and aligned to detached clean
+    image features, with optional image-text similarity distribution matching.
+    """
+    reference = batch["images"]
+    lambda_effective = _resolve_mdrc_lambda(args, epoch)
+    if lambda_effective <= 0.0:
+        return _empty_mdrc_terms(reference, lambda_effective=lambda_effective)
+
+    clean_img_feat, image_feature_key = _extract_mdrc_feature(
+        clean_ret,
+        MDRC_IMAGE_FEATURE_KEYS,
+        "image",
+        required=True,
+    )
+    text_feat, text_feature_key = _extract_mdrc_feature(
+        clean_ret,
+        MDRC_TEXT_FEATURE_KEYS,
+        "text",
+        required=False,
+    )
+
+    degraded_rgb, degraded_ir = degrade_rgbt_batch(
+        batch["images"],
+        batch.get("thermal_images", None),
+        prob=float(getattr(args, "mdrc_prob", 0.5)),
+        modes=getattr(args, "mdrc_degrade_modes", None),
+    )
+    degraded_batch = dict(batch)
+    degraded_batch["images"] = degraded_rgb
+    if "thermal_images" in batch:
+        degraded_batch["thermal_images"] = degraded_ir
+
+    degraded_ret = model(degraded_batch)
+    degraded_img_feat, degraded_image_feature_key = _extract_mdrc_feature(
+        degraded_ret,
+        (image_feature_key,) + tuple(
+            key for key in MDRC_IMAGE_FEATURE_KEYS if key != image_feature_key
+        ),
+        "degraded image",
+        required=True,
+    )
+
+    loss_feature = mdrc_feature_consistency(clean_img_feat, degraded_img_feat)
+    if text_feat is not None:
+        loss_similarity = mdrc_similarity_consistency(
+            clean_img_feat,
+            degraded_img_feat,
+            text_feat,
+            temp=float(getattr(args, "mdrc_temp", 0.07)),
+        )
+    else:
+        loss_similarity = loss_feature.new_zeros(())
+    loss_mdrc = loss_feature + loss_similarity
+    loss_weighted = float(lambda_effective) * loss_mdrc
+
+    return {
+        "loss_mdrc": loss_mdrc,
+        "loss_mdrc_feature": loss_feature,
+        "loss_mdrc_similarity": loss_similarity,
+        "loss_mdrc_weighted": loss_weighted,
+        "mdrc_lambda": loss_mdrc.new_tensor(float(lambda_effective)),
+        "mdrc_active": loss_mdrc.new_ones(()),
+        "mdrc_image_feature_key": degraded_image_feature_key,
+        "mdrc_text_feature_key": text_feature_key,
+    }
+
+
+def _add_mdrc_to_total_loss(args, total_loss, mdrc_terms):
+    if not _mdrc_enabled(args):
+        return total_loss
+    if not mdrc_terms:
+        return total_loss
+    return total_loss + mdrc_terms["loss_mdrc_weighted"]
+
+
+def log_mdrc_config(logger, args):
+    if not _mdrc_enabled(args):
+        return
+    logger.info(
+        "[MDRC] enable=%s lambda=%.6f prob=%.6f warmup_epoch=%d temp=%.6f modes=%s",
+        bool(getattr(args, "mdrc_enable", False)),
+        float(getattr(args, "mdrc_lambda", 0.05)),
+        float(getattr(args, "mdrc_prob", 0.5)),
+        int(getattr(args, "mdrc_warmup_epoch", 3)),
+        float(getattr(args, "mdrc_temp", 0.07)),
+        list(getattr(args, "mdrc_degrade_modes", [])),
+    )
+
+
 def do_train(
     start_epoch,
     args,
@@ -4172,9 +4340,11 @@ def do_train(
     log_img_local_filter_v1_train_config(logger, args)
     log_img_local_filter_train_config(logger, args)
     log_rgbt_moe_adapter_config(logger, args, model)
+    log_mdrc_config(logger, args)
 
     meters = {
         "loss": AverageMeter(),
+        "loss_baseline": AverageMeter(),
         "sdm_loss": AverageMeter(),
         "loss_sdm_prob": AverageMeter(),
         "loss_sdm_det": AverageMeter(),
@@ -4220,6 +4390,12 @@ def do_train(
         "dcalign_color_weight": AverageMeter(),
         "dcalign_struct_weight": AverageMeter(),
         "dcalign_full_weight": AverageMeter(),
+        "loss_mdrc": AverageMeter(),
+        "loss_mdrc_feature": AverageMeter(),
+        "loss_mdrc_similarity": AverageMeter(),
+        "loss_mdrc_weighted": AverageMeter(),
+        "mdrc_lambda": AverageMeter(),
+        "mdrc_active": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
         "loss_th_txt": AverageMeter(),
         "loss_txt_cons": AverageMeter(),
@@ -4594,6 +4770,19 @@ def do_train(
                 ret.update(dcalign_terms)
                 total_loss = total_loss + dcalign_terms["loss_dcalign"]
 
+            baseline_total_loss = total_loss
+            mdrc_terms = None
+            if _mdrc_enabled(args):
+                mdrc_terms = _compute_mdrc_terms(
+                    args,
+                    model,
+                    batch,
+                    ret,
+                    epoch,
+                )
+                ret.update(mdrc_terms)
+                total_loss = _add_mdrc_to_total_loss(args, total_loss, mdrc_terms)
+
             if uspc_debug_should_log:
                 if uspc_inputs is None:
                     _log_uspc_debug_examples(
@@ -4634,6 +4823,25 @@ def do_train(
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
+            if mdrc_terms is not None:
+                meters["loss_baseline"].update(
+                    _to_scalar(baseline_total_loss), batch_size
+                )
+                for mdrc_loss_name in [
+                    "loss_mdrc",
+                    "loss_mdrc_feature",
+                    "loss_mdrc_similarity",
+                    "loss_mdrc_weighted",
+                ]:
+                    meters[mdrc_loss_name].update(
+                        _to_scalar(mdrc_terms.get(mdrc_loss_name, 0)),
+                        batch_size,
+                    )
+                for mdrc_stat_name in ["mdrc_lambda", "mdrc_active"]:
+                    meters[mdrc_stat_name].update(
+                        _to_scalar(mdrc_terms.get(mdrc_stat_name, 0)),
+                        1,
+                    )
             meters["sdm_loss"].update(_to_scalar(ret.get("sdm_loss", 0)), batch_size)
             meters["loss_sdm_prob"].update(
                 _to_scalar(ret.get("loss_sdm_prob", ret.get("sdm_loss", 0))),
@@ -5112,6 +5320,13 @@ def do_train(
                         info_str += f", {k}: {v.avg:.4f}"
                 active_layers = ret.get("shared_consistency_active_layers", "none")
                 info_str += f", shared_consistency_active_layers: {active_layers}"
+                if _mdrc_enabled(args):
+                    info_str += (
+                        f", mdrc_image_feature_key: {ret.get('mdrc_image_feature_key', 'none')}"
+                    )
+                    info_str += (
+                        f", mdrc_text_feature_key: {ret.get('mdrc_text_feature_key', 'none')}"
+                    )
                 if bool(getattr(args, "use_proto_calib", False)):
                     info_str += (
                         f", proto_version: {ret.get('proto_version', getattr(args, 'proto_version', 'v1'))}"

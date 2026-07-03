@@ -41,6 +41,21 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+    mdrc_degrade_modes = (
+        "rgb_drop",
+        "ir_drop",
+        "rgb_noise",
+        "ir_noise",
+        "rgb_attenuate",
+        "ir_attenuate",
+    )
+    mdrc_group = parser.add_argument_group("MDRC")
+    mdrc_group.add_argument("--mdrc_enable", default=False, action='store_true', help="enable MDRC clean-degraded consistency training")
+    mdrc_group.add_argument("--mdrc_lambda", type=float, default=0.05, help="maximum MDRC consistency loss weight")
+    mdrc_group.add_argument("--mdrc_prob", type=float, default=0.5, help="per-sample probability of applying one MDRC degradation")
+    mdrc_group.add_argument("--mdrc_warmup_epoch", type=int, default=3, help="1-based epoch at which MDRC starts; weight then linearly ramps")
+    mdrc_group.add_argument("--mdrc_temp", type=float, default=0.07, help="temperature for MDRC image-text similarity distribution consistency")
+    mdrc_group.add_argument("--mdrc_degrade_modes", type=str, nargs='+', default=list(mdrc_degrade_modes), help="MDRC degradation modes; supports space or comma separated values")
     parser.add_argument("--use_proto_calib", default=False, action='store_true', help="enable identity prototype calibration bank during training only")
     parser.add_argument("--proto_version", type=str, default="v1", choices=["v1", "v2"], help="prototype calibration version used when --use_proto_calib is enabled")
     parser.add_argument("--lambda_proto_v", type=float, default=1.0, help="reserved visual prototype calibration loss weight")
@@ -447,6 +462,31 @@ def get_args():
 
     # Parse CLI args into namespace.
     args = parser.parse_args()
+    normalized_mdrc_modes = []
+    for item in args.mdrc_degrade_modes:
+        for mode in str(item).split(","):
+            mode = mode.strip()
+            if mode:
+                normalized_mdrc_modes.append(mode)
+    invalid_mdrc_modes = [
+        mode for mode in normalized_mdrc_modes if mode not in mdrc_degrade_modes
+    ]
+    if invalid_mdrc_modes:
+        parser.error(
+            "--mdrc_degrade_modes contains unsupported mode(s): "
+            f"{invalid_mdrc_modes}. Expected one of {list(mdrc_degrade_modes)}."
+        )
+    if not normalized_mdrc_modes:
+        parser.error("--mdrc_degrade_modes must include at least one mode.")
+    args.mdrc_degrade_modes = normalized_mdrc_modes
+    if float(args.mdrc_lambda) < 0.0:
+        parser.error("--mdrc_lambda must be >= 0.")
+    if not 0.0 <= float(args.mdrc_prob) <= 1.0:
+        parser.error("--mdrc_prob must be in [0, 1].")
+    if int(args.mdrc_warmup_epoch) < 0:
+        parser.error("--mdrc_warmup_epoch must be >= 0.")
+    if float(args.mdrc_temp) <= 0.0:
+        parser.error("--mdrc_temp must be > 0.")
     if args.use_hard_negative_loss and args.use_hardneg_aux:
         parser.error(
             "--use_hard_negative_loss and legacy --use_hardneg_aux share "
