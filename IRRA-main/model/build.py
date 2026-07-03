@@ -1937,7 +1937,7 @@ class IRRA(nn.Module):
             "region_feats": region_feats,
         }
 
-    def forward(self, batch):
+    def forward(self, batch, mdrc_feature_only=False):
         ret = {}
 
         # Input tensors:
@@ -1946,6 +1946,53 @@ class IRRA(nn.Module):
         # caption_ids: [B, L_t]
         images = batch["images"]
         thermal_images = batch.get("thermal_images", None)
+        if mdrc_feature_only:
+            # MDRC degraded branch: image-only feature extraction for
+            # clean-degraded consistency. No text encoding and no baseline losses.
+            (
+                v_rgb_c_raw,
+                v_t_c_raw,
+                _,
+                _,
+                img_local_stats,
+                _,
+            ) = self.encode_rgbt_global(images, thermal_images)
+            rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = self._encode_visual_global_gaussian(
+                v_rgb_c_raw,
+                v_t_c_raw,
+                thermal_available=thermal_images is not None,
+            )
+            fused_mu, fused_logvar = self._fuse_rgbt_global(
+                rgb_mu=rgb_mu,
+                rgb_logvar=rgb_logvar,
+                thermal_mu=thermal_mu,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_images is not None,
+            )
+            ret.update(
+                {
+                    "v_rgb_c": rgb_mu,
+                    "v_t_c": thermal_mu,
+                    "fused_mu": fused_mu,
+                    "fused_logvar": fused_logvar,
+                    "fused_det_feat": fused_mu,
+                    "fused_prob_feat": fused_mu,
+                    "mdrc_feature_only": True,
+                }
+            )
+            if img_local_stats is not None:
+                ret.update(img_local_stats)
+            if self._use_diag_gaussian_global():
+                ret.update(
+                    {
+                        "rgb_mu": rgb_mu,
+                        "rgb_logvar": rgb_logvar,
+                        "thermal_mu": thermal_mu,
+                        "thermal_logvar": thermal_logvar,
+                    }
+                )
+            return ret
+
         caption_ids = batch["caption_ids"]
         caption_weight_for_sdm = self._get_caption_weight_for_loss(
             batch,
