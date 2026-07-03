@@ -52,6 +52,7 @@ def get_args():
     mdrc_group = parser.add_argument_group("MDRC")
     mdrc_group.add_argument("--mdrc_enable", default=False, action='store_true', help="enable MDRC clean-degraded consistency training")
     mdrc_group.add_argument("--mdrc_lambda", type=float, default=0.05, help="maximum MDRC consistency loss weight")
+    mdrc_group.add_argument("--mdrc_loss_scale", type=float, default=1.0, help="extra scale applied to MDRC loss before adding it to total loss")
     mdrc_group.add_argument("--mdrc_prob", type=float, default=0.5, help="per-sample probability of applying one MDRC degradation")
     mdrc_group.add_argument("--mdrc_warmup_epoch", type=int, default=3, help="1-based epoch at which MDRC starts; weight then linearly ramps")
     mdrc_group.add_argument("--mdrc_temp", type=float, default=0.07, help="temperature for MDRC image-text similarity distribution consistency")
@@ -481,6 +482,8 @@ def get_args():
     args.mdrc_degrade_modes = normalized_mdrc_modes
     if float(args.mdrc_lambda) < 0.0:
         parser.error("--mdrc_lambda must be >= 0.")
+    if float(args.mdrc_loss_scale) < 0.0:
+        parser.error("--mdrc_loss_scale must be >= 0.")
     if not 0.0 <= float(args.mdrc_prob) <= 1.0:
         parser.error("--mdrc_prob must be in [0, 1].")
     if int(args.mdrc_warmup_epoch) < 0:

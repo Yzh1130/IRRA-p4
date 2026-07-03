@@ -2014,6 +2014,7 @@ def _build_total_loss(args, ret, epoch=None):
                 "loss_mdrc_feature",
                 "loss_mdrc_similarity",
                 "loss_mdrc_weighted",
+                "mdrc_loss_scale",
                 "loss_mga_pseudo_sdm",
                 "loss_mga_rgb_color",
                 "loss_mga_t_shape",
@@ -4169,6 +4170,12 @@ def _mdrc_enabled(args):
     return bool(getattr(args, "mdrc_enable", False))
 
 
+def _mdrc_loss_scale(args):
+    if args is None:
+        return 1.0
+    return float(getattr(args, "mdrc_loss_scale", 1.0))
+
+
 def _resolve_mdrc_lambda(args, epoch):
     if not _mdrc_enabled(args):
         return 0.0
@@ -4200,7 +4207,7 @@ def _extract_mdrc_feature(ret, candidate_keys, feature_name, required=True):
     )
 
 
-def _empty_mdrc_terms(reference, lambda_effective=0.0):
+def _empty_mdrc_terms(reference, lambda_effective=0.0, loss_scale=1.0):
     zero = reference.new_zeros(())
     return {
         "loss_mdrc": zero,
@@ -4208,7 +4215,9 @@ def _empty_mdrc_terms(reference, lambda_effective=0.0):
         "loss_mdrc_similarity": zero,
         "loss_mdrc_weighted": zero,
         "weighted_mdrc": zero,
+        "effective_weighted_mdrc": zero,
         "mdrc_lambda": zero.new_tensor(float(lambda_effective)),
+        "mdrc_loss_scale": zero.new_tensor(float(loss_scale)),
         "mdrc_active": zero,
         "mdrc_feature_only_degraded": zero,
         "mdrc_delta_rgb": zero,
@@ -4231,7 +4240,11 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
     reference = batch["images"]
     lambda_effective = _resolve_mdrc_lambda(args, epoch)
     if lambda_effective <= 0.0:
-        return _empty_mdrc_terms(reference, lambda_effective=lambda_effective)
+        return _empty_mdrc_terms(
+            reference,
+            lambda_effective=lambda_effective,
+            loss_scale=_mdrc_loss_scale(args),
+        )
 
     clean_img_feat, image_feature_key = _extract_mdrc_feature(
         clean_ret,
@@ -4279,7 +4292,8 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
     loss_similarity = loss_feature.new_zeros(())
     loss_mdrc = loss_feature
     lambda_tensor = loss_mdrc.new_tensor(float(lambda_effective))
-    loss_weighted = lambda_tensor * loss_mdrc
+    scale_tensor = loss_mdrc.new_tensor(float(_mdrc_loss_scale(args)))
+    loss_weighted = lambda_tensor * scale_tensor * loss_mdrc
     cos_clean_degraded = F.cosine_similarity(
         F.normalize(clean_img_feat.detach().float(), p=2, dim=-1, eps=1e-12),
         F.normalize(degraded_img_feat.detach().float(), p=2, dim=-1, eps=1e-12),
@@ -4292,7 +4306,9 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
         "loss_mdrc_similarity": loss_similarity,
         "loss_mdrc_weighted": loss_weighted,
         "weighted_mdrc": loss_weighted,
+        "effective_weighted_mdrc": loss_weighted,
         "mdrc_lambda": lambda_tensor,
+        "mdrc_loss_scale": scale_tensor,
         "mdrc_active": loss_mdrc.new_ones(()),
         "mdrc_feature_only_degraded": loss_mdrc.new_ones(()),
         "mdrc_delta_rgb": delta_rgb,
@@ -4309,7 +4325,12 @@ def _add_mdrc_to_total_loss(args, total_loss, mdrc_terms):
         return total_loss
     if not mdrc_terms:
         return total_loss
-    return total_loss + mdrc_terms["mdrc_lambda"] * mdrc_terms["loss_mdrc"]
+    return (
+        total_loss
+        + mdrc_terms["mdrc_lambda"]
+        * mdrc_terms["mdrc_loss_scale"]
+        * mdrc_terms["loss_mdrc"]
+    )
 
 
 def _log_mdrc_debug_status(
@@ -4325,6 +4346,7 @@ def _log_mdrc_debug_status(
     empty_terms = _empty_mdrc_terms(
         reference,
         lambda_effective=_resolve_mdrc_lambda(args, epoch),
+        loss_scale=_mdrc_loss_scale(args),
     )
     terms = mdrc_terms if mdrc_terms is not None else empty_terms
     active = bool(_to_scalar(terms.get("mdrc_active", 0)) > 0.0)
@@ -4332,7 +4354,8 @@ def _log_mdrc_debug_status(
     logger.info(
         "[MDRC_DEBUG] active=%s reason=%s epoch=%d iter=%d "
         "baseline_loss=%.6f loss_mdrc=%.6f lambda=%.6f "
-        "weighted_mdrc=%.6f total_loss=%.6f delta_rgb=%.6f "
+        "mdrc_loss_scale=%.6f weighted_mdrc=%.6f "
+        "effective_weighted_mdrc=%.6f total_loss=%.6f delta_rgb=%.6f "
         "delta_ir=%.6f cos_clean_degraded=%.6f degraded_requires_grad=%s "
         "feature_only_degraded=%s image_feature_key=%s text_feature_key=%s",
         active,
@@ -4342,7 +4365,14 @@ def _log_mdrc_debug_status(
         _to_scalar(baseline_loss),
         _to_scalar(terms.get("loss_mdrc", 0)),
         _to_scalar(terms.get("mdrc_lambda", 0)),
+        _to_scalar(terms.get("mdrc_loss_scale", _mdrc_loss_scale(args))),
         _to_scalar(terms.get("weighted_mdrc", terms.get("loss_mdrc_weighted", 0))),
+        _to_scalar(
+            terms.get(
+                "effective_weighted_mdrc",
+                terms.get("weighted_mdrc", terms.get("loss_mdrc_weighted", 0)),
+            )
+        ),
         _to_scalar(total_loss),
         _to_scalar(terms.get("mdrc_delta_rgb", 0)),
         _to_scalar(terms.get("mdrc_delta_ir", 0)),
@@ -4358,9 +4388,10 @@ def log_mdrc_config(logger, args):
     if not _mdrc_enabled(args):
         return
     logger.info(
-        "[MDRC] enable=%s feature_only_degraded=True lambda=%.6f prob=%.6f warmup_epoch=%d temp=%.6f modes=%s",
+        "[MDRC] enable=%s feature_only_degraded=True lambda=%.6f loss_scale=%.6f prob=%.6f warmup_epoch=%d temp=%.6f modes=%s",
         bool(getattr(args, "mdrc_enable", False)),
         float(getattr(args, "mdrc_lambda", 0.05)),
+        _mdrc_loss_scale(args),
         float(getattr(args, "mdrc_prob", 0.5)),
         int(getattr(args, "mdrc_warmup_epoch", 3)),
         float(getattr(args, "mdrc_temp", 0.07)),
@@ -4445,7 +4476,9 @@ def do_train(
         "loss_mdrc_feature": AverageMeter(),
         "loss_mdrc_similarity": AverageMeter(),
         "loss_mdrc_weighted": AverageMeter(),
+        "effective_weighted_mdrc": AverageMeter(),
         "mdrc_lambda": AverageMeter(),
+        "mdrc_loss_scale": AverageMeter(),
         "mdrc_active": AverageMeter(),
         "mdrc_feature_only_degraded": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
@@ -4898,6 +4931,7 @@ def do_train(
                     "loss_mdrc_feature",
                     "loss_mdrc_similarity",
                     "loss_mdrc_weighted",
+                    "effective_weighted_mdrc",
                 ]:
                     meters[mdrc_loss_name].update(
                         _to_scalar(mdrc_terms.get(mdrc_loss_name, 0)),
@@ -4905,6 +4939,7 @@ def do_train(
                     )
                 for mdrc_stat_name in [
                     "mdrc_lambda",
+                    "mdrc_loss_scale",
                     "mdrc_active",
                     "mdrc_feature_only_degraded",
                 ]:
