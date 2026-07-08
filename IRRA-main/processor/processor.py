@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import time
 
 import torch
@@ -24,6 +25,7 @@ from utils.comm import get_rank, synchronize
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.mdrc import (
+    ALLOWED_DEGRADE_MODES,
     degrade_rgbt_batch,
     mdrc_feature_consistency,
 )
@@ -4399,6 +4401,72 @@ def log_mdrc_config(logger, args):
     )
 
 
+# Fixed batch-level probability of applying the ablation degradation augmentation.
+DEGRADE_AUG_PROB = 0.5
+
+
+def _degrade_aug_mode(args):
+    return str(getattr(args, "degrade_aug_mode", "none"))
+
+
+def _degrade_aug_enabled(args):
+    # Ablation-only single-branch degradation augmentation. It is disabled whenever
+    # MDRC is on, so MDRC's clean-degraded consistency training is never altered.
+    return _degrade_aug_mode(args) != "none" and not _mdrc_enabled(args)
+
+
+def log_degrade_aug_config(logger, args):
+    # Only log (and thus only ever change behavior) when a mode is requested; the
+    # default "none" leaves the baseline path and its logs completely unchanged.
+    if _degrade_aug_mode(args) == "none":
+        return
+    logger.info(
+        "[DEGRADE_AUG] mode=%s prob=%.1f mdrc_enable=%s active=%s",
+        _degrade_aug_mode(args),
+        DEGRADE_AUG_PROB,
+        bool(_mdrc_enabled(args)),
+        bool(_degrade_aug_enabled(args)),
+    )
+
+
+def _apply_degrade_aug_to_batch(args, batch):
+    """
+    Ablation degradation augmentation (single branch, no consistency loss).
+
+    With probability DEGRADE_AUG_PROB, degrade the image inputs in-place on the
+    batch dict so the degraded tensors replace the originals for ALL downstream
+    baseline losses (SDM/MLM/ID). Returns (applied, mode_name) for logging.
+
+    - "mdrc_style": sample one of the 6 MDRC modes uniformly and apply it to the
+      whole batch (reuses degrade_rgbt_batch with prob=1.0).
+    - "moddrop": zero out a whole modality (RGB or IR) with equal probability
+      (reuses degrade_rgbt_batch rgb_drop/ir_drop with prob=1.0).
+    """
+    if random.random() >= DEGRADE_AUG_PROB:
+        return False, "none"
+
+    mode = _degrade_aug_mode(args)
+    rgb_imgs = batch["images"]
+    ir_imgs = batch.get("thermal_images", None)
+
+    if mode == "mdrc_style":
+        chosen = random.choice(list(ALLOWED_DEGRADE_MODES))
+        applied_name = chosen
+    elif mode == "moddrop":
+        chosen = random.choice(["rgb_drop", "ir_drop"])
+        applied_name = "moddrop_rgb" if chosen == "rgb_drop" else "moddrop_ir"
+    else:
+        return False, "none"
+
+    degraded_rgb, degraded_ir = degrade_rgbt_batch(
+        rgb_imgs, ir_imgs, prob=1.0, modes=[chosen]
+    )
+    batch["images"] = degraded_rgb
+    if torch.is_tensor(ir_imgs):
+        batch["thermal_images"] = degraded_ir
+    return True, applied_name
+
+
 def do_train(
     start_epoch,
     args,
@@ -4422,6 +4490,7 @@ def do_train(
     log_img_local_filter_train_config(logger, args)
     log_rgbt_moe_adapter_config(logger, args, model)
     log_mdrc_config(logger, args)
+    log_degrade_aug_config(logger, args)
 
     meters = {
         "loss": AverageMeter(),
@@ -4617,6 +4686,7 @@ def do_train(
         uspc_debug_logged_this_epoch = False
         dcalign_debug_logged_this_epoch = False
         mdrc_debug_logged_this_epoch = False
+        degrade_aug_logged_this_epoch = False
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -4676,6 +4746,23 @@ def do_train(
                     _truncate_log_text(th_example),
                 )
                 mtp_text_example_logged = True
+
+            if _degrade_aug_enabled(args):
+                # Ablation single-branch degradation augmentation: replace the
+                # image inputs before the forward so the degraded tensors flow
+                # into all baseline losses. No second branch, no consistency loss.
+                degrade_applied, degrade_mode_name = _apply_degrade_aug_to_batch(
+                    args, batch
+                )
+                if not degrade_aug_logged_this_epoch:
+                    logger.info(
+                        "[DEGRADE_AUG] epoch=%d iter=%d applied=%s mode=%s",
+                        epoch,
+                        n_iter + 1,
+                        bool(degrade_applied),
+                        degrade_mode_name,
+                    )
+                    degrade_aug_logged_this_epoch = True
 
             ret = model(batch)
             uspc_debug_should_log = (

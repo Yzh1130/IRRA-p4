@@ -57,6 +57,9 @@ def get_args():
     mdrc_group.add_argument("--mdrc_warmup_epoch", type=int, default=3, help="1-based epoch at which MDRC starts; weight then linearly ramps")
     mdrc_group.add_argument("--mdrc_temp", type=float, default=0.07, help="temperature for MDRC image-text similarity distribution consistency")
     mdrc_group.add_argument("--mdrc_degrade_modes", type=str, nargs='+', default=list(mdrc_degrade_modes), help="MDRC degradation modes; supports space or comma separated values")
+    # Ablation-only degradation data augmentation (single-branch; no consistency loss).
+    # Active only when --mdrc_enable is off; "none" keeps the baseline path unchanged.
+    parser.add_argument("--degrade_aug_mode", type=str, default="none", choices=["none", "mdrc_style", "moddrop"], help="ablation degradation augmentation applied to image inputs before the forward pass; 'mdrc_style' samples one of the 6 MDRC modes, 'moddrop' zeros a whole modality; disabled when --mdrc_enable is set")
     parser.add_argument("--use_proto_calib", default=False, action='store_true', help="enable identity prototype calibration bank during training only")
     parser.add_argument("--proto_version", type=str, default="v1", choices=["v1", "v2"], help="prototype calibration version used when --use_proto_calib is enabled")
     parser.add_argument("--lambda_proto_v", type=float, default=1.0, help="reserved visual prototype calibration loss weight")
