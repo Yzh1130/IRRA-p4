@@ -12,6 +12,10 @@ from utils.transport_rerank import build_transport_reranker
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
 from utils.attribute_parser import COLOR_CLASSES, parse_basic_attributes
+from utils.eval_degradation import (
+    NEW_EVAL_DEGRADATION_MODES,
+    apply_new_eval_degradation,
+)
 
 
 def _stable_hash(value):
@@ -296,6 +300,13 @@ class Evaluator():
         elif mode == "both_blur":
             img = self._blur_eval_image(img, blur_kernel)
             thermal_img = self._blur_eval_image(thermal_img, blur_kernel)
+        elif mode in NEW_EVAL_DEGRADATION_MODES:
+            img, thermal_img = apply_new_eval_degradation(
+                mode=mode,
+                rgb_img=img,
+                thermal_img=thermal_img,
+                strength=strength,
+            )
         else:
             raise ValueError(f"Unsupported eval_degrade_mode: {mode}.")
         return img, thermal_img
@@ -800,6 +811,18 @@ class Evaluator():
             "model_name": str(getattr(model_args, "name", "")),
             "output_dir": str(getattr(model_args, "output_dir", "")),
             "eval_source": str(self.source),
+            "eval_degrade_mode": str(
+                getattr(model_args, "eval_degrade_mode", "none")
+            ),
+            "eval_degrade_strength": float(
+                getattr(model_args, "eval_degrade_strength", 1.0)
+            ),
+            "eval_degrade_blur_kernel": int(
+                getattr(model_args, "eval_degrade_blur_kernel", 7)
+            ),
+            "eval_degrade_seed": int(
+                getattr(model_args, "eval_degrade_seed", 2026)
+            ),
             "order_hash": order_hash,
             "raw_similarity_saved": bool(
                 getattr(model_args, "eval_scores_save_raw", False)

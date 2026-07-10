@@ -276,6 +276,12 @@ if __name__ == "__main__":
             "rgb_blur",
             "ir_blur",
             "both_blur",
+            "rgb_brightness",
+            "ir_brightness",
+            "rgb_lowres",
+            "ir_lowres",
+            "rgb_jpeg",
+            "ir_jpeg",
         ],
         help="evaluation-only temporary RGB/T degradation mode",
     )
@@ -283,7 +289,11 @@ if __name__ == "__main__":
         "--eval_degrade_strength",
         type=float,
         default=1.0,
-        help="evaluation-only Gaussian noise std for *_noise degrade modes",
+        help=(
+            "degradation strength: Gaussian std for *_noise, brightness factor "
+            "for *_brightness, linear resize scale for *_lowres, or integer JPEG "
+            "quality for *_jpeg"
+        ),
     )
     parser.add_argument(
         "--eval_degrade_blur_kernel",
@@ -836,6 +846,27 @@ if __name__ == "__main__":
         raise ValueError("--eval_degrade_strength must be >= 0.")
     if int(cli_args.eval_degrade_blur_kernel) <= 0:
         raise ValueError("--eval_degrade_blur_kernel must be > 0.")
+    new_unit_strength_modes = {
+        "rgb_brightness",
+        "ir_brightness",
+        "rgb_lowres",
+        "ir_lowres",
+    }
+    if cli_args.eval_degrade_mode in new_unit_strength_modes and not (
+        0.0 < float(cli_args.eval_degrade_strength) <= 1.0
+    ):
+        raise ValueError(
+            f"--eval_degrade_strength={cli_args.eval_degrade_strength!r} is invalid "
+            f"for {cli_args.eval_degrade_mode}; expected 0 < strength <= 1."
+        )
+    if cli_args.eval_degrade_mode in {"rgb_jpeg", "ir_jpeg"}:
+        jpeg_quality = float(cli_args.eval_degrade_strength)
+        if not jpeg_quality.is_integer() or not (1.0 <= jpeg_quality <= 100.0):
+            raise ValueError(
+                f"--eval_degrade_strength={cli_args.eval_degrade_strength!r} is "
+                f"invalid for {cli_args.eval_degrade_mode}; expected an integer "
+                "JPEG quality in [1, 100]."
+            )
 
     args = load_train_configs(cli_args.config_file)
     args = _apply_qalr_test_overrides(args, cli_args)
@@ -859,6 +890,17 @@ if __name__ == "__main__":
         args.eval_degrade_blur_kernel,
         args.eval_degrade_seed,
     )
+    if args.eval_degrade_mode in {
+        "rgb_brightness",
+        "ir_brightness",
+        "rgb_lowres",
+        "ir_lowres",
+        "rgb_jpeg",
+        "ir_jpeg",
+    }:
+        logger.info(
+            "[DEGRADE] processing_space=pixel [0,1] before re-normalization"
+        )
     device = "cuda"
 
     if cli_args.use_train_validation_pipeline:
