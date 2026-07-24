@@ -73,13 +73,21 @@ def _apply_mode(target, sample_mask, mode):
     raise ValueError(f"Unsupported MDRC degrade mode: {mode}.")
 
 
-def degrade_rgbt_batch(rgb_imgs, ir_imgs, prob=0.5, modes=None):
+def degrade_rgbt_batch(
+    rgb_imgs,
+    ir_imgs,
+    prob=0.5,
+    modes=None,
+    return_mode=False,
+):
     """
     Build a degraded RGB/T view for training-stage clean-degraded consistency.
 
     The input tensors are never modified in place. For each sample, one selected
     degradation mode is drawn uniformly and applied with probability ``prob``.
-    Shapes, devices, and dtypes are preserved.
+    Shapes, devices, and dtypes are preserved. ``return_mode=False`` keeps the
+    historical two-value return exactly. Optional mode metadata is derived from
+    the already sampled tensors and never performs an additional random draw.
     """
     if not torch.is_tensor(rgb_imgs):
         raise TypeError("rgb_imgs must be a torch.Tensor.")
@@ -104,11 +112,30 @@ def degrade_rgbt_batch(rgb_imgs, ir_imgs, prob=0.5, modes=None):
     ]
     prob = max(0.0, min(1.0, float(prob)))
     if prob <= 0.0 or not valid_modes:
+        if return_mode:
+            batch_size = int(rgb_imgs.shape[0])
+            return degraded_rgb, degraded_ir, {
+                "valid_modes": tuple(valid_modes),
+                "active_mask": torch.zeros(
+                    batch_size, device=rgb_imgs.device, dtype=torch.bool
+                ),
+                "mode_indices": torch.full(
+                    (batch_size,), -1, device=rgb_imgs.device, dtype=torch.long
+                ),
+                "mode_counts": {"none": batch_size},
+            }
         return degraded_rgb, degraded_ir
 
     batch_size = rgb_imgs.shape[0]
     active = torch.rand(batch_size, device=rgb_imgs.device).lt(prob)
     if not bool(active.any().item()):
+        if return_mode:
+            return degraded_rgb, degraded_ir, {
+                "valid_modes": tuple(valid_modes),
+                "active_mask": active,
+                "mode_indices": torch.full_like(active, -1, dtype=torch.long),
+                "mode_counts": {"none": int(batch_size)},
+            }
         return degraded_rgb, degraded_ir
 
     choice = torch.randint(
@@ -126,6 +153,19 @@ def degrade_rgbt_batch(rgb_imgs, ir_imgs, prob=0.5, modes=None):
         elif has_ir:
             degraded_ir = _apply_mode(degraded_ir, sample_mask, mode)
 
+    if return_mode:
+        mode_indices = torch.where(active, choice, torch.full_like(choice, -1))
+        mode_counts = {
+            mode: int((active & choice.eq(mode_index)).sum().item())
+            for mode_index, mode in enumerate(valid_modes)
+        }
+        mode_counts["none"] = int((~active).sum().item())
+        return degraded_rgb, degraded_ir, {
+            "valid_modes": tuple(valid_modes),
+            "active_mask": active,
+            "mode_indices": mode_indices,
+            "mode_counts": mode_counts,
+        }
     return degraded_rgb, degraded_ir
 
 

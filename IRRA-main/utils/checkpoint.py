@@ -151,12 +151,51 @@ def strip_prefix_if_present(state_dict, prefix):
 
 def load_state_dict(model, loaded_state_dict, except_keys=None):
     # Perform tolerant key alignment, then strict load with aligned state dict.
-    model_state_dict = model.state_dict()
+    target_model = model.module if hasattr(model, "module") else model
+    model_state_dict = target_model.state_dict()
     # if the state_dict comes from a model that was wrapped in a
     # DataParallel or DistributedDataParallel during serialization,
     # remove the "module" prefix before performing the matching
     loaded_state_dict = strip_prefix_if_present(loaded_state_dict, prefix="module.")
+    mraf_keys = sorted(
+        key for key in model_state_dict.keys() if key.startswith("mraf_fusion.")
+    )
+    if mraf_keys:
+        current_keys = set(model_state_dict.keys())
+        loaded_keys = set(loaded_state_dict.keys())
+        missing_keys = sorted(current_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - current_keys)
+        loaded_mraf_keys = sorted(
+            key for key in loaded_keys if key.startswith("mraf_fusion.")
+        )
+        if loaded_mraf_keys:
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "Strict MRAF checkpoint load failed. "
+                    f"Missing keys: {missing_keys}; unexpected keys: "
+                    f"{unexpected_keys}."
+                )
+        else:
+            non_mraf_missing = [
+                key for key in missing_keys if not key.startswith("mraf_fusion.")
+            ]
+            if non_mraf_missing or unexpected_keys:
+                raise RuntimeError(
+                    "Old-checkpoint MRAF compatibility only permits missing "
+                    "MRAF keys. "
+                    f"Non-MRAF missing keys: {non_mraf_missing}; unexpected "
+                    f"keys: {unexpected_keys}."
+                )
+            logging.getLogger("PersonSearch.checkpoint").warning(
+                "Loading an old checkpoint into an MRAF-enabled model. "
+                "Missing MRAF keys are kept at initialization: %s",
+                missing_keys,
+            )
+        model_state_dict.update(loaded_state_dict)
+        target_model.load_state_dict(model_state_dict, strict=True)
+        return
+
     align_and_update_state_dicts(model_state_dict, loaded_state_dict, except_keys)
 
     # use strict loading
-    model.load_state_dict(model_state_dict)
+    target_model.load_state_dict(model_state_dict)

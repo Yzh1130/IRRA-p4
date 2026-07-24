@@ -15,6 +15,7 @@ from .clip_model import (
     convert_weights,
 )
 from .prototype_bank import DualIdentityPrototypeBank, IdentityPrototypeBank
+from .mraf import ModalityReliabilityAdaptiveFusion
 from .text_guided_masking import (
     apply_guided_mask_to_input_ids,
     build_guided_mlm_inputs_and_labels,
@@ -29,6 +30,7 @@ from utils.attribute_parser import (
     get_uspc_slot_local_attr_names,
     get_uspc_slot_region_map,
 )
+from utils.options import validate_mraf_options
 
 
 def apply_image_local_filter(
@@ -95,6 +97,7 @@ def apply_image_local_filter(
 class IRRA(nn.Module):
     def __init__(self, args, num_classes=11003):
         super().__init__()
+        validate_mraf_options(args)
         self.args = args
         self.num_classes = num_classes
         self._set_task()
@@ -104,6 +107,16 @@ class IRRA(nn.Module):
             args.pretrain_choice, args.img_size, args.stride_size, args=args
         )
         self.embed_dim = base_cfg["embed_dim"]
+        self.mraf_enabled = bool(getattr(args, "mraf_enabled", False))
+        if self.mraf_enabled:
+            self.mraf_fusion = ModalityReliabilityAdaptiveFusion(
+                feature_dim=self.embed_dim,
+                hidden_dim=int(getattr(args, "mraf_hidden_dim", 128)),
+                dropout=float(getattr(args, "mraf_dropout", 0.1)),
+                gate_temperature=float(
+                    getattr(args, "mraf_gate_temperature", 1.0)
+                ),
+            )
 
         # Temperature scalar used by global alignment losses.
         self.logit_scale = torch.ones([]) * (1 / args.temperature)
@@ -1027,9 +1040,14 @@ class IRRA(nn.Module):
         thermal_mu,
         thermal_logvar,
         thermal_available,
+        return_mraf_aux=False,
     ):
         """
         Fuse RGB/T thermal global features.
+
+        MRAF, when enabled, replaces both deterministic addition and precision
+        fusion. Argument validation rejects simultaneous MRAF and effective
+        uncertainty precision fusion before model construction.
 
         If diagonal-Gaussian global uncertainty is enabled and use_precision_fusion=True:
           precision = 1 / (var + eps), var = exp(logvar)
@@ -1040,12 +1058,37 @@ class IRRA(nn.Module):
 
         Otherwise fallback to baseline-style deterministic add fusion.
         """
+        mraf_aux = None
+        if self.mraf_enabled and thermal_available:
+            fused_mu, mraf_aux = self.mraf_fusion(
+                rgb_mu,
+                thermal_mu,
+                return_aux=True,
+            )
+            if self._use_diag_gaussian_global():
+                rgb_var = self._safe_var_from_logvar(rgb_logvar)
+                thermal_var = self._safe_var_from_logvar(thermal_logvar)
+                alpha_rgb = mraf_aux["alpha_rgb"].to(dtype=rgb_var.dtype)
+                alpha_ir = mraf_aux["alpha_ir"].to(dtype=thermal_var.dtype)
+                fused_var = 4.0 * (
+                    alpha_rgb.square() * rgb_var
+                    + alpha_ir.square() * thermal_var
+                )
+                fused_logvar = self._safe_logvar_from_var(fused_var)
+            else:
+                fused_logvar = torch.zeros_like(fused_mu)
+            if return_mraf_aux:
+                return fused_mu, fused_logvar, mraf_aux
+            return fused_mu, fused_logvar
+
         if not self._use_diag_gaussian_global():
             if self.use_rgbt_add_fusion:
                 fused_mu = rgb_mu + thermal_mu
             else:
                 fused_mu = rgb_mu
             fused_logvar = torch.zeros_like(fused_mu)
+            if return_mraf_aux:
+                return fused_mu, fused_logvar, mraf_aux
             return fused_mu, fused_logvar
 
         rgb_var = self._safe_var_from_logvar(rgb_logvar)
@@ -1062,6 +1105,8 @@ class IRRA(nn.Module):
             ) / precision_fused
             fused_var = 1.0 / precision_fused
             fused_logvar = self._safe_logvar_from_var(fused_var)
+            if return_mraf_aux:
+                return fused_mu, fused_logvar, mraf_aux
             return fused_mu, fused_logvar
 
         # Fallback: keep baseline fused representation path.
@@ -1072,6 +1117,8 @@ class IRRA(nn.Module):
             fused_mu = rgb_mu
             fused_var = rgb_var
         fused_logvar = self._safe_logvar_from_var(fused_var)
+        if return_mraf_aux:
+            return fused_mu, fused_logvar, mraf_aux
         return fused_mu, fused_logvar
 
     def compute_uncertainty_distance(
@@ -1510,6 +1557,8 @@ class IRRA(nn.Module):
             thermal_logvar=thermal_logvar,
             thermal_available=thermal_image is not None,
         )
+        if self.mraf_enabled:
+            return f_c
         if self.eval_use_mu_only:
             return rgb_mu
         if self.eval_use_fused_mu:
@@ -1625,15 +1674,28 @@ class IRRA(nn.Module):
                 thermal_available=thermal_image is not None,
             )
         )
-        fused_feat, _ = self._fuse_rgbt_global(
-            rgb_mu=rgb_mu,
-            rgb_logvar=rgb_logvar,
-            thermal_mu=thermal_mu,
-            thermal_logvar=thermal_logvar,
-            thermal_available=thermal_image is not None,
-        )
+        if self.mraf_enabled:
+            fused_feat, _, mraf_aux = self._fuse_rgbt_global(
+                rgb_mu=rgb_mu,
+                rgb_logvar=rgb_logvar,
+                thermal_mu=thermal_mu,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_image is not None,
+                return_mraf_aux=True,
+            )
+        else:
+            fused_feat, _ = self._fuse_rgbt_global(
+                rgb_mu=rgb_mu,
+                rgb_logvar=rgb_logvar,
+                thermal_mu=thermal_mu,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_image is not None,
+            )
+            mraf_aux = None
 
-        if self.eval_use_mu_only:
+        if self.mraf_enabled:
+            global_feat = fused_feat
+        elif self.eval_use_mu_only:
             global_feat = rgb_mu
         elif self.eval_use_fused_mu:
             global_feat = fused_feat
@@ -1642,7 +1704,7 @@ class IRRA(nn.Module):
         else:
             global_feat = rgb_mu
 
-        return {
+        outputs = {
             "global_feat": self._maybe_eval_sampling(global_feat),
             "rgb_global_feat": self._maybe_eval_sampling(rgb_mu),
             "thermal_global_feat": self._maybe_eval_sampling(thermal_mu),
@@ -1652,6 +1714,16 @@ class IRRA(nn.Module):
             "thermal_precision_weight": thermal_precision_weight,
             "precision_weight_valid": precision_weight_valid,
         }
+        if mraf_aux is not None:
+            outputs.update(
+                {
+                    "mraf_alpha": mraf_aux["alpha"],
+                    "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
+                    "mraf_alpha_ir": mraf_aux["alpha_ir"],
+                    "mraf_logits": mraf_aux["logits"],
+                }
+            )
+        return outputs
 
     def encode_rgbt_eval(self, rgb_image, thermal_image=None, return_local_tokens=False):
         if not return_local_tokens:
@@ -1962,13 +2034,24 @@ class IRRA(nn.Module):
                 v_t_c_raw,
                 thermal_available=thermal_images is not None,
             )
-            fused_mu, fused_logvar = self._fuse_rgbt_global(
-                rgb_mu=rgb_mu,
-                rgb_logvar=rgb_logvar,
-                thermal_mu=thermal_mu,
-                thermal_logvar=thermal_logvar,
-                thermal_available=thermal_images is not None,
-            )
+            if self.mraf_enabled:
+                fused_mu, fused_logvar, mraf_aux = self._fuse_rgbt_global(
+                    rgb_mu=rgb_mu,
+                    rgb_logvar=rgb_logvar,
+                    thermal_mu=thermal_mu,
+                    thermal_logvar=thermal_logvar,
+                    thermal_available=thermal_images is not None,
+                    return_mraf_aux=True,
+                )
+            else:
+                fused_mu, fused_logvar = self._fuse_rgbt_global(
+                    rgb_mu=rgb_mu,
+                    rgb_logvar=rgb_logvar,
+                    thermal_mu=thermal_mu,
+                    thermal_logvar=thermal_logvar,
+                    thermal_available=thermal_images is not None,
+                )
+                mraf_aux = None
             ret.update(
                 {
                     "v_rgb_c": rgb_mu,
@@ -1982,6 +2065,15 @@ class IRRA(nn.Module):
             )
             if img_local_stats is not None:
                 ret.update(img_local_stats)
+            if mraf_aux is not None:
+                ret.update(
+                    {
+                        "mraf_alpha": mraf_aux["alpha"],
+                        "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
+                        "mraf_alpha_ir": mraf_aux["alpha_ir"],
+                        "mraf_logits": mraf_aux["logits"],
+                    }
+                )
             if self._use_diag_gaussian_global():
                 ret.update(
                     {
@@ -2079,13 +2171,24 @@ class IRRA(nn.Module):
             v_t_c_raw,
             thermal_available=thermal_images is not None,
         )
-        fused_mu, fused_logvar = self._fuse_rgbt_global(
-            rgb_mu=rgb_mu,
-            rgb_logvar=rgb_logvar,
-            thermal_mu=thermal_mu,
-            thermal_logvar=thermal_logvar,
-            thermal_available=thermal_images is not None,
-        )
+        if self.mraf_enabled:
+            fused_mu, fused_logvar, mraf_aux = self._fuse_rgbt_global(
+                rgb_mu=rgb_mu,
+                rgb_logvar=rgb_logvar,
+                thermal_mu=thermal_mu,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_images is not None,
+                return_mraf_aux=True,
+            )
+        else:
+            fused_mu, fused_logvar = self._fuse_rgbt_global(
+                rgb_mu=rgb_mu,
+                rgb_logvar=rgb_logvar,
+                thermal_mu=thermal_mu,
+                thermal_logvar=thermal_logvar,
+                thermal_available=thermal_images is not None,
+            )
+            mraf_aux = None
 
         # Keep existing training/eval flow compatible: deterministic embedding is mu.
         v_rgb_c = rgb_mu
@@ -2216,6 +2319,15 @@ class IRRA(nn.Module):
                 "text_prob_feat": p_t,
             }
         )
+        if mraf_aux is not None:
+            ret.update(
+                {
+                    "mraf_alpha": mraf_aux["alpha"],
+                    "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
+                    "mraf_alpha_ir": mraf_aux["alpha_ir"],
+                    "mraf_logits": mraf_aux["logits"],
+                }
+            )
         if hn_fused_det_feat is not None:
             ret["hn_fused_det_feat"] = hn_fused_det_feat
         self._append_mga_aux_text_outputs(batch, ret)

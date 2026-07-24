@@ -16,6 +16,11 @@ from model.objectives import (
     compute_uspc_loss,
     resolve_dcalign_lite_lambda,
 )
+from model.mraf import (
+    compute_mraf_reliability_loss,
+    compute_mraf_reliability_targets,
+    resolve_mraf_rel_lambda,
+)
 from utils.attribute_parser import (
     get_uspc_slot_local_attr_names,
     parse_basic_attributes,
@@ -2017,6 +2022,8 @@ def _build_total_loss(args, ret, epoch=None):
                 "loss_mdrc_similarity",
                 "loss_mdrc_weighted",
                 "mdrc_loss_scale",
+                "loss_mraf_rel",
+                "loss_mraf_rel_weighted",
                 "loss_mga_pseudo_sdm",
                 "loss_mga_rgb_color",
                 "loss_mga_t_shape",
@@ -4196,6 +4203,37 @@ def _resolve_mdrc_lambda(args, epoch):
     return target_lambda * ramp_factor
 
 
+def _mraf_enabled(args):
+    return bool(getattr(args, "mraf_enabled", False))
+
+
+def _resolve_mraf_rel_lambda(args, epoch):
+    if not _mraf_enabled(args):
+        return 0.0
+    return resolve_mraf_rel_lambda(
+        base_lambda=float(getattr(args, "mraf_rel_lambda", 0.01)),
+        warmup_epoch=int(getattr(args, "mraf_rel_warmup_epoch", 3)),
+        # do_train uses 1-based epochs; the mathematical schedule is 0-based.
+        zero_based_epoch=max(0, int(epoch) - 1),
+    )
+
+
+def _need_degraded_branch(args):
+    return _mdrc_enabled(args) or (
+        _mraf_enabled(args)
+        and float(getattr(args, "mraf_rel_lambda", 0.01)) > 0.0
+    )
+
+
+def _should_execute_degraded_branch(args, epoch):
+    """Protect the historical MDRC warmup while sharing one degraded forward."""
+    return (
+        _mdrc_enabled(args) and _resolve_mdrc_lambda(args, epoch) > 0.0
+    ) or (
+        _mraf_enabled(args) and _resolve_mraf_rel_lambda(args, epoch) > 0.0
+    )
+
+
 def _extract_mdrc_feature(ret, candidate_keys, feature_name, required=True):
     for key in candidate_keys:
         value = ret.get(key, None)
@@ -4231,7 +4269,49 @@ def _empty_mdrc_terms(reference, lambda_effective=0.0, loss_scale=1.0):
     }
 
 
-def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
+def _build_degraded_branch_context(args, model, batch):
+    """Sample exactly one shared degraded RGB-T view and encode it once."""
+    degraded_rgb, degraded_ir, degrade_info = degrade_rgbt_batch(
+        batch["images"],
+        batch.get("thermal_images", None),
+        prob=float(getattr(args, "mdrc_prob", 0.5)),
+        modes=getattr(args, "mdrc_degrade_modes", None),
+        return_mode=True,
+    )
+    delta_rgb = (
+        degraded_rgb.detach().float() - batch["images"].detach().float()
+    ).abs().mean()
+    if torch.is_tensor(degraded_ir) and "thermal_images" in batch:
+        delta_ir = (
+            degraded_ir.detach().float()
+            - batch["thermal_images"].detach().float()
+        ).abs().mean()
+    else:
+        delta_ir = delta_rgb.new_zeros(())
+
+    degraded_batch = dict(batch)
+    degraded_batch["images"] = degraded_rgb
+    if "thermal_images" in batch:
+        degraded_batch["thermal_images"] = degraded_ir
+    degraded_ret = model(degraded_batch, mdrc_feature_only=True)
+    return {
+        "degraded_rgb": degraded_rgb,
+        "degraded_ir": degraded_ir,
+        "degraded_ret": degraded_ret,
+        "delta_rgb": delta_rgb,
+        "delta_ir": delta_ir,
+        "degrade_info": degrade_info,
+    }
+
+
+def _compute_mdrc_terms(
+    args,
+    model,
+    batch,
+    clean_ret,
+    epoch,
+    degraded_context=None,
+):
     """
     MDRC v1.1: training-stage clean-degraded feature consistency.
 
@@ -4254,27 +4334,13 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
         "image",
         required=True,
     )
-    degraded_rgb, degraded_ir = degrade_rgbt_batch(
-        batch["images"],
-        batch.get("thermal_images", None),
-        prob=float(getattr(args, "mdrc_prob", 0.5)),
-        modes=getattr(args, "mdrc_degrade_modes", None),
-    )
-    delta_rgb = (degraded_rgb.detach().float() - batch["images"].detach().float()).abs().mean()
-    if torch.is_tensor(degraded_ir) and "thermal_images" in batch:
-        delta_ir = (
-            degraded_ir.detach().float()
-            - batch["thermal_images"].detach().float()
-        ).abs().mean()
-    else:
-        delta_ir = delta_rgb.new_zeros(())
-
-    degraded_batch = dict(batch)
-    degraded_batch["images"] = degraded_rgb
-    if "thermal_images" in batch:
-        degraded_batch["thermal_images"] = degraded_ir
-
-    degraded_ret = model(degraded_batch, mdrc_feature_only=True)
+    if degraded_context is None:
+        degraded_context = _build_degraded_branch_context(
+            args,
+            model,
+            batch,
+        )
+    degraded_ret = degraded_context["degraded_ret"]
     degraded_img_feat, degraded_image_feature_key = _extract_mdrc_feature(
         degraded_ret,
         (image_feature_key,) + tuple(
@@ -4313,12 +4379,13 @@ def _compute_mdrc_terms(args, model, batch, clean_ret, epoch):
         "mdrc_loss_scale": scale_tensor,
         "mdrc_active": loss_mdrc.new_ones(()),
         "mdrc_feature_only_degraded": loss_mdrc.new_ones(()),
-        "mdrc_delta_rgb": delta_rgb,
-        "mdrc_delta_ir": delta_ir,
+        "mdrc_delta_rgb": degraded_context["delta_rgb"],
+        "mdrc_delta_ir": degraded_context["delta_ir"],
         "mdrc_cos_clean_degraded": cos_clean_degraded,
         "mdrc_degraded_requires_grad": degraded_requires_grad,
         "mdrc_image_feature_key": degraded_image_feature_key,
         "mdrc_text_feature_key": "disabled_v1_1",
+        "degrade_mode_counts": degraded_context["degrade_info"]["mode_counts"],
     }
 
 
@@ -4332,6 +4399,92 @@ def _add_mdrc_to_total_loss(args, total_loss, mdrc_terms):
         + mdrc_terms["mdrc_lambda"]
         * mdrc_terms["mdrc_loss_scale"]
         * mdrc_terms["loss_mdrc"]
+    )
+
+
+def _compute_mraf_reliability_terms(
+    args,
+    clean_ret,
+    degraded_context,
+    epoch,
+):
+    """Compute drift targets and reliability MSE from the shared branch."""
+    lambda_effective = _resolve_mraf_rel_lambda(args, epoch)
+    if not _mraf_enabled(args) or lambda_effective <= 0.0:
+        return None
+    if degraded_context is None:
+        raise RuntimeError(
+            "MRAF reliability supervision requires a degraded branch context."
+        )
+
+    degraded_ret = degraded_context["degraded_ret"]
+    required_clean_keys = ("v_rgb_c", "v_t_c", "mraf_alpha")
+    required_degraded_keys = ("v_rgb_c", "v_t_c", "mraf_alpha")
+    missing_clean = [key for key in required_clean_keys if key not in clean_ret]
+    missing_degraded = [
+        key for key in required_degraded_keys if key not in degraded_ret
+    ]
+    if missing_clean or missing_degraded:
+        raise KeyError(
+            "MRAF reliability supervision is missing model outputs. "
+            f"Clean missing: {missing_clean}; degraded missing: "
+            f"{missing_degraded}."
+        )
+
+    target_outputs = compute_mraf_reliability_targets(
+        clean_rgb=clean_ret["v_rgb_c"],
+        clean_ir=clean_ret["v_t_c"],
+        degraded_rgb=degraded_ret["v_rgb_c"],
+        degraded_ir=degraded_ret["v_t_c"],
+        target_temperature=float(
+            getattr(args, "mraf_target_temperature", 0.1)
+        ),
+    )
+    alpha_degraded = degraded_ret["mraf_alpha"]
+    loss_mraf_rel = compute_mraf_reliability_loss(
+        alpha_degraded,
+        target_outputs["target"],
+    )
+    lambda_tensor = loss_mraf_rel.new_tensor(float(lambda_effective))
+    return {
+        "loss_mraf_rel": loss_mraf_rel,
+        "loss_mraf_rel_weighted": lambda_tensor * loss_mraf_rel,
+        "lambda_mraf_rel_cur": lambda_tensor,
+        "mraf_rel_active": loss_mraf_rel.new_ones(()),
+        "alpha_rgb_degraded_mean": alpha_degraded[:, 0].mean(),
+        "alpha_ir_degraded_mean": alpha_degraded[:, 1].mean(),
+        "target_rgb_mean": target_outputs["target_rgb"].mean(),
+        "target_ir_mean": target_outputs["target_ir"].mean(),
+        "drift_rgb_mean": target_outputs["drift_rgb"].mean(),
+        "drift_ir_mean": target_outputs["drift_ir"].mean(),
+        "mraf_target_requires_grad": target_outputs["target"].requires_grad,
+        "degrade_mode_counts": degraded_context["degrade_info"]["mode_counts"],
+    }
+
+
+def _add_mraf_to_total_loss(args, total_loss, mraf_terms):
+    if not _mraf_enabled(args) or not mraf_terms:
+        return total_loss
+    return (
+        total_loss
+        + mraf_terms["lambda_mraf_rel_cur"]
+        * mraf_terms["loss_mraf_rel"]
+    )
+
+
+def _compose_mdrc_mraf_loss(
+    base_loss,
+    mdrc_loss,
+    lambda_mdrc,
+    mdrc_loss_scale,
+    mraf_rel_loss,
+    lambda_mraf_rel,
+):
+    """Reference composition that keeps MDRC scale away from MRAF loss."""
+    return (
+        base_loss
+        + float(lambda_mdrc) * float(mdrc_loss_scale) * mdrc_loss
+        + float(lambda_mraf_rel) * mraf_rel_loss
     )
 
 
@@ -4398,6 +4551,28 @@ def log_mdrc_config(logger, args):
         int(getattr(args, "mdrc_warmup_epoch", 3)),
         float(getattr(args, "mdrc_temp", 0.07)),
         list(getattr(args, "mdrc_degrade_modes", [])),
+    )
+    logger.info(
+        "[MDRC] effective_mdrc_loss_scale=%.6f",
+        _mdrc_loss_scale(args),
+    )
+
+
+def log_mraf_config(logger, args):
+    if not _mraf_enabled(args):
+        return
+    logger.info(
+        "[MRAF] enabled=True hidden_dim=%d dropout=%.6f "
+        "gate_temperature=%.6f rel_lambda=%.6f "
+        "target_temperature=%.6f rel_warmup_epoch=%d "
+        "balance_lambda=%.6f precision_fusion=False",
+        int(getattr(args, "mraf_hidden_dim", 128)),
+        float(getattr(args, "mraf_dropout", 0.1)),
+        float(getattr(args, "mraf_gate_temperature", 1.0)),
+        float(getattr(args, "mraf_rel_lambda", 0.01)),
+        float(getattr(args, "mraf_target_temperature", 0.1)),
+        int(getattr(args, "mraf_rel_warmup_epoch", 3)),
+        float(getattr(args, "mraf_balance_lambda", 0.0)),
     )
 
 
@@ -4490,12 +4665,14 @@ def do_train(
     log_img_local_filter_train_config(logger, args)
     log_rgbt_moe_adapter_config(logger, args, model)
     log_mdrc_config(logger, args)
+    log_mraf_config(logger, args)
     log_degrade_aug_config(logger, args)
 
     meters = {
         "loss": AverageMeter(),
         "loss_total": AverageMeter(),
         "loss_baseline": AverageMeter(),
+        "loss_base": AverageMeter(),
         "sdm_loss": AverageMeter(),
         "loss_sdm_prob": AverageMeter(),
         "loss_sdm_det": AverageMeter(),
@@ -4548,8 +4725,20 @@ def do_train(
         "effective_weighted_mdrc": AverageMeter(),
         "mdrc_lambda": AverageMeter(),
         "mdrc_loss_scale": AverageMeter(),
+        "lambda_mdrc_cur": AverageMeter(),
         "mdrc_active": AverageMeter(),
         "mdrc_feature_only_degraded": AverageMeter(),
+        "loss_mraf_rel": AverageMeter(),
+        "loss_mraf_rel_weighted": AverageMeter(),
+        "lambda_mraf_rel_cur": AverageMeter(),
+        "alpha_rgb_clean_mean": AverageMeter(),
+        "alpha_ir_clean_mean": AverageMeter(),
+        "alpha_rgb_degraded_mean": AverageMeter(),
+        "alpha_ir_degraded_mean": AverageMeter(),
+        "target_rgb_mean": AverageMeter(),
+        "target_ir_mean": AverageMeter(),
+        "drift_rgb_mean": AverageMeter(),
+        "drift_ir_mean": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
         "loss_th_txt": AverageMeter(),
         "loss_txt_cons": AverageMeter(),
@@ -4687,6 +4876,7 @@ def do_train(
         dcalign_debug_logged_this_epoch = False
         mdrc_debug_logged_this_epoch = False
         degrade_aug_logged_this_epoch = False
+        degraded_mode_counts = {}
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -4944,6 +5134,20 @@ def do_train(
                 total_loss = total_loss + dcalign_terms["loss_dcalign"]
 
             baseline_total_loss = total_loss
+            degraded_context = None
+            if _should_execute_degraded_branch(args, epoch):
+                degraded_context = _build_degraded_branch_context(
+                    args,
+                    model,
+                    batch,
+                )
+                for mode_name, mode_count in degraded_context[
+                    "degrade_info"
+                ]["mode_counts"].items():
+                    degraded_mode_counts[mode_name] = (
+                        degraded_mode_counts.get(mode_name, 0) + int(mode_count)
+                    )
+
             mdrc_terms = None
             if _mdrc_enabled(args):
                 mdrc_terms = _compute_mdrc_terms(
@@ -4952,9 +5156,26 @@ def do_train(
                     batch,
                     ret,
                     epoch,
+                    degraded_context=degraded_context,
                 )
                 ret.update(mdrc_terms)
                 total_loss = _add_mdrc_to_total_loss(args, total_loss, mdrc_terms)
+
+            mraf_terms = None
+            if _mraf_enabled(args):
+                mraf_terms = _compute_mraf_reliability_terms(
+                    args,
+                    ret,
+                    degraded_context,
+                    epoch,
+                )
+                if mraf_terms:
+                    ret.update(mraf_terms)
+                    total_loss = _add_mraf_to_total_loss(
+                        args,
+                        total_loss,
+                        mraf_terms,
+                    )
 
             if not mdrc_debug_logged_this_epoch:
                 _log_mdrc_debug_status(
@@ -5008,8 +5229,42 @@ def do_train(
 
             batch_size = batch["images"].shape[0]
             meters["loss"].update(_to_scalar(total_loss), batch_size)
-            if mdrc_terms is not None:
+            if _mraf_enabled(args):
+                meters["loss_base"].update(
+                    _to_scalar(baseline_total_loss),
+                    batch_size,
+                )
                 meters["loss_total"].update(_to_scalar(total_loss), batch_size)
+                clean_alpha = ret.get("mraf_alpha", None)
+                if torch.is_tensor(clean_alpha):
+                    meters["alpha_rgb_clean_mean"].update(
+                        _to_scalar(clean_alpha[:, 0].mean()),
+                        batch_size,
+                    )
+                    meters["alpha_ir_clean_mean"].update(
+                        _to_scalar(clean_alpha[:, 1].mean()),
+                        batch_size,
+                    )
+                if degraded_context is not None:
+                    degraded_alpha = degraded_context["degraded_ret"].get(
+                        "mraf_alpha",
+                        None,
+                    )
+                    if torch.is_tensor(degraded_alpha):
+                        meters["alpha_rgb_degraded_mean"].update(
+                            _to_scalar(degraded_alpha[:, 0].mean()),
+                            batch_size,
+                        )
+                        meters["alpha_ir_degraded_mean"].update(
+                            _to_scalar(degraded_alpha[:, 1].mean()),
+                            batch_size,
+                        )
+            if mdrc_terms is not None:
+                if not _mraf_enabled(args):
+                    meters["loss_total"].update(
+                        _to_scalar(total_loss),
+                        batch_size,
+                    )
                 meters["loss_baseline"].update(
                     _to_scalar(baseline_total_loss), batch_size
                 )
@@ -5034,6 +5289,32 @@ def do_train(
                         _to_scalar(mdrc_terms.get(mdrc_stat_name, 0)),
                         1,
                     )
+                if _mraf_enabled(args):
+                    meters["lambda_mdrc_cur"].update(
+                        _to_scalar(mdrc_terms.get("mdrc_lambda", 0)),
+                        1,
+                    )
+            if mraf_terms is not None:
+                for mraf_name in [
+                    "loss_mraf_rel",
+                    "loss_mraf_rel_weighted",
+                    "lambda_mraf_rel_cur",
+                    "target_rgb_mean",
+                    "target_ir_mean",
+                    "drift_rgb_mean",
+                    "drift_ir_mean",
+                ]:
+                    meters[mraf_name].update(
+                        _to_scalar(mraf_terms[mraf_name]),
+                        batch_size
+                        if mraf_name != "lambda_mraf_rel_cur"
+                        else 1,
+                    )
+            elif _mraf_enabled(args):
+                meters["lambda_mraf_rel_cur"].update(
+                    _resolve_mraf_rel_lambda(args, epoch),
+                    1,
+                )
             meters["sdm_loss"].update(_to_scalar(ret.get("sdm_loss", 0)), batch_size)
             meters["loss_sdm_prob"].update(
                 _to_scalar(ret.get("loss_sdm_prob", ret.get("sdm_loss", 0))),
@@ -5586,6 +5867,37 @@ def do_train(
                     debug_max_train_batches,
                 )
                 break
+
+        if degraded_mode_counts and _mraf_enabled(args):
+            logger.info(
+                "[DEGRADED_MODE_COUNTS] epoch=%d counts=%s",
+                int(epoch),
+                json.dumps(degraded_mode_counts, sort_keys=True),
+            )
+        if _mraf_enabled(args):
+            mraf_epoch_stats = {
+                name: (meters[name].avg if meters[name].count > 0 else None)
+                for name in [
+                    "loss_base",
+                    "loss_mdrc",
+                    "loss_mraf_rel",
+                    "lambda_mdrc_cur",
+                    "lambda_mraf_rel_cur",
+                    "alpha_rgb_clean_mean",
+                    "alpha_ir_clean_mean",
+                    "alpha_rgb_degraded_mean",
+                    "alpha_ir_degraded_mean",
+                    "target_rgb_mean",
+                    "target_ir_mean",
+                    "drift_rgb_mean",
+                    "drift_ir_mean",
+                ]
+            }
+            logger.info(
+                "[MRAF_EPOCH] epoch=%d stats=%s",
+                int(epoch),
+                json.dumps(mraf_epoch_stats, sort_keys=True),
+            )
 
         tb_writer.add_scalar("lr", scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar("temperature", _to_scalar(ret["temperature"]), epoch)

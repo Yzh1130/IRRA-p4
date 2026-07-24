@@ -1,6 +1,40 @@
 import argparse
 
 
+MRAF_PRECISION_FUSION_ERROR = (
+    "MRAF and uncertainty precision fusion are mutually exclusive in the "
+    "current implementation."
+)
+
+
+def validate_mraf_options(args):
+    """Validate MRAF options for CLI and config-file model construction."""
+    if int(getattr(args, "mraf_hidden_dim", 128)) <= 0:
+        raise ValueError("--mraf_hidden_dim must be > 0.")
+    dropout = float(getattr(args, "mraf_dropout", 0.1))
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError("--mraf_dropout must be in [0, 1).")
+    if float(getattr(args, "mraf_gate_temperature", 1.0)) <= 0.0:
+        raise ValueError("--mraf_gate_temperature must be > 0.")
+    if float(getattr(args, "mraf_target_temperature", 0.1)) <= 0.0:
+        raise ValueError("--mraf_target_temperature must be > 0.")
+    if float(getattr(args, "mraf_rel_lambda", 0.01)) < 0.0:
+        raise ValueError("--mraf_rel_lambda must be >= 0.")
+    if float(getattr(args, "mraf_balance_lambda", 0.0)) < 0.0:
+        raise ValueError("--mraf_balance_lambda must be >= 0.")
+    if int(getattr(args, "mraf_rel_warmup_epoch", 3)) < 0:
+        raise ValueError("--mraf_rel_warmup_epoch must be >= 0.")
+
+    configured_precision = getattr(args, "use_precision_fusion", None)
+    effective_precision = (
+        bool(getattr(args, "use_global_uncertainty", False))
+        if configured_precision is None
+        else bool(configured_precision)
+    )
+    if bool(getattr(args, "mraf_enabled", False)) and effective_precision:
+        raise ValueError(MRAF_PRECISION_FUSION_ERROR)
+
+
 def get_args():
     # Centralized CLI argument definitions for training/inference.
     parser = argparse.ArgumentParser(description="IRRA Args")
@@ -57,6 +91,15 @@ def get_args():
     mdrc_group.add_argument("--mdrc_warmup_epoch", type=int, default=3, help="1-based epoch at which MDRC starts; weight then linearly ramps")
     mdrc_group.add_argument("--mdrc_temp", type=float, default=0.07, help="temperature for MDRC image-text similarity distribution consistency")
     mdrc_group.add_argument("--mdrc_degrade_modes", type=str, nargs='+', default=list(mdrc_degrade_modes), help="MDRC degradation modes; supports space or comma separated values")
+    mraf_group = parser.add_argument_group("MRAF")
+    mraf_group.add_argument("--mraf_enabled", default=False, action='store_true', help="enable modality reliability-adaptive RGB-T fusion")
+    mraf_group.add_argument("--mraf_hidden_dim", type=int, default=128, help="hidden dimension of the shared MRAF reliability scorer")
+    mraf_group.add_argument("--mraf_dropout", type=float, default=0.1, help="dropout probability in the MRAF reliability scorer")
+    mraf_group.add_argument("--mraf_gate_temperature", type=float, default=1.0, help="softmax temperature for MRAF gate weights")
+    mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
+    mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")
+    mraf_group.add_argument("--mraf_rel_warmup_epoch", type=int, default=3, help="number of epochs used to linearly warm up MRAF reliability supervision")
+    mraf_group.add_argument("--mraf_balance_lambda", type=float, default=0.0, help="reserved MRAF balance-loss weight; inactive in the first implementation")
     # Ablation-only degradation data augmentation (single-branch; no consistency loss).
     # Active only when --mdrc_enable is off; "none" keeps the baseline path unchanged.
     parser.add_argument("--degrade_aug_mode", type=str, default="none", choices=["none", "mdrc_style", "moddrop"], help="ablation degradation augmentation applied to image inputs before the forward pass; 'mdrc_style' samples one of the 6 MDRC modes, 'moddrop' zeros a whole modality; disabled when --mdrc_enable is set")
@@ -493,6 +536,10 @@ def get_args():
         parser.error("--mdrc_warmup_epoch must be >= 0.")
     if float(args.mdrc_temp) <= 0.0:
         parser.error("--mdrc_temp must be > 0.")
+    try:
+        validate_mraf_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.use_hard_negative_loss and args.use_hardneg_aux:
         parser.error(
             "--use_hard_negative_loss and legacy --use_hardneg_aux share "

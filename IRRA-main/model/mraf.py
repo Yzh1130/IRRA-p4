@@ -1,0 +1,230 @@
+"""Modality Reliability-Adaptive Fusion (MRAF)."""
+
+from __future__ import annotations
+
+from typing import Dict, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+TensorOrTuple = Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]
+
+
+def _validate_feature_tensor(name: str, feature: torch.Tensor) -> None:
+    if not torch.is_tensor(feature):
+        raise TypeError(f"{name} must be a torch.Tensor.")
+    if feature.dim() != 2:
+        raise ValueError(
+            f"{name} must have shape [B, D], got {tuple(feature.shape)}."
+        )
+    if not feature.is_floating_point():
+        raise TypeError(f"{name} must have a floating-point dtype, got {feature.dtype}.")
+    if not bool(torch.isfinite(feature).all().item()):
+        raise ValueError(f"{name} contains NaN or Inf values.")
+
+
+def _validate_feature_pair(
+    first_name: str,
+    first: torch.Tensor,
+    second_name: str,
+    second: torch.Tensor,
+) -> None:
+    _validate_feature_tensor(first_name, first)
+    _validate_feature_tensor(second_name, second)
+    if first.shape[0] != second.shape[0]:
+        raise ValueError(
+            f"{first_name} and {second_name} must share batch size, got "
+            f"{first.shape[0]} and {second.shape[0]}."
+        )
+    if first.shape[1] != second.shape[1]:
+        raise ValueError(
+            f"{first_name} and {second_name} must share feature dimension, got "
+            f"{first.shape[1]} and {second.shape[1]}."
+        )
+    if first.device != second.device:
+        raise ValueError(
+            f"{first_name} and {second_name} must be on the same device, got "
+            f"{first.device} and {second.device}."
+        )
+    if first.dtype != second.dtype:
+        raise ValueError(
+            f"{first_name} and {second_name} must share dtype, got "
+            f"{first.dtype} and {second.dtype}."
+        )
+
+
+class ModalityReliabilityAdaptiveFusion(nn.Module):
+    """Fuse two global modality features using a shared reliability scorer."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+        gate_temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if int(feature_dim) <= 0:
+            raise ValueError(f"feature_dim must be > 0, got {feature_dim}.")
+        if int(hidden_dim) <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {hidden_dim}.")
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+        if float(gate_temperature) <= 0.0:
+            raise ValueError(
+                f"gate_temperature must be > 0, got {gate_temperature}."
+            )
+
+        self.feature_dim = int(feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.gate_temperature = float(gate_temperature)
+        self.scorer = nn.Sequential(
+            nn.Linear(self.feature_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        self._zero_initialize_output_layer()
+
+    @property
+    def output_layer(self) -> nn.Linear:
+        """Return the zero-initialized final scorer layer."""
+        return self.scorer[-1]
+
+    def _zero_initialize_output_layer(self) -> None:
+        nn.init.zeros_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+
+    def forward(
+        self,
+        f_rgb: torch.Tensor,
+        f_ir: torch.Tensor,
+        return_aux: bool = False,
+    ) -> TensorOrTuple:
+        """Return baseline-preserving reliability-weighted RGB/IR fusion."""
+        _validate_feature_pair("f_rgb", f_rgb, "f_ir", f_ir)
+        if f_rgb.shape[1] != self.feature_dim:
+            raise ValueError(
+                f"Expected feature dimension {self.feature_dim}, got "
+                f"{f_rgb.shape[1]}."
+            )
+
+        scorer_device = self.output_layer.weight.device
+        if f_rgb.device != scorer_device:
+            raise ValueError(
+                "MRAF inputs and scorer must be on the same device, got "
+                f"{f_rgb.device} and {scorer_device}."
+            )
+
+        scorer_dtype = self.output_layer.weight.dtype
+        rgb_normalized = F.normalize(f_rgb, p=2, dim=-1).to(dtype=scorer_dtype)
+        ir_normalized = F.normalize(f_ir, p=2, dim=-1).to(dtype=scorer_dtype)
+        rgb_logit = self.scorer(rgb_normalized)
+        ir_logit = self.scorer(ir_normalized)
+        logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+        alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+        if not bool(torch.isfinite(alpha).all().item()):
+            raise ValueError("MRAF reliability weights contain NaN or Inf values.")
+
+        alpha_for_fusion = alpha.to(dtype=f_rgb.dtype)
+        alpha_rgb = alpha_for_fusion[:, 0:1]
+        alpha_ir = alpha_for_fusion[:, 1:2]
+        fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
+        if not bool(torch.isfinite(fused).all().item()):
+            raise ValueError("MRAF fused features contain NaN or Inf values.")
+
+        if not return_aux:
+            return fused
+        return fused, {
+            "fused": fused,
+            "alpha_rgb": alpha_rgb,
+            "alpha_ir": alpha_ir,
+            "alpha": alpha_for_fusion,
+            "logits": logits,
+        }
+
+
+def compute_mraf_reliability_targets(
+    clean_rgb: torch.Tensor,
+    clean_ir: torch.Tensor,
+    degraded_rgb: torch.Tensor,
+    degraded_ir: torch.Tensor,
+    target_temperature: float = 0.1,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """Build detached reliability targets from clean/degraded feature drift."""
+    if float(target_temperature) <= 0.0:
+        raise ValueError(
+            f"target_temperature must be > 0, got {target_temperature}."
+        )
+    _validate_feature_pair("clean_rgb", clean_rgb, "clean_ir", clean_ir)
+    _validate_feature_pair(
+        "degraded_rgb", degraded_rgb, "degraded_ir", degraded_ir
+    )
+    _validate_feature_pair("clean_rgb", clean_rgb, "degraded_rgb", degraded_rgb)
+    _validate_feature_pair("clean_ir", clean_ir, "degraded_ir", degraded_ir)
+
+    drift_rgb = 1.0 - F.cosine_similarity(
+        degraded_rgb.float(),
+        clean_rgb.detach().float(),
+        dim=-1,
+        eps=float(eps),
+    )
+    drift_ir = 1.0 - F.cosine_similarity(
+        degraded_ir.float(),
+        clean_ir.detach().float(),
+        dim=-1,
+        eps=float(eps),
+    )
+    target_logits = torch.stack([-drift_rgb, -drift_ir], dim=-1)
+    target = F.softmax(target_logits / float(target_temperature), dim=-1).detach()
+    if not bool(torch.isfinite(target).all().item()):
+        raise ValueError("MRAF reliability targets contain NaN or Inf values.")
+    return {
+        "target": target,
+        "target_rgb": target[:, 0:1],
+        "target_ir": target[:, 1:2],
+        "drift_rgb": drift_rgb,
+        "drift_ir": drift_ir,
+    }
+
+
+def compute_mraf_reliability_loss(
+    alpha_degraded: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Return MSE supervision for attached degraded-branch gate weights."""
+    _validate_feature_pair(
+        "alpha_degraded", alpha_degraded, "target", target
+    )
+    if alpha_degraded.shape[1] != 2:
+        raise ValueError(
+            "alpha_degraded and target must have shape [B, 2], got "
+            f"{tuple(alpha_degraded.shape)}."
+        )
+    if target.requires_grad:
+        raise ValueError("MRAF reliability target must be detached.")
+    return F.mse_loss(alpha_degraded.float(), target.float())
+
+
+def resolve_mraf_rel_lambda(
+    base_lambda: float,
+    warmup_epoch: int,
+    zero_based_epoch: int,
+) -> float:
+    """Resolve the requested independent linear MRAF reliability warmup."""
+    base_lambda = float(base_lambda)
+    warmup_epoch = int(warmup_epoch)
+    zero_based_epoch = max(0, int(zero_based_epoch))
+    if base_lambda < 0.0:
+        raise ValueError(f"base_lambda must be >= 0, got {base_lambda}.")
+    if warmup_epoch < 0:
+        raise ValueError(f"warmup_epoch must be >= 0, got {warmup_epoch}.")
+    if base_lambda == 0.0:
+        return 0.0
+    if warmup_epoch > 0 and zero_based_epoch < warmup_epoch:
+        return base_lambda * float(zero_based_epoch + 1) / float(warmup_epoch)
+    return base_lambda
