@@ -4,12 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from model.build import IRRA
+from model import build as build_module
 from model.mraf import (
     ModalityReliabilityAdaptiveFusion,
     compute_mraf_reliability_loss,
@@ -23,7 +25,11 @@ from tools.revision.analyze_mraf_weights import summarize_alpha
 from tools.revision.summarize_mraf_experiment import write_summary
 from utils.checkpoint import Checkpointer, load_state_dict
 from utils.mdrc import degrade_rgbt_batch
-from utils.options import MRAF_PRECISION_FUSION_ERROR, validate_mraf_options
+from utils.options import (
+    MRAF_PRECISION_FUSION_ERROR,
+    get_args,
+    validate_mraf_options,
+)
 
 
 def make_args(**overrides):
@@ -32,6 +38,8 @@ def make_args(**overrides):
         "mraf_hidden_dim": 8,
         "mraf_dropout": 0.0,
         "mraf_gate_temperature": 1.0,
+        "mraf_gate_fp32": False,
+        "mraf_gate_base_grad_scale": 1.0,
         "mraf_rel_lambda": 0.01,
         "mraf_target_temperature": 0.1,
         "mraf_rel_warmup_epoch": 3,
@@ -45,7 +53,13 @@ def make_args(**overrides):
 
 
 class ToyConditionalFusionModel(nn.Module):
-    def __init__(self, enabled, feature_dim=4):
+    def __init__(
+        self,
+        enabled,
+        feature_dim=4,
+        gate_fp32=False,
+        gate_base_grad_scale=1.0,
+    ):
         super().__init__()
         self.projection = nn.Linear(feature_dim, feature_dim, bias=False)
         self.mraf_enabled = bool(enabled)
@@ -55,6 +69,8 @@ class ToyConditionalFusionModel(nn.Module):
                 hidden_dim=8,
                 dropout=0.0,
                 gate_temperature=1.0,
+                gate_fp32=gate_fp32,
+                gate_base_grad_scale=gate_base_grad_scale,
             )
 
     def forward(self, rgb, ir):
@@ -338,6 +354,183 @@ class TestMRAF(unittest.TestCase):
             module(bad, ir)
         with self.assertRaisesRegex(ValueError, "gate_temperature"):
             ModalityReliabilityAdaptiveFusion(4, gate_temperature=0.0)
+        for invalid_scale in (-0.01, 1.01):
+            with self.assertRaisesRegex(ValueError, "gate_base_grad_scale"):
+                ModalityReliabilityAdaptiveFusion(
+                    4, gate_base_grad_scale=invalid_scale
+                )
+            with self.assertRaisesRegex(ValueError, "mraf_gate_base_grad_scale"):
+                validate_mraf_options(
+                    make_args(mraf_gate_base_grad_scale=invalid_scale)
+                )
+
+    def test_gate_fp32_survives_half_and_autocast(self):
+        module = ModalityReliabilityAdaptiveFusion(
+            4,
+            hidden_dim=6,
+            dropout=0.0,
+            gate_fp32=True,
+        ).half()
+        with torch.no_grad():
+            module.output_layer.weight.normal_(std=0.2)
+            module.output_layer.bias.copy_(torch.tensor([0.03]))
+        self.assertTrue(
+            all(parameter.dtype == torch.float32 for parameter in module.scorer.parameters())
+        )
+        rgb = torch.randn(7, 4, dtype=torch.float16)
+        ir = torch.randn(7, 4, dtype=torch.float16)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            fused, aux = module(rgb, ir, return_aux=True)
+        self.assertEqual(aux["logits"].dtype, torch.float32)
+        self.assertEqual(aux["alpha"].dtype, torch.float32)
+        self.assertEqual(fused.dtype, torch.float32)
+
+        with torch.autocast(device_type="cpu", enabled=False):
+            rgb32 = rgb.float()
+            ir32 = ir.float()
+            logits_ref = torch.cat(
+                [
+                    module.scorer(torch.nn.functional.normalize(rgb32, dim=-1)),
+                    module.scorer(torch.nn.functional.normalize(ir32, dim=-1)),
+                ],
+                dim=-1,
+            )
+            alpha_ref = torch.softmax(
+                logits_ref / module.gate_temperature, dim=-1
+            )
+            fused_ref = 2.0 * (
+                alpha_ref[:, :1] * rgb32 + alpha_ref[:, 1:] * ir32
+            )
+        torch.testing.assert_close(aux["alpha"], alpha_ref, atol=1e-7, rtol=1e-7)
+        torch.testing.assert_close(fused, fused_ref, atol=1e-7, rtol=1e-7)
+
+    def test_cli_defaults_and_build_conversion_order(self):
+        with patch("sys.argv", ["train.py"]):
+            args = get_args()
+        self.assertFalse(args.mraf_gate_fp32)
+        self.assertEqual(args.mraf_gate_base_grad_scale, 1.0)
+
+        shell = nn.Module()
+        shell.mraf_enabled = True
+        shell.mraf_fusion = ModalityReliabilityAdaptiveFusion(
+            4, hidden_dim=3, gate_fp32=True
+        )
+
+        def convert_to_half(model):
+            model.mraf_fusion.scorer.half()
+
+        with patch.object(build_module, "IRRA", return_value=shell), patch.object(
+            build_module, "convert_weights", side_effect=convert_to_half
+        ):
+            built = build_module.build_model(SimpleNamespace(), num_classes=2)
+        self.assertIs(built, shell)
+        self.assertTrue(
+            all(
+                parameter.dtype == torch.float32
+                for parameter in built.mraf_fusion.scorer.parameters()
+            )
+        )
+
+    def test_gate_fp32_disabled_preserves_legacy_dtype_path(self):
+        module = ModalityReliabilityAdaptiveFusion(
+            4, hidden_dim=6, dropout=0.0, gate_fp32=False
+        ).half()
+        rgb = torch.randn(5, 4, dtype=torch.float16)
+        ir = torch.randn(5, 4, dtype=torch.float16)
+        fused, aux = module(rgb, ir, return_aux=True)
+        self.assertEqual(aux["logits"].dtype, torch.float16)
+        self.assertEqual(aux["alpha"].dtype, torch.float16)
+        self.assertEqual(fused.dtype, torch.float16)
+        self.assertTrue(torch.equal(fused, rgb + ir))
+
+    def test_base_gate_gradient_scaling_and_forward_invariance(self):
+        template = ModalityReliabilityAdaptiveFusion(
+            4, hidden_dim=6, dropout=0.0, gate_fp32=True
+        )
+        with torch.no_grad():
+            template.output_layer.weight.normal_(std=0.2)
+            template.output_layer.bias.normal_(std=0.1)
+        state = copy.deepcopy(template.state_dict())
+        rgb_seed = torch.randn(8, 4)
+        ir_seed = torch.randn(8, 4)
+        outputs = {}
+        scorer_grad_norms = {}
+        input_grad_norms = {}
+        for scale in (0.0, 0.1, 1.0):
+            module = ModalityReliabilityAdaptiveFusion(
+                4,
+                hidden_dim=6,
+                dropout=0.0,
+                gate_fp32=True,
+                gate_base_grad_scale=scale,
+            )
+            module.load_state_dict(state)
+            rgb = rgb_seed.clone().requires_grad_(True)
+            ir = ir_seed.clone().requires_grad_(True)
+            fused = module(rgb, ir)
+            loss = fused.square().mean()
+            loss.backward()
+            outputs[scale] = fused.detach()
+            scorer_grad_norms[scale] = sum(
+                float(parameter.grad.norm().item())
+                for parameter in module.scorer.parameters()
+                if parameter.grad is not None
+            )
+            input_grad_norms[scale] = float(rgb.grad.norm().item())
+        torch.testing.assert_close(outputs[0.0], outputs[0.1], atol=0, rtol=0)
+        torch.testing.assert_close(outputs[0.0], outputs[1.0], atol=0, rtol=0)
+        self.assertEqual(scorer_grad_norms[0.0], 0.0)
+        self.assertGreater(scorer_grad_norms[1.0], 0.0)
+        self.assertAlmostEqual(
+            scorer_grad_norms[0.1] / scorer_grad_norms[1.0],
+            0.1,
+            places=5,
+        )
+        self.assertGreater(input_grad_norms[0.0], 0.0)
+
+    def test_reliability_gradient_ignores_base_gradient_scale(self):
+        module = ModalityReliabilityAdaptiveFusion(
+            3,
+            hidden_dim=5,
+            dropout=0.0,
+            gate_fp32=True,
+            gate_base_grad_scale=0.0,
+        )
+        with torch.no_grad():
+            module.output_layer.weight.normal_(std=0.1)
+        rgb = torch.randn(6, 3)
+        ir = torch.randn(6, 3)
+        _, aux = module(rgb, ir, return_aux=True)
+        target = torch.tensor([[0.8, 0.2]], dtype=torch.float32).repeat(6, 1)
+        compute_mraf_reliability_loss(aux["alpha"], target).backward()
+        grad_norm = sum(
+            float(parameter.grad.norm().item())
+            for parameter in module.scorer.parameters()
+            if parameter.grad is not None
+        )
+        self.assertGreater(grad_norm, 0.0)
+
+    def test_fp32_checkpoint_roundtrip_and_eval_scale_invariance(self):
+        source = ToyConditionalFusionModel(
+            True, gate_fp32=True, gate_base_grad_scale=0.0
+        ).eval()
+        with torch.no_grad():
+            source.mraf_fusion.output_layer.weight.normal_(std=0.1)
+        rgb = torch.randn(4, 4)
+        ir = torch.randn(4, 4)
+        expected = source(rgb, ir)
+        target = ToyConditionalFusionModel(
+            True, gate_fp32=True, gate_base_grad_scale=1.0
+        ).eval()
+        target.load_state_dict(source.state_dict())
+        actual = target(rgb, ir)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertTrue(
+            all(
+                parameter.dtype == torch.float32
+                for parameter in target.mraf_fusion.scorer.parameters()
+            )
+        )
 
     def test_analysis_and_summary_helpers_do_not_invent_values(self):
         row = summarize_alpha(

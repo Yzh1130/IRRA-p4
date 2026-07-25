@@ -11,6 +11,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 import random
 import subprocess
 import sys
@@ -216,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--run-root",
-        required=True,
+        default="",
         help="experiment root containing formal/*_<case>_seed1 directories",
     )
     parser.add_argument(
@@ -227,9 +228,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cases",
         nargs="+",
-        required=True,
         choices=SUPPORTED_CASES,
         help="one or more trained MRAF cases",
+    )
+    parser.add_argument(
+        "--config-file",
+        default="",
+        help="direct single-run mode: saved configs.yaml path",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="direct single-run mode: trained checkpoint path",
+    )
+    parser.add_argument(
+        "--case-label",
+        default="",
+        help="direct single-run mode: stable label used in diagnostic outputs",
     )
     parser.add_argument(
         "--device",
@@ -347,6 +362,38 @@ def discover_run_artifacts(
             )
         )
     return artifacts
+
+
+def discover_direct_artifact(
+    config_path: Path,
+    checkpoint_path: Path,
+    case_label: str,
+) -> RunArtifacts:
+    """Resolve one candidate without changing the legacy formal-run layout."""
+    # Keep the caller-visible parent before following candidate symlinks:
+    # pipeline configs/best.pth can point into train_output while train.log
+    # intentionally remains at the candidate root.
+    config_path = config_path.expanduser().absolute()
+    checkpoint_path = checkpoint_path.expanduser().absolute()
+    case_label = str(case_label).strip()
+    if not case_label:
+        raise ValueError("--case-label must not be empty in direct mode.")
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    common = Path(
+        os.path.commonpath(
+            [str(config_path.parent), str(checkpoint_path.parent)]
+        )
+    ).resolve()
+    return RunArtifacts(
+        case=case_label,
+        run_dir=common,
+        config_path=config_path,
+        checkpoint_path=checkpoint_path,
+        train_log_path=_find_unique_file(common, "train.log"),
+    )
 
 
 def unwrap_state_dict(checkpoint: Mapping[str, Any]) -> Mapping[str, torch.Tensor]:
@@ -2012,7 +2059,9 @@ def _prepare_output_dir(path: Path) -> Path:
     return resolved
 
 
-def _validate_cli(args: argparse.Namespace) -> Tuple[Path, Path, torch.device]:
+def _validate_cli(
+    args: argparse.Namespace,
+) -> Tuple[Optional[Path], Path, torch.device, List[RunArtifacts], str]:
     if args.max_batches <= 0:
         raise ValueError("--max-batches must be a positive integer.")
     if args.gradient_batches <= 0:
@@ -2025,18 +2074,50 @@ def _validate_cli(args: argparse.Namespace) -> Tuple[Path, Path, torch.device]:
         raise ValueError(
             "--gradient-microbatch-size must be a positive integer."
         )
-    if len(set(args.cases)) != len(args.cases):
+    legacy_values = (bool(str(args.run_root).strip()), bool(args.cases))
+    direct_values = (
+        bool(str(args.config_file).strip()),
+        bool(str(args.checkpoint).strip()),
+        bool(str(args.case_label).strip()),
+    )
+    legacy_mode = all(legacy_values)
+    direct_mode = all(direct_values)
+    if any(legacy_values) and not legacy_mode:
+        raise ValueError("Legacy mode requires both --run-root and --cases.")
+    if any(direct_values) and not direct_mode:
+        raise ValueError(
+            "Direct mode requires --config-file, --checkpoint, and --case-label."
+        )
+    if legacy_mode == direct_mode:
+        raise ValueError(
+            "Choose exactly one input mode: --run-root/--cases or "
+            "--config-file/--checkpoint/--case-label."
+        )
+    if args.cases and len(set(args.cases)) != len(args.cases):
         raise ValueError("--cases must not contain duplicate case names.")
-    run_root = Path(args.run_root).resolve()
     data_root = Path(args.data_root).resolve()
-    if not run_root.is_dir():
-        raise FileNotFoundError(f"Run root not found: {run_root}")
     if not data_root.is_dir():
         raise FileNotFoundError(f"Data root not found: {data_root}")
+    if legacy_mode:
+        run_root = Path(args.run_root).resolve()
+        if not run_root.is_dir():
+            raise FileNotFoundError(f"Run root not found: {run_root}")
+        artifacts = discover_run_artifacts(run_root, args.cases)
+        input_mode = "run_root"
+    else:
+        run_root = None
+        artifacts = [
+            discover_direct_artifact(
+                Path(args.config_file),
+                Path(args.checkpoint),
+                args.case_label,
+            )
+        ]
+        input_mode = "direct"
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available() and not args.dry_run:
         raise RuntimeError("CUDA was requested but is not available.")
-    return run_root, data_root, device
+    return run_root, data_root, device, artifacts, input_mode
 
 
 def _seed_everything(seed: int) -> None:
@@ -2049,8 +2130,7 @@ def _seed_everything(seed: int) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    run_root, data_root, device = _validate_cli(args)
-    artifacts = discover_run_artifacts(run_root, args.cases)
+    run_root, data_root, device, artifacts, input_mode = _validate_cli(args)
     if args.dry_run:
         print(
             json.dumps(
@@ -2058,6 +2138,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "dry_run": True,
                     "git_head": _git_head(),
                     "data_root": str(data_root),
+                    "input_mode": input_mode,
                     "device": str(device),
                     "degrade_seed": int(args.degrade_seed),
                     "max_batches": int(args.max_batches),
@@ -2198,7 +2279,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_batches": int(args.max_batches),
         "gradient_batches": int(args.gradient_batches),
         "gradient_microbatch_size": int(args.gradient_microbatch_size),
-        "run_root": str(run_root),
+        "run_root": str(run_root) if run_root is not None else None,
+        "input_mode": input_mode,
         "data_root": str(data_root),
         "cases": metadata_cases,
         "statistics_dtype": str(torch.float32),

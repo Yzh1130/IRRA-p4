@@ -64,6 +64,8 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         hidden_dim: int = 128,
         dropout: float = 0.1,
         gate_temperature: float = 1.0,
+        gate_fp32: bool = False,
+        gate_base_grad_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if int(feature_dim) <= 0:
@@ -76,11 +78,18 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             raise ValueError(
                 f"gate_temperature must be > 0, got {gate_temperature}."
             )
+        if not 0.0 <= float(gate_base_grad_scale) <= 1.0:
+            raise ValueError(
+                "gate_base_grad_scale must be in [0, 1], got "
+                f"{gate_base_grad_scale}."
+            )
 
         self.feature_dim = int(feature_dim)
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self.gate_temperature = float(gate_temperature)
+        self.gate_fp32 = bool(gate_fp32)
+        self.gate_base_grad_scale = float(gate_base_grad_scale)
         self.scorer = nn.Sequential(
             nn.Linear(self.feature_dim, self.hidden_dim),
             nn.GELU(),
@@ -88,6 +97,8 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             nn.Linear(self.hidden_dim, 1),
         )
         self._zero_initialize_output_layer()
+        if self.gate_fp32:
+            self.scorer.float()
 
     @property
     def output_layer(self) -> nn.Linear:
@@ -97,6 +108,13 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
     def _zero_initialize_output_layer(self) -> None:
         nn.init.zeros_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
+
+    def _apply(self, fn):
+        """Keep the optional scorer in FP32 across model.half()/to()/conversion."""
+        super()._apply(fn)
+        if self.gate_fp32:
+            self.scorer.float()
+        return self
 
     def forward(
         self,
@@ -120,19 +138,60 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             )
 
         scorer_dtype = self.output_layer.weight.dtype
-        rgb_normalized = F.normalize(f_rgb, p=2, dim=-1).to(dtype=scorer_dtype)
-        ir_normalized = F.normalize(f_ir, p=2, dim=-1).to(dtype=scorer_dtype)
-        rgb_logit = self.scorer(rgb_normalized)
-        ir_logit = self.scorer(ir_normalized)
-        logits = torch.cat([rgb_logit, ir_logit], dim=-1)
-        alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+        if self.gate_fp32:
+            # Disable the surrounding AMP context for the complete gate and
+            # fusion path.  Merely storing FP32 parameters is insufficient:
+            # autocast would otherwise quantize Linear outputs on supported
+            # devices before softmax.
+            with torch.autocast(device_type=f_rgb.device.type, enabled=False):
+                rgb_for_fusion = f_rgb.float()
+                ir_for_fusion = f_ir.float()
+                rgb_normalized = F.normalize(rgb_for_fusion, p=2, dim=-1)
+                ir_normalized = F.normalize(ir_for_fusion, p=2, dim=-1)
+                rgb_logit = self.scorer(rgb_normalized)
+                ir_logit = self.scorer(ir_normalized)
+                logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+                alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+                if self.gate_base_grad_scale == 1.0:
+                    alpha_for_base = alpha
+                else:
+                    alpha_for_base = (
+                        alpha.detach()
+                        + self.gate_base_grad_scale * (alpha - alpha.detach())
+                    )
+                alpha_rgb = alpha_for_base[:, 0:1]
+                alpha_ir = alpha_for_base[:, 1:2]
+                alpha_aux = alpha
+                fused = 2.0 * (
+                    alpha_rgb * rgb_for_fusion
+                    + alpha_ir * ir_for_fusion
+                )
+        else:
+            rgb_normalized = F.normalize(f_rgb, p=2, dim=-1).to(
+                dtype=scorer_dtype
+            )
+            ir_normalized = F.normalize(f_ir, p=2, dim=-1).to(
+                dtype=scorer_dtype
+            )
+            rgb_logit = self.scorer(rgb_normalized)
+            ir_logit = self.scorer(ir_normalized)
+            logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+            alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+            if self.gate_base_grad_scale == 1.0:
+                alpha_for_base = alpha
+            else:
+                alpha_for_base = alpha.detach() + self.gate_base_grad_scale * (
+                    alpha - alpha.detach()
+                )
+            alpha_for_fusion = alpha_for_base.to(dtype=f_rgb.dtype)
+            # Preserve the legacy auxiliary dtype while keeping reliability
+            # supervision on the unscaled alpha graph.
+            alpha_aux = alpha.to(dtype=f_rgb.dtype)
+            alpha_rgb = alpha_for_fusion[:, 0:1]
+            alpha_ir = alpha_for_fusion[:, 1:2]
+            fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
         if not bool(torch.isfinite(alpha).all().item()):
             raise ValueError("MRAF reliability weights contain NaN or Inf values.")
-
-        alpha_for_fusion = alpha.to(dtype=f_rgb.dtype)
-        alpha_rgb = alpha_for_fusion[:, 0:1]
-        alpha_ir = alpha_for_fusion[:, 1:2]
-        fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
         if not bool(torch.isfinite(fused).all().item()):
             raise ValueError("MRAF fused features contain NaN or Inf values.")
 
@@ -140,9 +199,9 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             return fused
         return fused, {
             "fused": fused,
-            "alpha_rgb": alpha_rgb,
-            "alpha_ir": alpha_ir,
-            "alpha": alpha_for_fusion,
+            "alpha_rgb": alpha_aux[:, 0:1],
+            "alpha_ir": alpha_aux[:, 1:2],
+            "alpha": alpha_aux,
             "logits": logits,
         }
 

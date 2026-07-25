@@ -147,3 +147,40 @@ Rich evaluation output includes MRAF RGB/IR weights for the analysis tool.
 - Any non-MRAF missing key, unexpected key, or partially present MRAF state
   raises an error.
 - No global `strict=False` is used.
+
+## Optional gate-rescue controls
+
+`--mraf_gate_fp32` defaults to `False`. When enabled,
+`ModalityReliabilityAdaptiveFusion` disables the surrounding autocast context
+only for its scorer, logits, softmax and fusion arithmetic. The scorer is
+restored to FP32 after the repository-wide `convert_weights(model)` call, and
+the module's `_apply` hook keeps it FP32 across later `model.half()` or dtype
+conversion. The backbone remains in its existing precision. Returned
+`mraf_logits` and `mraf_alpha` are genuine FP32 values, and alpha is not cast
+back to FP16 before fusion.
+
+`--mraf_gate_base_grad_scale` defaults to `1.0` and accepts `[0,1]`. The base
+fusion path uses the forward-identical expression:
+
+```text
+alpha_for_base = alpha.detach() + scale * (alpha - alpha.detach())
+```
+
+The reliability loss continues to consume the original attached `alpha`.
+Therefore scale 0 removes only the base-task gradient into the scorer, scale
+0.1 passes 10%, and scale 1 preserves the historical graph. Direct feature
+gradients from the base loss are not detached. Evaluation values are identical
+for all scales.
+
+Both options are saved automatically in `configs.yaml` and logged in the MRAF
+configuration/epoch records. Epoch diagnostics also contain clean/degraded
+alpha mean/std, target mean/std, detached alpha-target Pearson, base and
+weighted reliability losses and ratio, scorer first/last layer gradient norms,
+and gate logits/alpha dtype. Logged tensors are detached immediately; logging
+does not retain training graphs.
+
+The fixed short-screen and formal orchestration are documented in
+`docs/revision/mraf_gate_rescue_pipeline.md`. These controls do not modify the
+target formula, target temperature, default reliability lambda, MDRC,
+degradation, CLIP, base fusion formula, loss task set, or default training
+behavior.

@@ -116,6 +116,10 @@ class IRRA(nn.Module):
                 gate_temperature=float(
                     getattr(args, "mraf_gate_temperature", 1.0)
                 ),
+                gate_fp32=bool(getattr(args, "mraf_gate_fp32", False)),
+                gate_base_grad_scale=float(
+                    getattr(args, "mraf_gate_base_grad_scale", 1.0)
+                ),
             )
 
         # Temperature scalar used by global alignment losses.
@@ -2497,4 +2501,9 @@ class IRRA(nn.Module):
 def build_model(args, num_classes=11003):
     model = IRRA(args, num_classes)
     convert_weights(model)
+    if model.mraf_enabled and model.mraf_fusion.gate_fp32:
+        # convert_weights recursively halves every Linear. Restore only the
+        # optional MRAF scorer; its _apply override also protects later
+        # model.half()/to(dtype=...) calls.
+        model.mraf_fusion.scorer.float()
     return model

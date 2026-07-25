@@ -22,6 +22,11 @@ def validate_mraf_options(args):
         raise ValueError("--mraf_rel_lambda must be >= 0.")
     if float(getattr(args, "mraf_balance_lambda", 0.0)) < 0.0:
         raise ValueError("--mraf_balance_lambda must be >= 0.")
+    base_grad_scale = float(
+        getattr(args, "mraf_gate_base_grad_scale", 1.0)
+    )
+    if not 0.0 <= base_grad_scale <= 1.0:
+        raise ValueError("--mraf_gate_base_grad_scale must be in [0.0, 1.0].")
     if int(getattr(args, "mraf_rel_warmup_epoch", 3)) < 0:
         raise ValueError("--mraf_rel_warmup_epoch must be >= 0.")
 
@@ -96,6 +101,8 @@ def get_args():
     mraf_group.add_argument("--mraf_hidden_dim", type=int, default=128, help="hidden dimension of the shared MRAF reliability scorer")
     mraf_group.add_argument("--mraf_dropout", type=float, default=0.1, help="dropout probability in the MRAF reliability scorer")
     mraf_group.add_argument("--mraf_gate_temperature", type=float, default=1.0, help="softmax temperature for MRAF gate weights")
+    mraf_group.add_argument("--mraf_gate_fp32", default=False, action='store_true', help="keep only the MRAF scorer, logits, alpha, and fusion arithmetic in FP32")
+    mraf_group.add_argument("--mraf_gate_base_grad_scale", type=float, default=1.0, help="scale only base-task gate gradients into the MRAF scorer; valid range [0,1]")
     mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
     mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")
     mraf_group.add_argument("--mraf_rel_warmup_epoch", type=int, default=3, help="number of epochs used to linearly warm up MRAF reliability supervision")

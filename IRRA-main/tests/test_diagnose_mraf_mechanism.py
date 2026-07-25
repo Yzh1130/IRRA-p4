@@ -240,6 +240,81 @@ def test_gradient_microbatch_size_must_be_positive():
     assert parser.parse_args(common_args).gradient_microbatch_size == 4
 
 
+def test_direct_single_checkpoint_mode_discovers_artifacts(tmp_path):
+    data_root = tmp_path / "data"
+    run_dir = tmp_path / "candidate"
+    data_root.mkdir()
+    run_dir.mkdir()
+    config_path = run_dir / "configs.yaml"
+    checkpoint_path = run_dir / "best.pth"
+    config_path.write_text("dataset_name: RGBT-PEDES\n", encoding="utf-8")
+    checkpoint_path.write_bytes(b"dry-run checkpoint")
+    (run_dir / "train.log").write_text("fixture\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exit_code = main(
+            [
+                "--config-file",
+                str(config_path),
+                "--checkpoint",
+                str(checkpoint_path),
+                "--case-label",
+                "S4",
+                "--data-root",
+                str(data_root),
+                "--device",
+                "cpu",
+                "--max-batches",
+                "1",
+                "--gradient-batches",
+                "1",
+                "--output-dir",
+                str(output_dir),
+                "--dry-run",
+            ]
+        )
+
+    payload = stdout.getvalue()
+    assert exit_code == 0
+    assert '"input_mode": "direct"' in payload
+    assert '"case": "S4"' in payload
+    assert not output_dir.exists()
+
+
+def test_cli_rejects_mixed_or_partial_input_modes(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    base = [
+        "--data-root",
+        str(data_root),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--device",
+        "cpu",
+        "--dry-run",
+    ]
+    with pytest.raises(ValueError, match="requires"):
+        main(base + ["--config-file", "configs.yaml"])
+    with pytest.raises(ValueError, match="exactly one"):
+        main(
+            base
+            + [
+                "--run-root",
+                str(tmp_path),
+                "--cases",
+                "mraf_only",
+                "--config-file",
+                "configs.yaml",
+                "--checkpoint",
+                "best.pth",
+                "--case-label",
+                "S0",
+            ]
+        )
+
+
 def test_slice_batch_for_diagnostics_handles_batch_values_without_mutation():
     images = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     auxiliary = torch.arange(3)
@@ -374,6 +449,10 @@ def test_gradient_memory_schema_and_cli_help_are_stable():
 
     assert required_memory_fields.issubset(set(GRADIENT_FIELDS))
     assert "--gradient-microbatch-size" in diagnostic.build_parser().format_help()
+    help_text = diagnostic.build_parser().format_help()
+    assert "--config-file" in help_text
+    assert "--checkpoint" in help_text
+    assert "--case-label" in help_text
 
 
 def test_existing_output_directory_is_rejected_after_failure(tmp_path):

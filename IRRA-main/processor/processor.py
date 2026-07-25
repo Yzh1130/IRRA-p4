@@ -6,6 +6,7 @@ import random
 import time
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
@@ -77,6 +78,51 @@ def _to_scalar(value):
             return value.item()
         return value.detach().mean().item()
     return float(value)
+
+
+def _detached_std(value):
+    """Return a graph-free population std for compact diagnostics."""
+    if not torch.is_tensor(value) or value.numel() == 0:
+        return 0.0
+    return value.detach().float().reshape(-1).std(unbiased=False).item()
+
+
+def _detached_pearson(first, second):
+    """Return a graph-free Pearson value, or 0 for an undefined constant input."""
+    first = first.detach().float().reshape(-1)
+    second = second.detach().float().reshape(-1)
+    if first.numel() < 2 or first.numel() != second.numel():
+        return 0.0
+    first = first - first.mean()
+    second = second - second.mean()
+    denominator = first.norm() * second.norm()
+    if float(denominator.item()) <= 0.0:
+        return 0.0
+    return float(torch.dot(first, second).div(denominator).item())
+
+
+def _mraf_scorer_gradient_stats(model):
+    """Read scorer gradient norms without retaining parameters or graphs."""
+    runtime_model = model.module if hasattr(model, "module") else model
+    fusion = getattr(runtime_model, "mraf_fusion", None)
+    scorer = getattr(fusion, "scorer", None)
+    if scorer is None:
+        return {}
+    linears = [module for module in scorer if isinstance(module, nn.Linear)]
+    if not linears:
+        return {}
+
+    def grad_norm(parameter):
+        if parameter is None or parameter.grad is None:
+            return 0.0
+        return float(parameter.grad.detach().float().norm().item())
+
+    return {
+        "scorer_first_weight_grad_norm": grad_norm(linears[0].weight),
+        "scorer_first_bias_grad_norm": grad_norm(linears[0].bias),
+        "scorer_last_weight_grad_norm": grad_norm(linears[-1].weight),
+        "scorer_last_bias_grad_norm": grad_norm(linears[-1].bias),
+    }
 
 
 def _resolve_metric_ckpt_dir(args):
@@ -4446,15 +4492,33 @@ def _compute_mraf_reliability_terms(
         target_outputs["target"],
     )
     lambda_tensor = loss_mraf_rel.new_tensor(float(lambda_effective))
+    alpha_rgb = alpha_degraded[:, 0]
+    alpha_ir = alpha_degraded[:, 1]
+    target_rgb = target_outputs["target_rgb"][:, 0]
+    target_ir = target_outputs["target_ir"][:, 0]
     return {
         "loss_mraf_rel": loss_mraf_rel,
         "loss_mraf_rel_weighted": lambda_tensor * loss_mraf_rel,
         "lambda_mraf_rel_cur": lambda_tensor,
         "mraf_rel_active": loss_mraf_rel.new_ones(()),
-        "alpha_rgb_degraded_mean": alpha_degraded[:, 0].mean(),
-        "alpha_ir_degraded_mean": alpha_degraded[:, 1].mean(),
-        "target_rgb_mean": target_outputs["target_rgb"].mean(),
-        "target_ir_mean": target_outputs["target_ir"].mean(),
+        "alpha_rgb_degraded_mean": alpha_rgb.mean(),
+        "alpha_ir_degraded_mean": alpha_ir.mean(),
+        "alpha_rgb_degraded_std": loss_mraf_rel.new_tensor(
+            _detached_std(alpha_rgb)
+        ),
+        "alpha_ir_degraded_std": loss_mraf_rel.new_tensor(
+            _detached_std(alpha_ir)
+        ),
+        "target_rgb_mean": target_rgb.mean(),
+        "target_ir_mean": target_ir.mean(),
+        "target_rgb_std": loss_mraf_rel.new_tensor(_detached_std(target_rgb)),
+        "target_ir_std": loss_mraf_rel.new_tensor(_detached_std(target_ir)),
+        "alpha_target_pearson_rgb": loss_mraf_rel.new_tensor(
+            _detached_pearson(alpha_rgb, target_rgb)
+        ),
+        "alpha_target_pearson_ir": loss_mraf_rel.new_tensor(
+            _detached_pearson(alpha_ir, target_ir)
+        ),
         "drift_rgb_mean": target_outputs["drift_rgb"].mean(),
         "drift_ir_mean": target_outputs["drift_ir"].mean(),
         "mraf_target_requires_grad": target_outputs["target"].requires_grad,
@@ -4563,12 +4627,15 @@ def log_mraf_config(logger, args):
         return
     logger.info(
         "[MRAF] enabled=True hidden_dim=%d dropout=%.6f "
-        "gate_temperature=%.6f rel_lambda=%.6f "
+        "gate_temperature=%.6f gate_fp32=%s gate_base_grad_scale=%.6f "
+        "rel_lambda=%.6f "
         "target_temperature=%.6f rel_warmup_epoch=%d "
         "balance_lambda=%.6f precision_fusion=False",
         int(getattr(args, "mraf_hidden_dim", 128)),
         float(getattr(args, "mraf_dropout", 0.1)),
         float(getattr(args, "mraf_gate_temperature", 1.0)),
+        bool(getattr(args, "mraf_gate_fp32", False)),
+        float(getattr(args, "mraf_gate_base_grad_scale", 1.0)),
         float(getattr(args, "mraf_rel_lambda", 0.01)),
         float(getattr(args, "mraf_target_temperature", 0.1)),
         int(getattr(args, "mraf_rel_warmup_epoch", 3)),
@@ -4733,10 +4800,23 @@ def do_train(
         "lambda_mraf_rel_cur": AverageMeter(),
         "alpha_rgb_clean_mean": AverageMeter(),
         "alpha_ir_clean_mean": AverageMeter(),
+        "alpha_rgb_clean_std": AverageMeter(),
+        "alpha_ir_clean_std": AverageMeter(),
         "alpha_rgb_degraded_mean": AverageMeter(),
         "alpha_ir_degraded_mean": AverageMeter(),
+        "alpha_rgb_degraded_std": AverageMeter(),
+        "alpha_ir_degraded_std": AverageMeter(),
         "target_rgb_mean": AverageMeter(),
         "target_ir_mean": AverageMeter(),
+        "target_rgb_std": AverageMeter(),
+        "target_ir_std": AverageMeter(),
+        "alpha_target_pearson_rgb": AverageMeter(),
+        "alpha_target_pearson_ir": AverageMeter(),
+        "weighted_mraf_rel_over_loss_base": AverageMeter(),
+        "scorer_first_weight_grad_norm": AverageMeter(),
+        "scorer_first_bias_grad_norm": AverageMeter(),
+        "scorer_last_weight_grad_norm": AverageMeter(),
+        "scorer_last_bias_grad_norm": AverageMeter(),
         "drift_rgb_mean": AverageMeter(),
         "drift_ir_mean": AverageMeter(),
         "loss_rgb_txt": AverageMeter(),
@@ -4877,6 +4957,8 @@ def do_train(
         mdrc_debug_logged_this_epoch = False
         degrade_aug_logged_this_epoch = False
         degraded_mode_counts = {}
+        mraf_gate_logits_dtype = None
+        mraf_alpha_dtype = None
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -5245,6 +5327,18 @@ def do_train(
                         _to_scalar(clean_alpha[:, 1].mean()),
                         batch_size,
                     )
+                    meters["alpha_rgb_clean_std"].update(
+                        _detached_std(clean_alpha[:, 0]),
+                        batch_size,
+                    )
+                    meters["alpha_ir_clean_std"].update(
+                        _detached_std(clean_alpha[:, 1]),
+                        batch_size,
+                    )
+                    mraf_alpha_dtype = str(clean_alpha.dtype)
+                clean_logits = ret.get("mraf_logits", None)
+                if torch.is_tensor(clean_logits):
+                    mraf_gate_logits_dtype = str(clean_logits.dtype)
                 if degraded_context is not None:
                     degraded_alpha = degraded_context["degraded_ret"].get(
                         "mraf_alpha",
@@ -5301,6 +5395,12 @@ def do_train(
                     "lambda_mraf_rel_cur",
                     "target_rgb_mean",
                     "target_ir_mean",
+                    "alpha_rgb_degraded_std",
+                    "alpha_ir_degraded_std",
+                    "target_rgb_std",
+                    "target_ir_std",
+                    "alpha_target_pearson_rgb",
+                    "alpha_target_pearson_ir",
                     "drift_rgb_mean",
                     "drift_ir_mean",
                 ]:
@@ -5310,6 +5410,14 @@ def do_train(
                         if mraf_name != "lambda_mraf_rel_cur"
                         else 1,
                     )
+                loss_base_value = abs(_to_scalar(baseline_total_loss))
+                weighted_rel_value = _to_scalar(
+                    mraf_terms["loss_mraf_rel_weighted"]
+                )
+                meters["weighted_mraf_rel_over_loss_base"].update(
+                    weighted_rel_value / max(loss_base_value, 1e-12),
+                    batch_size,
+                )
             elif _mraf_enabled(args):
                 meters["lambda_mraf_rel_cur"].update(
                     _resolve_mraf_rel_lambda(args, epoch),
@@ -5741,6 +5849,11 @@ def do_train(
 
             optimizer.zero_grad()
             total_loss.backward()
+            if _mraf_enabled(args):
+                for grad_name, grad_value in _mraf_scorer_gradient_stats(
+                    model
+                ).items():
+                    meters[grad_name].update(grad_value, 1)
             optimizer.step()
             proto_update_info = update_model_proto_bank_after_step(model, ret, batch)
             meters["proto_num_updated_pids"].update(
@@ -5879,20 +5992,55 @@ def do_train(
                 name: (meters[name].avg if meters[name].count > 0 else None)
                 for name in [
                     "loss_base",
+                    "loss_total",
                     "loss_mdrc",
                     "loss_mraf_rel",
                     "lambda_mdrc_cur",
                     "lambda_mraf_rel_cur",
                     "alpha_rgb_clean_mean",
                     "alpha_ir_clean_mean",
+                    "alpha_rgb_clean_std",
+                    "alpha_ir_clean_std",
                     "alpha_rgb_degraded_mean",
                     "alpha_ir_degraded_mean",
+                    "alpha_rgb_degraded_std",
+                    "alpha_ir_degraded_std",
                     "target_rgb_mean",
                     "target_ir_mean",
+                    "target_rgb_std",
+                    "target_ir_std",
+                    "alpha_target_pearson_rgb",
+                    "alpha_target_pearson_ir",
                     "drift_rgb_mean",
                     "drift_ir_mean",
+                    "loss_mraf_rel_weighted",
+                    "weighted_mraf_rel_over_loss_base",
+                    "scorer_first_weight_grad_norm",
+                    "scorer_first_bias_grad_norm",
+                    "scorer_last_weight_grad_norm",
+                    "scorer_last_bias_grad_norm",
                 ]
             }
+            mraf_epoch_stats.update(
+                {
+                    "mraf_gate_fp32": bool(
+                        getattr(args, "mraf_gate_fp32", False)
+                    ),
+                    "mraf_gate_base_grad_scale": float(
+                        getattr(args, "mraf_gate_base_grad_scale", 1.0)
+                    ),
+                    "mraf_rel_lambda": float(
+                        getattr(args, "mraf_rel_lambda", 0.01)
+                    ),
+                    "weighted_mraf_rel": (
+                        meters["loss_mraf_rel_weighted"].avg
+                        if meters["loss_mraf_rel_weighted"].count > 0
+                        else None
+                    ),
+                    "gate_logits_dtype": mraf_gate_logits_dtype,
+                    "alpha_dtype": mraf_alpha_dtype,
+                }
+            )
             logger.info(
                 "[MRAF_EPOCH] epoch=%d stats=%s",
                 int(epoch),

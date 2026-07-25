@@ -179,3 +179,35 @@ batch 内文本作为小型检索候选集，适合验证路径敏感性，不�
 若发生 OOM 或其他异常，不会生成一个表示成功的 `summary.txt`；异常前由外部
 重定向保存的日志或可能存在的部分文件只能用于排错，不能作为最终诊断结论。
 失败后必须指定一个全新的 `--output-dir` 重跑，不要复用失败目录。
+## 单 checkpoint 入口与 gate-rescue（2026-07）
+
+候选筛选可直接诊断一个 checkpoint：
+
+```bash
+python -B tools/revision/diagnose_mraf_mechanism.py \
+  --config-file <candidate>/configs.yaml \
+  --checkpoint <candidate>/best.pth \
+  --case-label S4 \
+  --data-root /root/autodl-tmp/TextReID \
+  --device cuda:0 \
+  --degrade-seed 2026 \
+  --max-batches 4 \
+  --gradient-batches 3 \
+  --gradient-microbatch-size 4 \
+  --output-dir <candidate>/diagnostics
+```
+
+该入口与原 `--run-root/--cases` 入口互斥，后者保持兼容。
+`--config-file`、`--checkpoint`、`--case-label` 必须一起出现。
+
+当前正式根因证据是：target 分布未塌缩，但 alpha 几乎固定在 0.5，原始
+logits/alpha 处于 FP16 量化，reliability/base loss 比例和 reliability-only
+scorer 梯度明显偏小，主任务经门控传入的梯度占优；融合路径本身有效。因此
+gate-rescue 只扫描可选 FP32 gate、reliability lambda 与 base gate gradient
+scale，不扫描或修改 target temperature。阈值与 8 epoch 结果只用于机制
+筛选，不能直接视为论文最终结论。
+
+完整候选矩阵、硬筛选、60 epoch、11 场景、`--base-config`、
+`--reference-run-root`、`--resume-run-root`、mock/dry-run 和关机保护见
+`docs/revision/mraf_gate_rescue_pipeline.md`。诊断工具仍不创建 optimizer、
+不执行 `optimizer.step()`、不修改模型参数或 checkpoint。
