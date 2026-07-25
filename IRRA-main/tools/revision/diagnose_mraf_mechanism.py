@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import copy
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -159,6 +160,13 @@ GRADIENT_FIELDS = (
     "case",
     "batch_index",
     "diagnostic_epoch",
+    "original_batch_size",
+    "effective_microbatch_size",
+    "gradient_microbatch_size",
+    "cuda_memory_allocated_before_mb",
+    "cuda_memory_allocated_after_forward_mb",
+    "cuda_peak_memory_allocated_mb",
+    "cuda_peak_memory_reserved_mb",
     "loss_base",
     "loss_mraf_rel",
     "lambda_mraf_rel_cur",
@@ -188,6 +196,15 @@ class RunArtifacts:
             "checkpoint_path": str(self.checkpoint_path),
             "train_log_path": str(self.train_log_path),
         }
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value!r}"
+        )
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -238,9 +255,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of training batches used for gradient probes (minimum: 3)",
     )
     parser.add_argument(
+        "--gradient-microbatch-size",
+        type=_positive_int,
+        default=4,
+        help=(
+            "positive microbatch size used only by gradient diagnostics "
+            "(default: 4)"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
-        help="new or empty directory for diagnostic outputs",
+        help="new, non-existing directory for diagnostic outputs",
     )
     parser.add_argument(
         "--dry-run",
@@ -764,6 +790,90 @@ def _snapshot_equal(
 ) -> bool:
     return first.keys() == second.keys() and all(
         torch.equal(first[name], second[name]) for name in first
+    )
+
+
+def infer_diagnostic_batch_size(batch: Mapping[str, Any]) -> int:
+    if not isinstance(batch, Mapping):
+        raise TypeError("Diagnostic batch must be a mapping.")
+    preferred_keys = (
+        "images",
+        "thermal_images",
+        "pids",
+        "caption_ids",
+        "mlm_labels",
+    )
+    ordered_keys = list(preferred_keys) + [
+        key for key in batch if key not in preferred_keys
+    ]
+    for key in ordered_keys:
+        if key not in batch:
+            continue
+        value = batch[key]
+        if torch.is_tensor(value) and value.dim() > 0:
+            size = int(value.shape[0])
+            if size > 0:
+                return size
+        if isinstance(value, (list, tuple)) and len(value) > 0:
+            return len(value)
+    raise ValueError("Could not infer a positive batch dimension.")
+
+
+def slice_batch_for_diagnostics(
+    batch: Mapping[str, Any],
+    max_samples: int,
+) -> Tuple[Dict[str, Any], int, int]:
+    max_samples = int(max_samples)
+    if max_samples <= 0:
+        raise ValueError("max_samples must be a positive integer.")
+    original_batch_size = infer_diagnostic_batch_size(batch)
+    effective_microbatch_size = min(original_batch_size, max_samples)
+    sliced: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if (
+            torch.is_tensor(value)
+            and value.dim() > 0
+            and int(value.shape[0]) == original_batch_size
+        ):
+            sliced[key] = value[:effective_microbatch_size]
+        elif isinstance(value, list) and len(value) == original_batch_size:
+            sliced[key] = value[:effective_microbatch_size]
+        elif isinstance(value, tuple) and len(value) == original_batch_size:
+            sliced[key] = value[:effective_microbatch_size]
+        else:
+            sliced[key] = value
+    return sliced, original_batch_size, effective_microbatch_size
+
+
+def release_cuda_objects(*objects: Any) -> None:
+    # Callers clear their own strong references before invoking this helper.
+    # Dropping the temporary argument tuple here prevents the helper from
+    # extending those lifetimes while cyclic garbage is collected.
+    del objects
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _reset_cuda_peak_memory_stats(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    torch.cuda.reset_peak_memory_stats(device)
+    return float(torch.cuda.memory_allocated(device) / (1024.0**2))
+
+
+def _cuda_memory_allocated_mb(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    return float(torch.cuda.memory_allocated(device) / (1024.0**2))
+
+
+def _cuda_peak_memory_mb(device: torch.device) -> Tuple[float, float]:
+    if device.type != "cuda":
+        return 0.0, 0.0
+    return (
+        float(torch.cuda.max_memory_allocated(device) / (1024.0**2)),
+        float(torch.cuda.max_memory_reserved(device) / (1024.0**2)),
     )
 
 
@@ -1339,35 +1449,45 @@ def run_fusion_path_check(
     }
 
 
-def run_gradient_diagnostics(
-    case: str,
+def _run_gradient_probe(
+    source: str,
     model: nn.Module,
-    train_loader: Iterable,
+    batch: Mapping[str, Any],
     args: Any,
     device: torch.device,
-    gradient_batches: int,
     diagnostic_epoch: int,
-) -> List[Dict[str, Any]]:
-    if str(getattr(args, "degrade_aug_mode", "none")) != "none":
-        raise ValueError(
-            "Gradient diagnostics only support the formal degrade_aug_mode=none path."
-        )
-    model.train()
-    named_parameters = scorer_named_parameters(model)
-    rows: List[Dict[str, Any]] = []
-    for batch_index, batch in enumerate(train_loader):
-        if batch_index >= gradient_batches:
-            break
-        batch = _move_batch_to_device(batch, device)
-        ret = model(batch)
-        base_loss = _build_total_loss(args, ret, epoch=diagnostic_epoch)
-        total_loss = base_loss
-        degraded_context = None
-        if _should_execute_degraded_branch(args, diagnostic_epoch):
-            degraded_context = _build_degraded_branch_context(args, model, batch)
+    named_parameters: Sequence[Tuple[str, nn.Parameter]],
+) -> Dict[str, Any]:
+    if source not in {"total", "rel_only"}:
+        raise ValueError(f"Unsupported gradient probe source: {source}")
 
-        mdrc_terms = None
-        if _mdrc_enabled(args):
+    ret = None
+    base_loss = None
+    total_loss = None
+    degraded_context = None
+    mdrc_terms = None
+    mraf_terms = None
+    weighted_rel = None
+    probe_loss = None
+    model.zero_grad(set_to_none=True)
+    release_cuda_objects()
+    allocated_before_mb = _reset_cuda_peak_memory_stats(device)
+    try:
+        ret = model(batch)
+        allocated_after_forward_mb = _cuda_memory_allocated_mb(device)
+
+        if source == "total":
+            base_loss = _build_total_loss(args, ret, epoch=diagnostic_epoch)
+            total_loss = base_loss
+
+        if _should_execute_degraded_branch(args, diagnostic_epoch):
+            degraded_context = _build_degraded_branch_context(
+                args,
+                model,
+                batch,
+            )
+
+        if source == "total" and _mdrc_enabled(args):
             mdrc_terms = _compute_mdrc_terms(
                 args,
                 model,
@@ -1376,9 +1496,12 @@ def run_gradient_diagnostics(
                 diagnostic_epoch,
                 degraded_context=degraded_context,
             )
-            total_loss = _add_mdrc_to_total_loss(args, total_loss, mdrc_terms)
+            total_loss = _add_mdrc_to_total_loss(
+                args,
+                total_loss,
+                mdrc_terms,
+            )
 
-        mraf_terms = None
         if _mraf_enabled(args):
             mraf_terms = _compute_mraf_reliability_terms(
                 args,
@@ -1387,58 +1510,189 @@ def run_gradient_diagnostics(
                 diagnostic_epoch,
             )
             if mraf_terms:
-                total_loss = _add_mraf_to_total_loss(args, total_loss, mraf_terms)
+                weighted_rel = mraf_terms["loss_mraf_rel_weighted"]
+                if source == "total":
+                    total_loss = _add_mraf_to_total_loss(
+                        args,
+                        total_loss,
+                        mraf_terms,
+                    )
 
-        if mraf_terms:
-            loss_mraf_rel = mraf_terms["loss_mraf_rel"]
-            lambda_mraf = mraf_terms["lambda_mraf_rel_cur"]
-            weighted_rel = mraf_terms["loss_mraf_rel_weighted"]
-        else:
-            loss_mraf_rel = base_loss.detach().new_zeros(())
-            lambda_mraf = base_loss.detach().new_zeros(())
-            weighted_rel = None
-
-        before = _scorer_snapshot(named_parameters)
-        gradients = measure_loss_gradients(
-            {"total": total_loss, "rel_only": weighted_rel},
+        probe_loss = total_loss if source == "total" else weighted_rel
+        gradient_values = measure_loss_gradients(
+            {source: probe_loss},
             named_parameters,
+        )[source]
+        peak_allocated_mb, peak_reserved_mb = _cuda_peak_memory_mb(device)
+
+        result: Dict[str, Any] = {
+            "gradients": gradient_values,
+            "rel_active": bool(mraf_terms),
+            "cuda_memory_allocated_before_mb": allocated_before_mb,
+            "cuda_memory_allocated_after_forward_mb": (
+                allocated_after_forward_mb
+            ),
+            "cuda_peak_memory_allocated_mb": peak_allocated_mb,
+            "cuda_peak_memory_reserved_mb": peak_reserved_mb,
+        }
+        if source == "total":
+            if base_loss is None or total_loss is None:
+                raise RuntimeError("Total-loss gradient probe did not build losses.")
+            if mraf_terms:
+                loss_mraf_rel = mraf_terms["loss_mraf_rel"]
+                lambda_mraf = mraf_terms["lambda_mraf_rel_cur"]
+                weighted_scalar = float(
+                    weighted_rel.detach().to(torch.float32).item()
+                )
+            else:
+                loss_mraf_rel = base_loss.detach().new_zeros(())
+                lambda_mraf = base_loss.detach().new_zeros(())
+                weighted_scalar = 0.0
+            base_scalar = float(base_loss.detach().to(torch.float32).item())
+            result["losses"] = {
+                "loss_base": base_scalar,
+                "loss_mraf_rel": float(
+                    loss_mraf_rel.detach().to(torch.float32).item()
+                ),
+                "lambda_mraf_rel_cur": float(
+                    lambda_mraf.detach().to(torch.float32).item()
+                ),
+                "weighted_mraf_rel": weighted_scalar,
+                "weighted_mraf_rel_over_loss_base": (
+                    weighted_scalar / max(abs(base_scalar), 1e-12)
+                ),
+                "total_loss": float(
+                    total_loss.detach().to(torch.float32).item()
+                ),
+            }
+        return result
+    finally:
+        model.zero_grad(set_to_none=True)
+        del (
+            ret,
+            base_loss,
+            total_loss,
+            degraded_context,
+            mdrc_terms,
+            mraf_terms,
+            weighted_rel,
+            probe_loss,
         )
+        release_cuda_objects()
+
+
+def run_gradient_diagnostics(
+    case: str,
+    model: nn.Module,
+    train_loader: Iterable,
+    args: Any,
+    device: torch.device,
+    gradient_batches: int,
+    gradient_microbatch_size: int,
+    diagnostic_epoch: int,
+) -> List[Dict[str, Any]]:
+    if str(getattr(args, "degrade_aug_mode", "none")) != "none":
+        raise ValueError(
+            "Gradient diagnostics only support the formal degrade_aug_mode=none path."
+        )
+    if int(gradient_microbatch_size) <= 0:
+        raise ValueError("gradient_microbatch_size must be a positive integer.")
+
+    model.train()
+    named_parameters = scorer_named_parameters(model)
+    rows: List[Dict[str, Any]] = []
+    for batch_index, original_batch in enumerate(train_loader):
+        if batch_index >= gradient_batches:
+            break
+        (
+            sliced_batch,
+            original_batch_size,
+            effective_microbatch_size,
+        ) = slice_batch_for_diagnostics(
+            original_batch,
+            gradient_microbatch_size,
+        )
+        microbatch = _move_batch_to_device(sliced_batch, device)
+        before = _scorer_snapshot(named_parameters)
+
+        total_probe = _run_gradient_probe(
+            source="total",
+            model=model,
+            batch=microbatch,
+            args=args,
+            device=device,
+            diagnostic_epoch=diagnostic_epoch,
+            named_parameters=named_parameters,
+        )
+        if total_probe["rel_active"]:
+            rel_probe = _run_gradient_probe(
+                source="rel_only",
+                model=model,
+                batch=microbatch,
+                args=args,
+                device=device,
+                diagnostic_epoch=diagnostic_epoch,
+                named_parameters=named_parameters,
+            )
+        else:
+            rel_probe = {
+                "gradients": {
+                    role: None for role in GRADIENT_PARAMETER_ROLES
+                },
+                "cuda_memory_allocated_before_mb": 0.0,
+                "cuda_memory_allocated_after_forward_mb": 0.0,
+                "cuda_peak_memory_allocated_mb": 0.0,
+                "cuda_peak_memory_reserved_mb": 0.0,
+            }
+
         after = _scorer_snapshot(named_parameters)
         parameters_unchanged = _snapshot_equal(before, after)
         if not parameters_unchanged:
             raise RuntimeError(
                 "MRAF scorer parameters changed during read-only gradient diagnostics."
             )
-        base_scalar = float(base_loss.detach().to(torch.float32).item())
-        weighted_scalar = (
-            0.0
-            if weighted_rel is None
-            else float(weighted_rel.detach().to(torch.float32).item())
+
+        memory_keys = (
+            "cuda_memory_allocated_before_mb",
+            "cuda_memory_allocated_after_forward_mb",
+            "cuda_peak_memory_allocated_mb",
+            "cuda_peak_memory_reserved_mb",
         )
         row: Dict[str, Any] = {
             "case": case,
             "batch_index": batch_index + 1,
             "diagnostic_epoch": int(diagnostic_epoch),
-            "loss_base": base_scalar,
-            "loss_mraf_rel": float(
-                loss_mraf_rel.detach().to(torch.float32).item()
-            ),
-            "lambda_mraf_rel_cur": float(
-                lambda_mraf.detach().to(torch.float32).item()
-            ),
-            "weighted_mraf_rel": weighted_scalar,
-            "weighted_mraf_rel_over_loss_base": (
-                weighted_scalar / max(abs(base_scalar), 1e-12)
-            ),
-            "total_loss": float(total_loss.detach().to(torch.float32).item()),
+            "original_batch_size": original_batch_size,
+            "effective_microbatch_size": effective_microbatch_size,
+            "gradient_microbatch_size": int(gradient_microbatch_size),
+            **{
+                key: max(float(total_probe[key]), float(rel_probe[key]))
+                for key in memory_keys
+            },
+            **total_probe["losses"],
             "parameters_unchanged": parameters_unchanged,
             "optimizer_step_executed": False,
         }
-        for source in ("total", "rel_only"):
+        for source, probe in (
+            ("total", total_probe),
+            ("rel_only", rel_probe),
+        ):
             for role in GRADIENT_PARAMETER_ROLES:
-                row[f"{source}_{role}_grad_norm"] = gradients[source][role]
+                row[f"{source}_{role}_grad_norm"] = probe["gradients"][role]
         rows.append(row)
-        del ret, total_loss, degraded_context, mdrc_terms, mraf_terms
+
+        del (
+            before,
+            after,
+            total_probe,
+            rel_probe,
+            microbatch,
+            sliced_batch,
+            original_batch,
+        )
+        release_cuda_objects()
+
+    model.zero_grad(set_to_none=True)
     if len(rows) != gradient_batches:
         raise RuntimeError(
             f"Gradient diagnostics collected {len(rows)} batches, expected "
@@ -1469,46 +1723,44 @@ def _checkpoint_epoch(checkpoint: Mapping[str, Any], args: Any) -> int:
         return max(1, int(getattr(args, "num_epoch", 1)))
 
 
-def build_eval_resources(
+def build_case_resources(
     artifact: RunArtifacts,
     data_root: Path,
     device: torch.device,
-) -> Tuple[Any, nn.Module, Iterable, Iterable, Mapping[str, Any], int]:
-    args = _load_config_args(artifact, data_root, training=False)
-    img_loader, txt_loader, num_classes = build_dataloader(args)
-    model = build_model(args, num_classes=num_classes)
+) -> Tuple[Any, nn.Module, Iterable, Iterable, Iterable, Mapping[str, Any], int]:
+    train_args = _load_config_args(artifact, data_root, training=True)
+    train_loader, _, _, train_num_classes = build_dataloader(train_args)
+    eval_args = _load_config_args(artifact, data_root, training=False)
+    img_loader, txt_loader, eval_num_classes = build_dataloader(eval_args)
+    if int(train_num_classes) != int(eval_num_classes):
+        raise RuntimeError(
+            "Training/evaluation dataloaders disagree on num_classes: "
+            f"{train_num_classes} vs {eval_num_classes}."
+        )
+
+    # Construct and load exactly one model per case. The same immutable
+    # checkpoint instance is switched between eval() and train() for the
+    # separate read-only diagnostic stages.
+    model = build_model(train_args, num_classes=train_num_classes)
     checkpoint = Checkpointer(model).load(str(artifact.checkpoint_path))
-    epoch = _checkpoint_epoch(checkpoint, args)
+    epoch = _checkpoint_epoch(checkpoint, train_args)
     apply_img_local_filter_stage(
         model,
-        args,
+        train_args,
         epoch,
         logger=None,
-        prefix="MRAF_DIAGNOSTIC_EVAL",
+        prefix="MRAF_DIAGNOSTIC",
     )
     model.to(device).eval()
-    return args, model, img_loader, txt_loader, checkpoint, epoch
-
-
-def build_train_resources(
-    artifact: RunArtifacts,
-    data_root: Path,
-    device: torch.device,
-) -> Tuple[Any, nn.Module, Iterable, Mapping[str, Any], int]:
-    args = _load_config_args(artifact, data_root, training=True)
-    train_loader, _, _, num_classes = build_dataloader(args)
-    model = build_model(args, num_classes=num_classes)
-    checkpoint = Checkpointer(model).load(str(artifact.checkpoint_path))
-    epoch = _checkpoint_epoch(checkpoint, args)
-    apply_img_local_filter_stage(
+    return (
+        train_args,
         model,
-        args,
+        train_loader,
+        img_loader,
+        txt_loader,
+        checkpoint,
         epoch,
-        logger=None,
-        prefix="MRAF_DIAGNOSTIC_TRAIN",
     )
-    model.to(device).train()
-    return args, model, train_loader, checkpoint, epoch
 
 
 def _write_csv(
@@ -1701,6 +1953,8 @@ def write_summary(path: Path, diagnosis: Mapping[str, Any]) -> None:
     lines = [
         "MRAF mechanism diagnosis",
         f"git_head={diagnosis['metadata']['git_head']}",
+        "gradient_microbatch_size="
+        f"{diagnosis['metadata']['gradient_microbatch_size']}",
         "thresholds_are_diagnostic_only=true",
         "",
     ]
@@ -1749,9 +2003,10 @@ def write_summary(path: Path, diagnosis: Mapping[str, Any]) -> None:
 
 def _prepare_output_dir(path: Path) -> Path:
     resolved = path.resolve()
-    if resolved.exists() and any(resolved.iterdir()):
+    if resolved.exists():
         raise FileExistsError(
-            f"Refusing to overwrite non-empty output directory: {resolved}"
+            "Refusing to reuse an existing diagnostic output directory: "
+            f"{resolved}"
         )
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
@@ -1765,6 +2020,10 @@ def _validate_cli(args: argparse.Namespace) -> Tuple[Path, Path, torch.device]:
     if args.gradient_batches < 3 and not args.dry_run:
         raise ValueError(
             "--gradient-batches must be at least 3 for mechanism diagnostics."
+        )
+    if int(args.gradient_microbatch_size) <= 0:
+        raise ValueError(
+            "--gradient-microbatch-size must be a positive integer."
         )
     if len(set(args.cases)) != len(args.cases):
         raise ValueError("--cases must not contain duplicate case names.")
@@ -1803,6 +2062,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "degrade_seed": int(args.degrade_seed),
                     "max_batches": int(args.max_batches),
                     "gradient_batches": int(args.gradient_batches),
+                    "gradient_microbatch_size": int(
+                        args.gradient_microbatch_size
+                    ),
                     "artifacts": [artifact.serializable() for artifact in artifacts],
                 },
                 indent=2,
@@ -1823,95 +2085,110 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     metadata_cases: Dict[str, Dict[str, Any]] = {}
 
     for artifact in artifacts:
-        _seed_everything(args.degrade_seed)
-        raw_checkpoint = torch.load(
-            str(artifact.checkpoint_path),
-            map_location=torch.device("cpu"),
-        )
-        rows, mraf_parameters = checkpoint_parameter_rows(
-            artifact.case,
-            artifact.checkpoint_path,
-            raw_checkpoint,
-        )
-        parameter_rows.extend(rows)
-        parameters_by_case[artifact.case] = mraf_parameters
-
-        (
-            _,
-            eval_model,
-            img_loader,
-            txt_loader,
-            eval_checkpoint,
-            checkpoint_epoch,
-        ) = build_eval_resources(
-            artifact,
-            data_root,
-            device,
-        )
-        (
-            case_gate_rows,
-            case_target_rows,
-            case_direction_rows,
-            case_sample_records,
-            order_hash,
-        ) = collect_scenario_diagnostics(
-            case=artifact.case,
-            model=eval_model,
-            img_loader=img_loader,
-            txt_loader=txt_loader,
-            device=device,
-            degrade_seed=args.degrade_seed,
-            max_batches=args.max_batches,
-        )
-        gate_rows.extend(case_gate_rows)
-        target_rows.extend(case_target_rows)
-        direction_rows.extend(case_direction_rows)
-        sample_records[artifact.case] = case_sample_records
-        fusion_checks[artifact.case] = run_fusion_path_check(
-            case=artifact.case,
-            model=eval_model,
-            img_loader=img_loader,
-            txt_loader=txt_loader,
-            device=device,
-        )
-        del eval_model, img_loader, txt_loader, eval_checkpoint
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        _seed_everything(args.degrade_seed)
-        (
-            train_args,
-            train_model,
-            train_loader,
-            train_checkpoint,
-            train_epoch,
-        ) = build_train_resources(
-            artifact,
-            data_root,
-            device,
-        )
-        diagnostic_epoch = max(checkpoint_epoch, train_epoch)
-        gradient_rows.extend(
-            run_gradient_diagnostics(
-                case=artifact.case,
-                model=train_model,
-                train_loader=train_loader,
-                args=train_args,
-                device=device,
-                gradient_batches=args.gradient_batches,
-                diagnostic_epoch=diagnostic_epoch,
+        raw_checkpoint = None
+        case_model = None
+        train_args = None
+        train_loader = None
+        img_loader = None
+        txt_loader = None
+        case_checkpoint = None
+        try:
+            _seed_everything(args.degrade_seed)
+            raw_checkpoint = torch.load(
+                str(artifact.checkpoint_path),
+                map_location=torch.device("cpu"),
             )
-        )
-        del train_model, train_loader, train_checkpoint
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            rows, mraf_parameters = checkpoint_parameter_rows(
+                artifact.case,
+                artifact.checkpoint_path,
+                raw_checkpoint,
+            )
+            parameter_rows.extend(rows)
+            parameters_by_case[artifact.case] = mraf_parameters
+            raw_checkpoint = None
+            release_cuda_objects()
 
-        metadata_cases[artifact.case] = {
-            **artifact.serializable(),
-            "checkpoint_sha256": _sha256_file(artifact.checkpoint_path),
-            "checkpoint_epoch": int(diagnostic_epoch),
-            "sample_order_sha256": order_hash,
-        }
+            (
+                train_args,
+                case_model,
+                train_loader,
+                img_loader,
+                txt_loader,
+                case_checkpoint,
+                diagnostic_epoch,
+            ) = build_case_resources(
+                artifact,
+                data_root,
+                device,
+            )
+            case_checkpoint = None
+
+            case_model.eval()
+            (
+                case_gate_rows,
+                case_target_rows,
+                case_direction_rows,
+                case_sample_records,
+                order_hash,
+            ) = collect_scenario_diagnostics(
+                case=artifact.case,
+                model=case_model,
+                img_loader=img_loader,
+                txt_loader=txt_loader,
+                device=device,
+                degrade_seed=args.degrade_seed,
+                max_batches=args.max_batches,
+            )
+            gate_rows.extend(case_gate_rows)
+            target_rows.extend(case_target_rows)
+            direction_rows.extend(case_direction_rows)
+            sample_records[artifact.case] = case_sample_records
+            fusion_checks[artifact.case] = run_fusion_path_check(
+                case=artifact.case,
+                model=case_model,
+                img_loader=img_loader,
+                txt_loader=txt_loader,
+                device=device,
+            )
+
+            _seed_everything(args.degrade_seed)
+            gradient_rows.extend(
+                run_gradient_diagnostics(
+                    case=artifact.case,
+                    model=case_model,
+                    train_loader=train_loader,
+                    args=train_args,
+                    device=device,
+                    gradient_batches=args.gradient_batches,
+                    gradient_microbatch_size=(
+                        args.gradient_microbatch_size
+                    ),
+                    diagnostic_epoch=diagnostic_epoch,
+                )
+            )
+
+            metadata_cases[artifact.case] = {
+                **artifact.serializable(),
+                "checkpoint_sha256": _sha256_file(artifact.checkpoint_path),
+                "checkpoint_epoch": int(diagnostic_epoch),
+                "sample_order_sha256": order_hash,
+                "gradient_microbatch_size": int(
+                    args.gradient_microbatch_size
+                ),
+            }
+        finally:
+            if case_model is not None:
+                case_model.zero_grad(set_to_none=True)
+            del (
+                raw_checkpoint,
+                case_checkpoint,
+                train_args,
+                train_loader,
+                img_loader,
+                txt_loader,
+                case_model,
+            )
+            release_cuda_objects()
 
     checkpoint_comparison = compare_checkpoint_parameters(parameters_by_case)
     metadata = {
@@ -1920,6 +2197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "degrade_seed": int(args.degrade_seed),
         "max_batches": int(args.max_batches),
         "gradient_batches": int(args.gradient_batches),
+        "gradient_microbatch_size": int(args.gradient_microbatch_size),
         "run_root": str(run_root),
         "data_root": str(data_root),
         "cases": metadata_cases,

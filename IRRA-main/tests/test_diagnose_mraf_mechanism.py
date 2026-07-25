@@ -1,14 +1,17 @@
 import csv
+import gc
 import io
 import inspect
+import weakref
 from contextlib import redirect_stdout
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
 from model.mraf import ModalityReliabilityAdaptiveFusion
+from tools.revision import diagnose_mraf_mechanism as diagnostic
 from tools.revision.diagnose_mraf_mechanism import (
     CHECKPOINT_PARAMETER_FIELDS,
     GATE_DIRECTION_FIELDS,
@@ -24,10 +27,60 @@ from tools.revision.diagnose_mraf_mechanism import (
     main,
     measure_loss_gradients,
     pearson_correlation,
+    release_cuda_objects,
+    run_gradient_diagnostics,
+    slice_batch_for_diagnostics,
     spearman_correlation,
     summarize_vector,
     unwrap_state_dict,
 )
+
+
+class _TinyDiagnosticModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mraf_enabled = True
+        self.mraf_fusion = ModalityReliabilityAdaptiveFusion(
+            feature_dim=4,
+            hidden_dim=2,
+            dropout=0.0,
+        )
+        self.seen_batch_sizes = []
+
+    def forward(self, batch):
+        self.seen_batch_sizes.append(int(batch["images"].shape[0]))
+        fused = self.mraf_fusion(
+            batch["images"],
+            batch["thermal_images"],
+        )
+        return {"diagnostic_loss": fused.square().mean()}
+
+
+def _patch_tiny_gradient_path(monkeypatch):
+    monkeypatch.setattr(
+        diagnostic,
+        "_build_total_loss",
+        lambda args, ret, epoch: ret["diagnostic_loss"],
+    )
+    monkeypatch.setattr(
+        diagnostic,
+        "_should_execute_degraded_branch",
+        lambda args, epoch: False,
+    )
+    monkeypatch.setattr(diagnostic, "_mdrc_enabled", lambda args: False)
+    monkeypatch.setattr(diagnostic, "_mraf_enabled", lambda args: False)
+
+
+def _tiny_train_loader(num_batches=3, batch_size=5):
+    return [
+        {
+            "images": torch.randn(batch_size, 4),
+            "thermal_images": torch.randn(batch_size, 4),
+            "pids": torch.arange(batch_size),
+            "captions": [f"sample-{index}" for index in range(batch_size)],
+        }
+        for _ in range(num_batches)
+    ]
 
 
 def test_fp32_statistics_and_quantiles():
@@ -168,6 +221,171 @@ def test_measure_loss_gradients_does_not_update_parameters_or_populate_grad():
     assert ".backward(" not in source
 
 
+def test_gradient_microbatch_size_must_be_positive():
+    parser = diagnostic.build_parser()
+    common_args = [
+        "--run-root",
+        "runs",
+        "--data-root",
+        "data",
+        "--cases",
+        "mraf_only",
+        "--output-dir",
+        "output",
+    ]
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            common_args + ["--gradient-microbatch-size", "0"]
+        )
+    assert parser.parse_args(common_args).gradient_microbatch_size == 4
+
+
+def test_slice_batch_for_diagnostics_handles_batch_values_without_mutation():
+    images = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    auxiliary = torch.arange(3)
+    original = {
+        "images": images,
+        "pids": torch.arange(5),
+        "captions": ["a", "b", "c", "d", "e"],
+        "paths": ("a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"),
+        "scalar": torch.tensor(7.0),
+        "non_batch_tensor": auxiliary,
+        "name": "fixture",
+        "config": {"mode": "read-only"},
+    }
+    images_before = images.clone()
+    captions_before = list(original["captions"])
+
+    sliced, original_size, effective_size = slice_batch_for_diagnostics(
+        original,
+        max_samples=2,
+    )
+
+    assert original_size == 5
+    assert effective_size == 2
+    assert sliced is not original
+    assert sliced["images"].shape == (2, 4)
+    assert sliced["pids"].tolist() == [0, 1]
+    assert sliced["captions"] == ["a", "b"]
+    assert isinstance(sliced["captions"], list)
+    assert sliced["paths"] == ("a.jpg", "b.jpg")
+    assert isinstance(sliced["paths"], tuple)
+    assert sliced["scalar"] is original["scalar"]
+    assert sliced["non_batch_tensor"] is auxiliary
+    assert sliced["name"] == "fixture"
+    assert sliced["config"] is original["config"]
+    assert torch.equal(original["images"], images_before)
+    assert original["captions"] == captions_before
+
+
+def test_release_cuda_objects_does_not_modify_model_parameters():
+    model = nn.Linear(4, 2)
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+
+    release_cuda_objects(model)
+
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, before[name])
+
+
+def test_cpu_microbatch_gradient_diagnostics_preserve_parameters(
+    monkeypatch,
+):
+    _patch_tiny_gradient_path(monkeypatch)
+    model = _TinyDiagnosticModel()
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+
+    rows = run_gradient_diagnostics(
+        case="mraf_only",
+        model=model,
+        train_loader=_tiny_train_loader(),
+        args=SimpleNamespace(degrade_aug_mode="none"),
+        device=torch.device("cpu"),
+        gradient_batches=3,
+        gradient_microbatch_size=2,
+        diagnostic_epoch=60,
+    )
+
+    assert len(rows) == 3
+    assert model.seen_batch_sizes == [2, 2, 2]
+    for row in rows:
+        assert row["original_batch_size"] == 5
+        assert row["effective_microbatch_size"] == 2
+        assert row["gradient_microbatch_size"] == 2
+        assert row["cuda_memory_allocated_before_mb"] == 0.0
+        assert row["cuda_memory_allocated_after_forward_mb"] == 0.0
+        assert row["cuda_peak_memory_allocated_mb"] == 0.0
+        assert row["cuda_peak_memory_reserved_mb"] == 0.0
+        assert row["parameters_unchanged"] is True
+        assert row["optimizer_step_executed"] is False
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, before[name])
+        assert parameter.grad is None
+
+    source = inspect.getsource(run_gradient_diagnostics)
+    assert "build_optimizer" not in source
+    assert ".step(" not in source
+
+
+def test_repeated_cpu_diagnostics_do_not_retain_models_globally(monkeypatch):
+    _patch_tiny_gradient_path(monkeypatch)
+
+    def run_once():
+        model = _TinyDiagnosticModel()
+        run_gradient_diagnostics(
+            case="mraf_only",
+            model=model,
+            train_loader=_tiny_train_loader(),
+            args=SimpleNamespace(degrade_aug_mode="none"),
+            device=torch.device("cpu"),
+            gradient_batches=3,
+            gradient_microbatch_size=2,
+            diagnostic_epoch=60,
+        )
+        return weakref.ref(model)
+
+    references = [run_once(), run_once()]
+    gc.collect()
+
+    assert all(reference() is None for reference in references)
+    assert "build_eval_resources" not in inspect.getsource(diagnostic.main)
+    assert "build_train_resources" not in inspect.getsource(diagnostic.main)
+    assert inspect.getsource(diagnostic.main).count(
+        "build_case_resources("
+    ) == 1
+
+
+def test_gradient_memory_schema_and_cli_help_are_stable():
+    required_memory_fields = {
+        "original_batch_size",
+        "effective_microbatch_size",
+        "gradient_microbatch_size",
+        "cuda_memory_allocated_before_mb",
+        "cuda_memory_allocated_after_forward_mb",
+        "cuda_peak_memory_allocated_mb",
+        "cuda_peak_memory_reserved_mb",
+    }
+
+    assert required_memory_fields.issubset(set(GRADIENT_FIELDS))
+    assert "--gradient-microbatch-size" in diagnostic.build_parser().format_help()
+
+
+def test_existing_output_directory_is_rejected_after_failure(tmp_path):
+    failed_output = tmp_path / "failed_diagnosis"
+    failed_output.mkdir()
+
+    with pytest.raises(FileExistsError, match="Refusing to reuse"):
+        diagnostic._prepare_output_dir(failed_output)
+
+    assert not (failed_output / "summary.txt").exists()
+
+
 @pytest.mark.parametrize(
     "fields",
     [
@@ -227,4 +445,5 @@ def test_cpu_dry_run_discovers_artifacts_without_creating_output(tmp_path):
     assert exit_code == 0
     assert "mraf_only" in stdout.getvalue()
     assert "best.pth" in stdout.getvalue()
+    assert '"gradient_microbatch_size": 4' in stdout.getvalue()
     assert not output_dir.exists()
