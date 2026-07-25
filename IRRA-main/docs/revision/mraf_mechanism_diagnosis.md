@@ -32,6 +32,7 @@ python -B tools/revision/diagnose_mraf_mechanism.py \
   --degrade-seed 2026 \
   --max-batches 24 \
   --gradient-batches 3 \
+  --gradient-microbatch-size 4 \
   --output-dir /root/autodl-tmp/mraf_diagnosis
 ```
 
@@ -46,12 +47,37 @@ python -B tools/revision/diagnose_mraf_mechanism.py \
   --degrade-seed 2026 \
   --max-batches 24 \
   --gradient-batches 3 \
+  --gradient-microbatch-size 4 \
   --output-dir /root/autodl-tmp/mraf_diagnosis \
   --dry-run
 ```
 
-为避免覆盖诊断资产，非空的 `--output-dir` 会被拒绝。诊断过程不会写入训练
-结果目录。
+为避免覆盖或混用诊断资产，`--output-dir` 必须尚不存在；已有目录即使为空也会
+被拒绝。诊断过程不会写入训练结果目录。
+
+## 梯度微批与显存管理
+
+训练配置中的正式 `batch_size` 保持不变，例如历史配置仍记录为 64。
+`--gradient-microbatch-size`（默认 4）只控制 gradient diagnostics：工具先在
+CPU 侧从完整训练 batch 取前
+`min(original_batch_size, gradient_microbatch_size)` 个样本，再把这个微批搬到
+诊断设备。gate、target、11 个退化场景和 fusion path 不受该参数影响。
+
+每个 case 只构建并加载一个模型实例。gate/target 和 fusion path 在 `eval()`
+状态下使用该实例，梯度探针随后切换到 `train()` 复用同一实例，不再同时创建
+eval model 与 train model。case 结束或异常退出时会清除模型、loader、输出、
+loss 和 graph 引用，执行 `gc.collect()`；CUDA 可用时再执行
+`torch.cuda.empty_cache()`。
+
+total loss 与 rel-only 梯度使用两个独立微批前向。每次前向前调用
+`model.zero_grad(set_to_none=True)`；CUDA 路径同时调用
+`torch.cuda.reset_peak_memory_stats()`。梯度仍通过 `torch.autograd.grad`
+计算，不创建 optimizer，不调用 `backward()` 或 `optimizer.step()`。每次探针
+结束立即释放计算图，返回值只保留 Python 数值。
+
+`gradient_diagnostics.csv` 的 CUDA 显存字段记录同一行 total/rel-only 两次探针
+中的较大值；CPU 路径记录为 0。该策略降低梯度诊断峰值，但不等价于更改正式
+训练 batch size，也不改变训练或 checkpoint。
 
 ## 退化场景
 
@@ -80,10 +106,10 @@ python -B tools/revision/diagnose_mraf_mechanism.py \
 | `scenario_target_statistics.csv` | drift、target 分布及 alpha-target MAE/MSE、Pearson、Spearman、方向一致率 |
 | `sample_level_diagnostics.pt` | 每 case/场景的逐样本 FP32 logits、alpha、drift 和 target |
 | `gate_direction_statistics.csv` | 同一样本从 clean 到退化后的门控变化方向、均值、中位数、均值方向布尔值及正确方向比例 |
-| `gradient_diagnostics.csv` | base、reliability、加权比例、total 及 scorer 首末层的 total/rel-only 梯度范数 |
+| `gradient_diagnostics.csv` | 原始 batch、有效微批、显存峰值、base/reliability/total 及 scorer 首末层的 total/rel-only 梯度范数 |
 | `fusion_path_check.json` | learned、0.5/0.5、RGB-only、IR-only 四种门控的特征距离、余弦、hash、检索 score 与 top-1 变化 |
-| `summary.txt` | 人可读的 case 级警报和关键数值 |
-| `diagnosis.json` | 机器可读结论、阈值和可重复性元数据 |
+| `summary.txt` | 人可读的 case 级警报、关键数值和梯度微批大小 |
+| `diagnosis.json` | 机器可读结论、阈值、梯度微批大小和可重复性元数据 |
 
 所有 gate logits、alpha、target 和相关统计都会先转换为 `torch.float32`。即便模型
 主体处于混合精度，也不会只用 FP16 值计算统计量；若捕获到原始 gate 输出为
@@ -105,6 +131,9 @@ FP16/BF16，会产生 `FP16_QUANTIZATION_WARNING`。
 - `weighted_mraf_rel / loss_base`：reliability 辅助项相对于既有 base loss 的量级。
 - 梯度范数：用 `torch.autograd.grad` 分别检查 total loss 和仅
   `weighted_mraf_rel` 对 scorer 的作用；不写入 `.grad`，不更新参数。
+- CUDA 显存字段：`allocated_before` 是探针前模型和微批的基线占用，
+  `allocated_after_forward` 是 clean 前向后的占用，`peak_allocated` 与
+  `peak_reserved` 是该行两个独立探针中的较大峰值，单位均为 MiB。
 - 融合路径：在同一图像 batch 与文本特征上比较四种门控，确认
   `eval_use_fused_mu` 当前评估特征确实对门控敏感。
 
@@ -143,3 +172,10 @@ FP16/BF16，会产生 `FP16_QUANTIZATION_WARNING`。
 三种正式 case，不模拟 optimizer、scheduler 或 epoch 间参数变化。
 `gradient-batches` 只限制诊断 batch 数，不能代表完整 epoch。融合路径使用当前
 batch 内文本作为小型检索候选集，适合验证路径敏感性，不等同于完整验证集指标。
+
+## 失败目录
+
+工具只在所有 case 的计算都成功后统一写出最终 CSV、JSON 和 `summary.txt`。
+若发生 OOM 或其他异常，不会生成一个表示成功的 `summary.txt`；异常前由外部
+重定向保存的日志或可能存在的部分文件只能用于排错，不能作为最终诊断结论。
+失败后必须指定一个全新的 `--output-dir` 重跑，不要复用失败目录。
