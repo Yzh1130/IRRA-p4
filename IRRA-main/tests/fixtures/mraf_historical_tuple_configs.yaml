@@ -1,0 +1,26 @@
+dataset_name: RGBT-PEDES
+img_size: !!python/tuple
+  - 384
+  - 128
+milestones: !!python/tuple
+  - 20
+  - 50
+nested:
+  value: !!python/tuple
+    - !!python/tuple
+      - 1
+      - 2
+    - 3
+batch_size: 64
+loss_names: sdm+mlm+id
+MLM: true
+num_epoch: 60
+warmup_epochs: 5
+eval_use_fused_mu: true
+mdrc_loss_scale: 100
+mdrc_lambda: 0.05
+mdrc_prob: 0.5
+mdrc_warmup_epoch: 3
+mraf_rel_lambda: 0.01
+mraf_gate_fp32: false
+mraf_gate_base_grad_scale: 1.0

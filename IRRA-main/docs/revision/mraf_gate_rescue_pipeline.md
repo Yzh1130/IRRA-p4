@@ -140,3 +140,66 @@ bash scripts/mraf/run_mraf_gate_rescue_pipeline.sh \
 
 失败会写 `STATUS=FAILED`、`FAILED_STAGE` 和 `EXIT_CODE`；筛选失败和 mock
 完成均不会触发关机。
+
+## 历史 `configs.yaml` 兼容与安全边界
+
+项目历史训练配置由 `utils/iotools.py::save_train_configs()` 通过
+`yaml.dump(vars(args))` 保存，因此 `img_size`、`milestones` 等 tuple
+可能带 `!!python/tuple`。所有 Gate Rescue 读取路径统一复用
+`utils/config.py::load_config_mapping()`（`load_train_configs()` 也复用
+它）：它基于 `yaml.SafeLoader`，只额外
+允许 `tag:yaml.org,2002:python/tuple` 并递归构造为 tuple。普通 YAML
+语义不变；`!!python/object`、`!!python/object/apply` 及其他未知 Python
+标签仍会被拒绝，不使用 `FullLoader`、`UnsafeLoader` 或
+`yaml.unsafe_load`。
+
+部署后先对真实历史配置执行只读检查：
+
+```bash
+cd /root/autodl-tmp/IRRA-main-mraf/IRRA-main
+conda activate rgbt5090
+
+python -B tools/revision/validate_mraf_rescue_config.py \
+  --config /root/autodl-tmp/MRAF_SEED1_20260724_162808/formal/20260724_170553_mdrc_mraf_seed1/RGBT-PEDES/20260724_170555_mdrc_mraf_seed1/configs.yaml \
+  --require-gate-rescue-protocol
+```
+
+成功必须显示 `config_valid=true`、`top_level_type=dict` 和
+`tuple_tag_supported=true`，并列出数据集、epoch、batch size 与三个 Gate
+Rescue 字段。该命令不构建模型、不访问 GPU、不改写配置。
+
+Pipeline preflight 配置失败时直接打印：
+
+```text
+STATUS=FAILED
+FAILED_STAGE=PREFLIGHT_CONFIG
+EXIT_CODE=<non-zero>
+CONFIG_PATH=<configs.yaml>
+CONFIG_ERROR=<concise error>
+```
+
+不会输出无上下文 traceback。`--dry-run` 在创建 timestamp run 目录之前
+完成配置检查，所以失败不会产生误导性的正式结果目录，也不会调用
+`train.py`、`test.py` 或诊断工具。失败目录或部分 CSV 不应当作最终诊断
+结论；重跑正式任务时使用新的 `--output-root` 子目录。
+
+## 真实路径静态核查
+
+- 所有外部路径均以 Bash 数组或双引号传递；`--output-root` 必须是已存在
+  的父目录，timestamp run 目录拒绝覆盖。
+- `--base-config` 可显式给出，也只会从 reference root 下唯一匹配
+  `formal/*_mdrc_mraf_seed1*/configs.yaml`；preflight、候选产物链接、
+  resume 跳过判断、候选/正式汇总和历史比较均使用统一加载器。
+- `Caption.json` 的三个受支持数据布局都使用 `-f` 检查，可跟随
+  `RGBT-PEDES` 目录软链接。
+- 已对照 `train.py --help`、`test.py --help` 和诊断工具 `--help`：
+  Pipeline 生成的训练、8/11 场景评估、direct-checkpoint 诊断参数均存在。
+- 每个候选独立从相同初始化训练 8 epoch，`mraf_rel_warmup_epoch=1`；
+  正式入选配置重新训练 60 epoch，`mraf_rel_warmup_epoch=3`。S0–S5
+  参数矩阵固定且互不串用 checkpoint。
+- 单候选失败会记录并继续；无候选通过时不启动 60 epoch；resume 校验
+  commit、seed、矩阵、路径及可读配置；关机仍受
+  `--shutdown-on-success`、正式完成和报告归档三重门禁。
+- Pipeline 不自行猜测磁盘容量阈值。正式启动前必须运行
+  `df -h /root/autodl-tmp`，确认数据、6 组 8 epoch、1 组 60 epoch、
+  评估 score、诊断与归档所需空间；空间不足时不要启动。

@@ -247,7 +247,13 @@ def test_direct_single_checkpoint_mode_discovers_artifacts(tmp_path):
     run_dir.mkdir()
     config_path = run_dir / "configs.yaml"
     checkpoint_path = run_dir / "best.pth"
-    config_path.write_text("dataset_name: RGBT-PEDES\n", encoding="utf-8")
+    config_path.write_text(
+        "dataset_name: RGBT-PEDES\n"
+        "img_size: !!python/tuple\n"
+        "  - 384\n"
+        "  - 128\n",
+        encoding="utf-8",
+    )
     checkpoint_path.write_bytes(b"dry-run checkpoint")
     (run_dir / "train.log").write_text("fixture\n", encoding="utf-8")
     output_dir = tmp_path / "output"
@@ -492,7 +498,13 @@ def test_cpu_dry_run_discovers_artifacts_without_creating_output(tmp_path):
     case_root = run_root / "formal" / "20260725_mraf_only_seed1"
     case_root.mkdir(parents=True)
     data_root.mkdir()
-    (case_root / "configs.yaml").write_text("dataset_name: RGBT-PEDES\n", encoding="utf-8")
+    (case_root / "configs.yaml").write_text(
+        "dataset_name: RGBT-PEDES\n"
+        "milestones: !!python/tuple\n"
+        "  - 20\n"
+        "  - 50\n",
+        encoding="utf-8",
+    )
     (case_root / "best.pth").write_bytes(b"not loaded during dry-run")
     (case_root / "train.log").write_text("dry-run fixture\n", encoding="utf-8")
     output_dir = tmp_path / "diagnostics"

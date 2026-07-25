@@ -2132,6 +2132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     run_root, data_root, device, artifacts, input_mode = _validate_cli(args)
     if args.dry_run:
+        for artifact in artifacts:
+            load_train_configs(str(artifact.config_path))
         print(
             json.dumps(
                 {

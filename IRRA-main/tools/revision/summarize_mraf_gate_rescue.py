@@ -7,9 +7,16 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.config import ConfigLoadError, load_config_mapping  # noqa: E402
 
 
 CANDIDATE_MATRIX: Mapping[str, Mapping[str, Any]] = {
@@ -141,6 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--old-run-root",
         default="",
         help="optional root containing old formal *_<case>_seed1 runs",
+    )
+    parser.add_argument(
+        "--base-config",
+        default="",
+        help="historical formal configs.yaml recorded in the final report",
     )
     parser.add_argument("--output-dir", required=True)
     return parser
@@ -295,6 +307,21 @@ def collect_candidate(candidate_root: Path, label: str) -> Dict[str, Any]:
         result["collection_error"] = "candidate_directory_missing"
         return result
 
+    config_path = candidate_dir / "configs.yaml"
+    saved_config = (
+        load_config_mapping(config_path) if config_path.is_file() else None
+    )
+    if saved_config is not None:
+        for key, expected in config.items():
+            if saved_config.get(key) != expected:
+                raise ValueError(
+                    f"{label} saved config mismatch for {key}: "
+                    f"{saved_config.get(key)!r} != {expected!r}; "
+                    f"config={config_path}"
+                )
+        result["config_path"] = str(config_path.resolve())
+        result["config_valid"] = True
+
     metadata_path = candidate_dir / "candidate.json"
     if metadata_path.is_file():
         metadata = _read_json(metadata_path)
@@ -416,7 +443,7 @@ def collect_candidate(candidate_root: Path, label: str) -> Dict[str, Any]:
     result["complete"] = (
         len(result["metrics"]) == len(SCREEN_SCENARIOS)
         and diagnosis_path.is_file()
-        and (candidate_dir / "configs.yaml").is_file()
+        and saved_config is not None
         and (candidate_dir / "best.pth").is_file()
         and (candidate_dir / "train.log").is_file()
     )
@@ -735,6 +762,9 @@ def _old_comparison_row(
     run_dir = matches[0].resolve()
     row["run_dir"] = str(run_dir)
     try:
+        config_path = _find_unique(run_dir, ("configs.yaml",))
+        if config_path is not None:
+            load_config_mapping(config_path)
         clean_path = _scenario_score(run_dir, "clean")
         if clean_path is not None:
             clean = _load_score_metrics(clean_path)
@@ -765,6 +795,8 @@ def _old_comparison_row(
             row["weighted_rel_base_median"] = case_row.get(
                 "weighted_rel_base_ratio_median"
             )
+    except ConfigLoadError:
+        raise
     except (FileNotFoundError, ValueError):
         # Historical runs are optional provenance; unavailable fields remain NA.
         pass
@@ -775,6 +807,7 @@ def summarize_final(
     final_run_dir: Path,
     output_dir: Path,
     old_run_root: Optional[Path] = None,
+    base_config: Optional[Path] = None,
 ) -> Dict[str, Path]:
     final_run_dir = final_run_dir.resolve()
     output_dir = output_dir.resolve()
@@ -784,6 +817,14 @@ def summarize_final(
         raise FileExistsError(
             f"Refusing to overwrite non-empty final summary directory: {output_dir}"
         )
+    final_config_path = final_run_dir / "configs.yaml"
+    final_config = load_config_mapping(final_config_path)
+    base_config_path = base_config.resolve() if base_config is not None else None
+    historical_config = (
+        load_config_mapping(base_config_path)
+        if base_config_path is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     metric_rows, aggregate = _final_metrics(final_run_dir)
     diagnosis_path = _active_diagnostic_dir(final_run_dir) / "diagnosis.json"
@@ -870,6 +911,10 @@ def summarize_final(
             [
                 "MRAF gate rescue final report",
                 f"final_run_dir={final_run_dir}",
+                f"formal_config={final_config_path.resolve()}",
+                f"formal_config_valid={bool(final_config)}",
+                f"base_config={base_config_path or 'NONE'}",
+                f"base_config_valid={historical_config is not None}",
                 f"clean_R1={aggregate['clean_R1']}",
                 f"clean_mAP={aggregate['clean_mAP']}",
                 f"clean_mINP={aggregate['clean_mINP']}",
@@ -912,6 +957,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(args.final_run_dir),
             Path(args.output_dir),
             old_run_root=old_root,
+            base_config=(
+                Path(args.base_config)
+                if str(args.base_config).strip()
+                else None
+            ),
         )
     for name, path in paths.items():
         print(f"{name}={path}")

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from tools.revision import summarize_mraf_gate_rescue as rescue
+from tools.revision import validate_mraf_rescue_config as validator
+from utils.config import ConfigLoadError, load_config_mapping
 
 
 EXPECTED_MATRIX = {
@@ -17,6 +19,35 @@ EXPECTED_MATRIX = {
     "S4": (True, 0.25, 0.10),
     "S5": (True, 0.25, 0.00),
 }
+
+
+def _write_protocol_config(path, *, label="S4", tuple_tag=True):
+    gate_fp32, rel_lambda, grad_scale = EXPECTED_MATRIX[label]
+    tuple_value = (
+        "img_size: !!python/tuple\n"
+        "  - 384\n"
+        "  - 128\n"
+        if tuple_tag
+        else "img_size: [384, 128]\n"
+    )
+    path.write_text(
+        "dataset_name: RGBT-PEDES\n"
+        f"{tuple_value}"
+        "num_epoch: 8\n"
+        "batch_size: 64\n"
+        "loss_names: sdm+mlm+id\n"
+        "MLM: true\n"
+        "warmup_epochs: 5\n"
+        "eval_use_fused_mu: true\n"
+        "mdrc_loss_scale: 100\n"
+        "mdrc_lambda: 0.05\n"
+        "mdrc_prob: 0.5\n"
+        "mdrc_warmup_epoch: 3\n"
+        f"mraf_rel_lambda: {rel_lambda}\n"
+        f"mraf_gate_fp32: {str(gate_fp32).lower()}\n"
+        f"mraf_gate_base_grad_scale: {grad_scale}\n",
+        encoding="utf-8",
+    )
 
 
 def _metrics(clean=70.0, degraded=60.0):
@@ -228,3 +259,263 @@ def test_summarizer_source_does_not_run_training_or_optimizer_steps():
     source = inspect.getsource(rescue)
     assert "optimizer.step" not in source
     assert "train.py" not in source
+
+
+def test_plain_yaml_and_scalar_semantics_are_preserved(tmp_path):
+    config_path = tmp_path / "plain.yaml"
+    config_path.write_text(
+        "enabled: true\n"
+        "disabled: false\n"
+        "nothing: null\n"
+        "name: RGBT-PEDES\n"
+        "count: 64\n"
+        "ratio: 0.25\n"
+        "items:\n"
+        "  - one\n"
+        "  - two\n",
+        encoding="utf-8",
+    )
+    config = load_config_mapping(config_path)
+    assert config == {
+        "enabled": True,
+        "disabled": False,
+        "nothing": None,
+        "name": "RGBT-PEDES",
+        "count": 64,
+        "ratio": 0.25,
+        "items": ["one", "two"],
+    }
+
+
+def test_historical_tuple_supports_nested_and_mixed_sequences(tmp_path):
+    config_path = tmp_path / "tuple.yaml"
+    config_path.write_text(
+        "img_size: !!python/tuple\n"
+        "  - 384\n"
+        "  - 128\n"
+        "nested:\n"
+        "  value: !!python/tuple\n"
+        "    - !!python/tuple\n"
+        "      - 1\n"
+        "      - 2\n"
+        "    - 3\n"
+        "tuple_with_list: !!python/tuple\n"
+        "  - [4, 5]\n"
+        "list_with_tuple:\n"
+        "  - !!python/tuple\n"
+        "    - 6\n"
+        "    - 7\n",
+        encoding="utf-8",
+    )
+    config = load_config_mapping(config_path)
+    assert config["img_size"] == (384, 128)
+    assert config["nested"]["value"] == ((1, 2), 3)
+    assert config["tuple_with_list"] == ([4, 5],)
+    assert config["list_with_tuple"] == [(6, 7)]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "value: !!python/object:builtins.dict {}\n",
+        "value: !!python/object/apply:builtins.str [unsafe]\n",
+    ],
+)
+def test_unknown_python_tags_are_rejected_with_path_and_tag(tmp_path, payload):
+    config_path = tmp_path / "unsafe.yaml"
+    config_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(ConfigLoadError) as raised:
+        load_config_mapping(config_path)
+    message = str(raised.value)
+    assert str(config_path.resolve()) in message
+    assert "python/object" in message
+
+
+def test_arbitrary_python_constructor_is_not_executed(tmp_path):
+    marker = tmp_path / "must_not_exist.txt"
+    expression = (
+        f"__import__('pathlib').Path({str(marker)!r}).write_text('owned')"
+    )
+    config_path = tmp_path / "unsafe_apply.yaml"
+    config_path.write_text(
+        "value: !!python/object/apply:builtins.eval\n"
+        f"  - {json.dumps(expression)}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigLoadError, match="python/object/apply"):
+        load_config_mapping(config_path)
+    assert not marker.exists()
+
+
+def test_empty_config_is_rejected(tmp_path):
+    config_path = tmp_path / "empty.yaml"
+    config_path.write_text("\n", encoding="utf-8")
+    with pytest.raises(ConfigLoadError, match="empty"):
+        load_config_mapping(config_path)
+
+
+def test_non_mapping_top_level_is_rejected(tmp_path):
+    config_path = tmp_path / "list.yaml"
+    config_path.write_text("- one\n- two\n", encoding="utf-8")
+    with pytest.raises(ConfigLoadError, match="top level must be a mapping"):
+        load_config_mapping(config_path)
+
+
+def test_missing_config_is_rejected_with_absolute_path(tmp_path):
+    config_path = tmp_path / "missing.yaml"
+    with pytest.raises(ConfigLoadError) as raised:
+        load_config_mapping(config_path)
+    assert "Config file not found" in str(raised.value)
+    assert str(config_path.resolve()) in str(raised.value)
+
+
+def test_validator_reports_required_fields_for_tuple_config(tmp_path, capsys):
+    config_path = tmp_path / "configs.yaml"
+    _write_protocol_config(config_path)
+    exit_code = validator.main(
+        [
+            "--config",
+            str(config_path),
+            "--require-gate-rescue-protocol",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    for expected in (
+        "config_valid=true",
+        "top_level_type=dict",
+        "tuple_tag_supported=true",
+        "dataset_name=RGBT-PEDES",
+        "num_epoch=8",
+        "batch_size=64",
+        "mraf_rel_lambda=0.25",
+        "mraf_gate_fp32=true",
+        "mraf_gate_base_grad_scale=0.1",
+    ):
+        assert expected in output
+
+
+def test_validator_returns_nonzero_without_traceback(tmp_path, capsys):
+    config_path = tmp_path / "bad.yaml"
+    config_path.write_text(
+        "value: !!python/object/apply:builtins.str [unsafe]\n",
+        encoding="utf-8",
+    )
+    exit_code = validator.main(["--config", str(config_path)])
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert "config_valid=false" in captured.err
+    assert "config_error=" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_summarizer_reads_tuple_tagged_candidate_config(tmp_path):
+    candidate_root = tmp_path / "candidates"
+    candidate_dir = candidate_root / "S4"
+    candidate_dir.mkdir(parents=True)
+    _write_protocol_config(candidate_dir / "configs.yaml", label="S4")
+    candidate = rescue.collect_candidate(candidate_root, "S4")
+    assert candidate["config_valid"] is True
+    assert candidate["complete"] is False
+
+
+def test_summarizer_rejects_saved_candidate_matrix_mismatch(tmp_path):
+    candidate_root = tmp_path / "candidates"
+    candidate_dir = candidate_root / "S4"
+    candidate_dir.mkdir(parents=True)
+    config_path = candidate_dir / "configs.yaml"
+    _write_protocol_config(config_path, label="S4")
+    text = config_path.read_text(encoding="utf-8").replace(
+        "mraf_rel_lambda: 0.25", "mraf_rel_lambda: 1.0"
+    )
+    config_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="saved config mismatch"):
+        rescue.collect_candidate(candidate_root, "S4")
+
+
+def test_final_summarizer_reads_formal_and_base_tuple_configs(
+    tmp_path, monkeypatch
+):
+    final_run = tmp_path / "formal"
+    diagnostics = final_run / "diagnostics"
+    diagnostics.mkdir(parents=True)
+    _write_protocol_config(final_run / "configs.yaml", label="S4")
+    base_config = tmp_path / "historical_configs.yaml"
+    _write_protocol_config(base_config, label="S0")
+    (diagnostics / "diagnosis.json").write_text(
+        json.dumps({"cases": {"S4_formal": {}}}),
+        encoding="utf-8",
+    )
+    aggregate = {
+        "clean_R1": 70.0,
+        "clean_mAP": 65.0,
+        "clean_mINP": 55.0,
+        "degraded_mean_R1": 60.0,
+        "relative_clean_mean_drop_R1": 10.0,
+        "worst_scenario": "rgb_missing",
+        "worst_R1": 50.0,
+    }
+    monkeypatch.setattr(rescue, "_final_metrics", lambda _: ([], aggregate))
+    paths = rescue.summarize_final(
+        final_run,
+        tmp_path / "summary",
+        base_config=base_config,
+    )
+    report = paths["report"].read_text(encoding="utf-8")
+    assert "formal_config_valid=True" in report
+    assert "base_config_valid=True" in report
+
+
+def test_historical_comparison_does_not_hide_unsafe_config_tags(tmp_path):
+    old_run = tmp_path / "20260724_mraf_only_seed1"
+    old_run.mkdir()
+    (old_run / "configs.yaml").write_text(
+        "value: !!python/object/apply:builtins.str [unsafe]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigLoadError, match="python/object/apply"):
+        rescue._old_comparison_row(tmp_path, "mraf_only")
+
+
+def test_pipeline_uses_central_validator_for_all_config_stages():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "mraf"
+        / "run_mraf_gate_rescue_pipeline.sh"
+    ).read_text(encoding="utf-8")
+    assert "validate_mraf_rescue_config.py" in script
+    assert "yaml.safe_load" not in script
+    assert "config_is_valid" in script
+    assert 'config_is_valid "$config_path"' in script
+    assert 'config_is_valid "${path}/configs.yaml"' in script
+    assert 'config_is_valid "${formal_run_path}/configs.yaml"' in script
+    assert '--base-config "$base_config"' in script
+
+
+def test_pipeline_config_failure_schema_is_stable():
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "mraf"
+        / "run_mraf_gate_rescue_pipeline.sh"
+    ).read_text(encoding="utf-8")
+    for field in (
+        "STATUS=FAILED",
+        "FAILED_STAGE=PREFLIGHT_CONFIG",
+        "EXIT_CODE=",
+        "CONFIG_PATH=",
+        "CONFIG_ERROR=",
+    ):
+        assert field in script
+    assert "Traceback" not in script
+
+
+def test_validator_help_exposes_read_only_config_interface():
+    help_text = validator.build_parser().format_help()
+    assert "--config" in help_text
+    assert "--require-gate-rescue-protocol" in help_text
+    source = inspect.getsource(validator)
+    assert "torch" not in source
+    assert "build_model" not in source
+    assert "optimizer" not in source

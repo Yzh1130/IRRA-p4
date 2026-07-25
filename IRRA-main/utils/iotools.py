@@ -11,6 +11,7 @@ import os
 import os.path as osp
 import yaml
 from easydict import EasyDict as edict
+from utils.config import ConfigLoadError, load_config_mapping
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -77,8 +78,7 @@ def save_train_configs(path, args):
     with open(f'{path}/configs.yaml', 'w') as f:
         yaml.dump(vars(args), f, default_flow_style=False)
 
+
 def load_train_configs(path):
     # Load YAML config and expose dict fields as attributes.
-    with open(path, 'r') as f:
-        args = yaml.load(f, Loader=yaml.FullLoader)
-    return edict(args)
+    return edict(load_config_mapping(path))

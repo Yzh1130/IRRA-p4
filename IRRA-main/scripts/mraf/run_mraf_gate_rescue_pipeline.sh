@@ -133,6 +133,7 @@ candidate_status_file="${run_dir}/candidate_status.tsv"
 current_stage="preflight"
 pipeline_completed=false
 formal_completed=false
+base_config_validation=""
 
 write_status() {
   local status=$1
@@ -154,6 +155,30 @@ on_error() {
   exit "$exit_code"
 }
 trap on_error ERR
+
+config_validator=(
+  "$python_bin" -B tools/revision/validate_mraf_rescue_config.py
+)
+
+fail_preflight_config() {
+  local exit_code=$1
+  local config_path=$2
+  shift 2
+  local config_error
+  config_error="$(printf '%s ' "$@" | tr '\r\n' '  ' | sed 's/[[:space:]]\+/ /g;s/ $//')"
+  current_stage="PREFLIGHT_CONFIG"
+  echo "STATUS=FAILED"
+  echo "FAILED_STAGE=PREFLIGHT_CONFIG"
+  echo "EXIT_CODE=$exit_code"
+  echo "CONFIG_PATH=$config_path"
+  echo "CONFIG_ERROR=$config_error"
+  exit "$exit_code"
+}
+
+config_is_valid() {
+  local config_path=$1
+  "${config_validator[@]}" --config "$config_path" >/dev/null 2>&1
+}
 
 print_matrix() {
   cat <<'EOF'
@@ -226,7 +251,8 @@ validate_protocol_paths() {
       "Provide --base-config; reference discovery found ${#base_matches[@]} matches"
     base_config=${base_matches[0]}
   fi
-  [[ -f "$base_config" ]] || die "Base config not found: $base_config"
+  [[ -f "$base_config" ]] || fail_preflight_config 2 "$base_config" \
+    "Config file not found: $base_config"
   base_config="$(cd "$(dirname "$base_config")" && pwd)/$(basename "$base_config")"
   caption_file=""
   for candidate_caption in \
@@ -236,20 +262,19 @@ validate_protocol_paths() {
     if [[ -f "$candidate_caption" ]]; then caption_file=$candidate_caption; break; fi
   done
   [[ -n "$caption_file" ]] || die "Caption.json not found under --data-root"
-  "$python_bin" -B - "$base_config" <<'PY'
-import sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
-expected = {
-    "batch_size": 64, "loss_names": "sdm+mlm+id", "MLM": True,
-    "warmup_epochs": 5, "eval_use_fused_mu": True,
-    "mdrc_loss_scale": 100, "mdrc_lambda": 0.05, "mdrc_prob": 0.5,
-    "mdrc_warmup_epoch": 3,
-}
-bad = {key: (cfg.get(key), value) for key, value in expected.items()
-       if cfg.get(key) != value}
-if bad:
-    raise SystemExit(f"Historical formal config mismatch: {bad}")
-PY
+  local config_exit config_error
+  set +e
+  base_config_validation="$(
+    "${config_validator[@]}" --config "$base_config" \
+      --require-gate-rescue-protocol 2>&1
+  )"
+  config_exit=$?
+  set -e
+  if [[ "$config_exit" -ne 0 ]]; then
+    config_error="$(sed -n 's/^config_error=//p' <<<"$base_config_validation")"
+    [[ -n "$config_error" ]] || config_error="$base_config_validation"
+    fail_preflight_config "$config_exit" "$base_config" "$config_error"
+  fi
 }
 
 if [[ "$mock" != "true" ]]; then
@@ -279,6 +304,7 @@ if [[ "$dry_run" == "true" ]]; then
   echo "seed=$seed"
   echo "auto_continue=$auto_continue"
   echo "shutdown_on_success=$shutdown_on_success"
+  printf '%s\n' "$base_config_validation"
   print_matrix
   echo "No directory, training, evaluation, diagnosis, or shutdown was executed."
   exit 0
@@ -352,6 +378,7 @@ link_candidate_artifacts() {
   checkpoint_path="$(resolve_unique_artifact "${candidate_dir}/train_output" best.pth)"
   train_log_path="${candidate_dir}/train.log"
   [[ -f "$train_log_path" ]] || return 1
+  config_is_valid "$config_path" || return 1
   ln -s "$config_path" "${candidate_dir}/configs.yaml"
   ln -s "$checkpoint_path" "${candidate_dir}/best.pth"
 }
@@ -450,7 +477,25 @@ make_mock_candidate() {
   local gate_fp32 rel_lambda grad_scale
   read -r gate_fp32 rel_lambda grad_scale < <(candidate_values "$label")
   mkdir -p "$candidate_dir/eval" "$candidate_dir/diagnostics"
-  printf 'mock\n' >"${candidate_dir}/configs.yaml"
+  cat >"${candidate_dir}/configs.yaml" <<EOF
+dataset_name: RGBT-PEDES
+img_size: !!python/tuple
+  - 384
+  - 128
+num_epoch: 8
+batch_size: 64
+loss_names: sdm+mlm+id
+MLM: true
+warmup_epochs: 5
+eval_use_fused_mu: true
+mdrc_loss_scale: 100
+mdrc_lambda: 0.05
+mdrc_prob: 0.5
+mdrc_warmup_epoch: 3
+mraf_rel_lambda: $rel_lambda
+mraf_gate_fp32: $gate_fp32
+mraf_gate_base_grad_scale: $grad_scale
+EOF
   printf 'mock\n' >"${candidate_dir}/best.pth"
   printf 'mock\n' >"${candidate_dir}/train.log"
   "$python_bin" -B - "$candidate_dir" "$label" "$gate_fp32" "$rel_lambda" "$grad_scale" <<'PY'
@@ -667,6 +712,7 @@ candidate_complete() {
   local path=$1
   [[ -s "${path}/configs.yaml" && -s "${path}/best.pth" \
       && -s "${path}/train.log" ]] || return 1
+  config_is_valid "${path}/configs.yaml" || return 1
   local scenario
   for scenario in clean rgb_missing ir_missing rgb_noise_0.10 ir_noise_0.10 \
     rgb_blur_k7 ir_blur_k7 both_blur_k7; do
@@ -772,7 +818,8 @@ formal_run_path="$(active_candidate_path "$formal_container")"
 if [[ "$resume_mode" == "true" \
       && -s "${formal_run_path}/configs.yaml" \
       && -s "${formal_run_path}/best.pth" \
-      && -s "${formal_run_path}/train.log" ]]; then
+      && -s "${formal_run_path}/train.log" ]] \
+      && config_is_valid "${formal_run_path}/configs.yaml"; then
   :
 elif [[ "$resume_mode" == "true" && -e "$formal_container" ]]; then
   formal_run_path="${formal_container}/resume_attempt_${timestamp}"
@@ -830,6 +877,7 @@ fi
 "$python_bin" -B tools/revision/summarize_mraf_gate_rescue.py \
   --final-run-dir "$formal_run_path" \
   --old-run-root "$reference_run_root" \
+  --base-config "$base_config" \
   --output-dir "$final_reports_dir" \
   >"${run_dir}/final_summary.log" 2>&1
 {
