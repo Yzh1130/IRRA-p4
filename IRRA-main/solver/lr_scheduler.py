@@ -82,14 +82,64 @@ class LRSchedulerWithWarmup(_LRScheduler):
             # Polynomial schedule ending at target_lr.
             factor = 1 - epoch_ratio
             return [
-                self.target_lr + (base_lr - self.target_lr) * self.power ** factor
-                for base_lr in self.base_lrs
+                (
+                    self.target_lr
+                    * float(
+                        group.get("mraf_scorer_lr_multiplier", 1.0)
+                    )
+                    if str(group.get("group_name", "")).startswith(
+                        "mraf_scorer"
+                    )
+                    else self.target_lr
+                )
+                + (
+                    base_lr
+                    - (
+                        self.target_lr
+                        * float(
+                            group.get("mraf_scorer_lr_multiplier", 1.0)
+                        )
+                        if str(group.get("group_name", "")).startswith(
+                            "mraf_scorer"
+                        )
+                        else self.target_lr
+                    )
+                )
+                * self.power ** factor
+                for base_lr, group in zip(
+                    self.base_lrs, self.optimizer.param_groups
+                )
             ]
         if self.mode == "cosine":
             # Cosine annealing schedule ending at target_lr.
             factor = 0.5 * (1 + cos(pi * epoch_ratio))
             return [
-                self.target_lr + (base_lr - self.target_lr) * factor
-                for base_lr in self.base_lrs
+                (
+                    self.target_lr
+                    * float(
+                        group.get("mraf_scorer_lr_multiplier", 1.0)
+                    )
+                    if str(group.get("group_name", "")).startswith(
+                        "mraf_scorer"
+                    )
+                    else self.target_lr
+                )
+                + (
+                    base_lr
+                    - (
+                        self.target_lr
+                        * float(
+                            group.get("mraf_scorer_lr_multiplier", 1.0)
+                        )
+                        if str(group.get("group_name", "")).startswith(
+                            "mraf_scorer"
+                        )
+                        else self.target_lr
+                    )
+                )
+                * factor
+                for base_lr, group in zip(
+                    self.base_lrs, self.optimizer.param_groups
+                )
             ]
         raise NotImplementedError

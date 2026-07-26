@@ -1,5 +1,11 @@
 # MRAF 门控修复与自动筛选流水线
 
+> 后续状态：本轮 S0–S5 已全部完成但最终 `SCREEN_FAILED`。S4/S5 的
+> Pearson 提升没有带来实际 alpha 幅度，说明“有相关性”不等于“门控有效”。
+> 新的 scorer-LR、best/last、只读 logit 校准、确认训练和正式门禁见
+> `docs/revision/mraf_gate_amplitude_rescue_pipeline.md`。本文件保留作为
+> 上一轮协议与只读 reference 的记录；旧 S3/S4 不会被新流水线重训或修改。
+
 ## 目的与诊断依据
 
 正式机制诊断显示：reliability target 的退化场景标准差约为 `0.284`，

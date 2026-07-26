@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Tuple, Union
 
 import torch
@@ -64,6 +65,7 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         hidden_dim: int = 128,
         dropout: float = 0.1,
         gate_temperature: float = 1.0,
+        gate_logit_scale: float = 1.0,
         gate_fp32: bool = False,
         gate_base_grad_scale: float = 1.0,
     ) -> None:
@@ -78,6 +80,13 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             raise ValueError(
                 f"gate_temperature must be > 0, got {gate_temperature}."
             )
+        if (
+            not math.isfinite(float(gate_logit_scale))
+            or float(gate_logit_scale) <= 0.0
+        ):
+            raise ValueError(
+                f"gate_logit_scale must be > 0, got {gate_logit_scale}."
+            )
         if not 0.0 <= float(gate_base_grad_scale) <= 1.0:
             raise ValueError(
                 "gate_base_grad_scale must be in [0, 1], got "
@@ -88,6 +97,7 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self.gate_temperature = float(gate_temperature)
+        self.gate_logit_scale = float(gate_logit_scale)
         self.gate_fp32 = bool(gate_fp32)
         self.gate_base_grad_scale = float(gate_base_grad_scale)
         self.scorer = nn.Sequential(
@@ -150,8 +160,11 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 ir_normalized = F.normalize(ir_for_fusion, p=2, dim=-1)
                 rgb_logit = self.scorer(rgb_normalized)
                 ir_logit = self.scorer(ir_normalized)
-                logits = torch.cat([rgb_logit, ir_logit], dim=-1)
-                alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+                raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+                scaled_logits = raw_logits * self.gate_logit_scale
+                alpha = F.softmax(
+                    scaled_logits / self.gate_temperature, dim=-1
+                )
                 if self.gate_base_grad_scale == 1.0:
                     alpha_for_base = alpha
                 else:
@@ -175,8 +188,11 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             )
             rgb_logit = self.scorer(rgb_normalized)
             ir_logit = self.scorer(ir_normalized)
-            logits = torch.cat([rgb_logit, ir_logit], dim=-1)
-            alpha = F.softmax(logits / self.gate_temperature, dim=-1)
+            raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+            scaled_logits = raw_logits * self.gate_logit_scale
+            alpha = F.softmax(
+                scaled_logits / self.gate_temperature, dim=-1
+            )
             if self.gate_base_grad_scale == 1.0:
                 alpha_for_base = alpha
             else:
@@ -202,7 +218,12 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             "alpha_rgb": alpha_aux[:, 0:1],
             "alpha_ir": alpha_aux[:, 1:2],
             "alpha": alpha_aux,
-            "logits": logits,
+            # Keep the legacy alias on raw logits; new code should use the
+            # explicit raw/scaled names.
+            "logits": raw_logits,
+            "raw_logits": raw_logits,
+            "scaled_logits": scaled_logits,
+            "gate_logit_scale": self.gate_logit_scale,
         }
 
 

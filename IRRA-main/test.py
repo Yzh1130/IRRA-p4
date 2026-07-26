@@ -1,4 +1,5 @@
 import argparse
+import math
 import copy
 import os.path as op
 
@@ -17,6 +18,24 @@ from processor.processor import (
 from utils.checkpoint import Checkpointer
 from utils.iotools import load_train_configs
 from utils.logger import setup_logger
+
+
+def _positive_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive float, got {value!r}"
+        )
+    return parsed
+
+
+def _apply_mraf_test_overrides(args, cli_args):
+    """Apply read-only runtime overrides to a copied loaded configuration."""
+    runtime_args = copy.deepcopy(args)
+    override = getattr(cli_args, "mraf_gate_logit_scale", None)
+    if override is not None:
+        runtime_args.mraf_gate_logit_scale = float(override)
+    return runtime_args
 
 
 def _apply_qalr_test_overrides(args, cli_args):
@@ -237,6 +256,15 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="checkpoint file to evaluate; defaults to output_dir/best.pth",
+    )
+    parser.add_argument(
+        "--mraf_gate_logit_scale",
+        type=_positive_float,
+        default=None,
+        help=(
+            "read-only MRAF logit-scale override for this evaluation; "
+            "does not modify configs.yaml or the checkpoint"
+        ),
     )
     parser.add_argument(
         "--use_train_validation_pipeline",
@@ -870,6 +898,7 @@ if __name__ == "__main__":
 
     args = load_train_configs(cli_args.config_file)
     args = _apply_qalr_test_overrides(args, cli_args)
+    args = _apply_mraf_test_overrides(args, cli_args)
     args.training = False
     args.save_eval_scores = bool(cli_args.save_eval_scores)
     args.eval_scores_file = str(cli_args.eval_scores_file)
@@ -883,6 +912,15 @@ if __name__ == "__main__":
 
     logger = setup_logger("IRRA", save_dir=args.output_dir, if_train=args.training)
     logger.info(args)
+    logger.info(
+        "[MRAF_OVERRIDE] gate_logit_scale=%.6f source=%s",
+        float(getattr(args, "mraf_gate_logit_scale", 1.0)),
+        (
+            "cli_override"
+            if cli_args.mraf_gate_logit_scale is not None
+            else "saved_config"
+        ),
+    )
     logger.info(
         "[DEGRADE] mode=%s strength=%.6f blur_kernel=%d seed=%d",
         args.eval_degrade_mode,

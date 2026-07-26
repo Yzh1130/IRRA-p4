@@ -1,4 +1,7 @@
 import argparse
+import math
+
+from utils.config import load_config_mapping
 
 
 MRAF_PRECISION_FUSION_ERROR = (
@@ -16,6 +19,17 @@ def validate_mraf_options(args):
         raise ValueError("--mraf_dropout must be in [0, 1).")
     if float(getattr(args, "mraf_gate_temperature", 1.0)) <= 0.0:
         raise ValueError("--mraf_gate_temperature must be > 0.")
+    gate_logit_scale = float(getattr(args, "mraf_gate_logit_scale", 1.0))
+    if not math.isfinite(gate_logit_scale) or gate_logit_scale <= 0.0:
+        raise ValueError("--mraf_gate_logit_scale must be > 0.")
+    scorer_lr_multiplier = float(
+        getattr(args, "mraf_scorer_lr_multiplier", 1.0)
+    )
+    if (
+        not math.isfinite(scorer_lr_multiplier)
+        or scorer_lr_multiplier <= 0.0
+    ):
+        raise ValueError("--mraf_scorer_lr_multiplier must be > 0.")
     if float(getattr(args, "mraf_target_temperature", 0.1)) <= 0.0:
         raise ValueError("--mraf_target_temperature must be > 0.")
     if float(getattr(args, "mraf_rel_lambda", 0.01)) < 0.0:
@@ -44,6 +58,14 @@ def get_args():
     # Centralized CLI argument definitions for training/inference.
     parser = argparse.ArgumentParser(description="IRRA Args")
     ######################## general settings ########################
+    parser.add_argument(
+        "--config_file",
+        default="",
+        help=(
+            "optional saved training config used as parser defaults; explicit "
+            "CLI arguments take precedence"
+        ),
+    )
     # local_rank is injected by distributed launchers (torchrun).
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--name", default="baseline", help="experiment name to save")
@@ -60,6 +82,7 @@ def get_args():
     parser.add_argument("--save_full_eval_state_ckpt", default=False, action='store_true', help="save full eval-state checkpoints after validation for exact reproduction diagnostics")
     parser.add_argument("--verify_ckpt_immediately_after_save", default=False, action='store_true', help="immediately re-evaluate in-memory and reloaded full-state checkpoints after validation")
     parser.add_argument("--verify_ckpt_epochs", type=str, default="", help="comma-separated 1-based epochs for immediate checkpoint verification, e.g. '9,13'; empty means all validation epochs")
+    parser.add_argument("--save_last_checkpoint", default=False, action='store_true', help="save one additional last.pth after the final training epoch")
 
     ######################## model general settings ########################
     # pretrain_choice chooses which CLIP checkpoint to initialize.
@@ -101,8 +124,10 @@ def get_args():
     mraf_group.add_argument("--mraf_hidden_dim", type=int, default=128, help="hidden dimension of the shared MRAF reliability scorer")
     mraf_group.add_argument("--mraf_dropout", type=float, default=0.1, help="dropout probability in the MRAF reliability scorer")
     mraf_group.add_argument("--mraf_gate_temperature", type=float, default=1.0, help="softmax temperature for MRAF gate weights")
+    mraf_group.add_argument("--mraf_gate_logit_scale", type=float, default=1.0, help="positive multiplier applied to raw MRAF logits before temperature and softmax")
     mraf_group.add_argument("--mraf_gate_fp32", default=False, action='store_true', help="keep only the MRAF scorer, logits, alpha, and fusion arithmetic in FP32")
     mraf_group.add_argument("--mraf_gate_base_grad_scale", type=float, default=1.0, help="scale only base-task gate gradients into the MRAF scorer; valid range [0,1]")
+    mraf_group.add_argument("--mraf_scorer_lr_multiplier", type=float, default=1.0, help="positive learning-rate multiplier applied only to MRAF scorer parameters")
     mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
     mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")
     mraf_group.add_argument("--mraf_rel_warmup_epoch", type=int, default=3, help="number of epochs used to linearly warm up MRAF reliability supervision")
@@ -513,6 +538,24 @@ def get_args():
     parser.add_argument("--synth_weight_apply_to_unc", default=False, action='store_true', help="apply synthetic caption weights to text-side uncertainty alignment loss")
     parser.add_argument("--debug_print_synth_weight_stats", default=False, action='store_true', help="print batch synthetic-caption weight stats every log period")
     parser.add_argument("--test", dest='training', default=True, action='store_false')
+
+    # A historical configs.yaml can provide the complete baseline protocol.
+    # Only currently supported parser destinations are applied; explicit CLI
+    # arguments below still take precedence. With no --config_file this path is
+    # a no-op and preserves the legacy defaults exactly.
+    config_cli, _ = parser.parse_known_args()
+    if str(config_cli.config_file).strip():
+        saved_config = load_config_mapping(config_cli.config_file)
+        supported_destinations = {
+            action.dest for action in parser._actions
+        }
+        parser.set_defaults(
+            **{
+                key: value
+                for key, value in saved_config.items()
+                if key in supported_destinations
+            }
+        )
 
     # Parse CLI args into namespace.
     args = parser.parse_args()

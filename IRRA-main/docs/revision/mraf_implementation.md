@@ -38,6 +38,37 @@ alpha_rgb = alpha_ir = 0.5
 f_fused = f_rgb + f_ir
 ```
 
+## Gate amplitude controls
+
+Two backward-compatible controls are available:
+
+- `mraf_scorer_lr_multiplier` defaults to `1.0`. When non-default, only
+  `IRRA.mraf_fusion.scorer` is removed from the legacy parameter groups and put
+  in dedicated weight/bias groups at `base_lr * multiplier`. Parameter identity,
+  not fuzzy name matching, selects the scorer. The partition is checked for full
+  coverage and duplicates. Warmup and every scheduler mode preserve the ratio.
+- `mraf_gate_logit_scale` defaults to `1.0`. The scorer produces
+  `raw_mraf_logits`; the forward path computes
+  `scaled_mraf_logits = raw_mraf_logits * scale`, then applies temperature and
+  softmax. The legacy `mraf_logits` alias remains the raw value.
+
+Scale and softmax remain FP32 when `mraf_gate_fp32=true`. Reliability loss uses
+the final alpha; target and fusion formulas are unchanged. Both parameters are
+strictly positive and are stored in `configs.yaml`, but add no checkpoint tensor
+or dimension, so old checkpoints still strict-load. `test.py` and the mechanism
+diagnostic accept a read-only logit-scale override without writing the saved
+configuration or checkpoint.
+
+`save_last_checkpoint` defaults to false. When explicitly enabled, training
+keeps the existing clean-R1 `best.pth` semantics and adds only final-epoch
+`last.pth`, plus `checkpoint_selection.tsv`. Training also writes graph-free
+`mraf_epoch_metrics.tsv` and `optimizer_param_groups.tsv` for amplitude audits.
+
+For protocol-controlled experiments, `train.py --config_file configs.yaml`
+uses currently supported values from a historical saved configuration as
+parser defaults, with explicit CLI arguments taking precedence. Omitting this
+option leaves the legacy parser defaults unchanged.
+
 The feature dimension comes from the CLIP model configuration and is never
 hard-coded to 512. Inputs are checked for rank, batch/feature dimensions,
 device, dtype, and finite values. Both gate and target temperatures reject

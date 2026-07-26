@@ -1,6 +1,8 @@
+import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -22,6 +24,7 @@ from model.mraf import (
     compute_mraf_reliability_targets,
     resolve_mraf_rel_lambda,
 )
+from solver.build import append_optimizer_param_groups_tsv
 from utils.attribute_parser import (
     get_uspc_slot_local_attr_names,
     parse_basic_attributes,
@@ -71,6 +74,223 @@ EVAL_RUNTIME_ATTR_NAMES = (
 _MGA_WARNED_KEYS = set()
 
 
+MRAF_EPOCH_METRIC_FIELDS = (
+    "epoch",
+    "base_lr",
+    "scorer_lr",
+    "scorer_lr_multiplier",
+    "mraf_gate_logit_scale",
+    "mraf_rel_lambda",
+    "mraf_gate_base_grad_scale",
+    "raw_logit_diff_mean",
+    "raw_logit_diff_std",
+    "raw_logit_diff_abs_max",
+    "scaled_logit_diff_mean",
+    "scaled_logit_diff_std",
+    "scaled_logit_diff_abs_max",
+    "alpha_rgb_mean",
+    "alpha_rgb_std",
+    "alpha_rgb_min",
+    "alpha_rgb_max",
+    "target_rgb_mean",
+    "target_rgb_std",
+    "alpha_target_pearson",
+    "loss_base",
+    "loss_mraf_rel",
+    "weighted_rel_base_ratio",
+    "scorer_first_weight_norm",
+    "scorer_last_weight_norm",
+    "scorer_first_grad_norm",
+    "scorer_last_grad_norm",
+    "scorer_parameter_delta_from_initial",
+    "gate_logits_dtype",
+    "alpha_dtype",
+)
+
+CHECKPOINT_SELECTION_FIELDS = (
+    "checkpoint",
+    "epoch",
+    "clean_R1",
+    "alpha_std",
+    "Pearson",
+    "weighted_rel_base_ratio",
+)
+
+
+class _DetachedRunningStats:
+    """Exact scalar moments without retaining tensors or computation graphs."""
+
+    def __init__(self):
+        self.count = 0
+        self.total = 0.0
+        self.square_total = 0.0
+        self.minimum = None
+        self.maximum = None
+
+    def update(self, value):
+        if not torch.is_tensor(value) or value.numel() == 0:
+            return
+        detached = value.detach().float().cpu().reshape(-1)
+        self.count += int(detached.numel())
+        self.total += float(detached.sum().item())
+        self.square_total += float(detached.square().sum().item())
+        current_min = float(detached.min().item())
+        current_max = float(detached.max().item())
+        self.minimum = (
+            current_min if self.minimum is None else min(self.minimum, current_min)
+        )
+        self.maximum = (
+            current_max if self.maximum is None else max(self.maximum, current_max)
+        )
+
+    @property
+    def mean(self):
+        return self.total / self.count if self.count else None
+
+    @property
+    def std(self):
+        if not self.count:
+            return None
+        variance = max(
+            self.square_total / self.count - float(self.mean) ** 2,
+            0.0,
+        )
+        return math.sqrt(variance)
+
+    @property
+    def abs_max(self):
+        if self.minimum is None or self.maximum is None:
+            return None
+        return max(abs(self.minimum), abs(self.maximum))
+
+
+class _DetachedPairedStats:
+    def __init__(self):
+        self.count = 0
+        self.sum_x = 0.0
+        self.sum_y = 0.0
+        self.sum_xx = 0.0
+        self.sum_yy = 0.0
+        self.sum_xy = 0.0
+
+    def update(self, first, second):
+        if not torch.is_tensor(first) or not torch.is_tensor(second):
+            return
+        x = first.detach().float().cpu().reshape(-1)
+        y = second.detach().float().cpu().reshape(-1)
+        if x.numel() == 0 or x.numel() != y.numel():
+            return
+        self.count += int(x.numel())
+        self.sum_x += float(x.sum().item())
+        self.sum_y += float(y.sum().item())
+        self.sum_xx += float(x.square().sum().item())
+        self.sum_yy += float(y.square().sum().item())
+        self.sum_xy += float((x * y).sum().item())
+
+    def pearson(self):
+        if self.count < 2:
+            return None
+        count = float(self.count)
+        covariance = self.sum_xy - self.sum_x * self.sum_y / count
+        variance_x = self.sum_xx - self.sum_x * self.sum_x / count
+        variance_y = self.sum_yy - self.sum_y * self.sum_y / count
+        denominator = math.sqrt(max(variance_x, 0.0) * max(variance_y, 0.0))
+        if denominator <= 0.0:
+            return None
+        return covariance / denominator
+
+
+def _mraf_scorer_linears(model):
+    runtime_model = model.module if hasattr(model, "module") else model
+    fusion = getattr(runtime_model, "mraf_fusion", None)
+    scorer = getattr(fusion, "scorer", None)
+    if scorer is None:
+        return []
+    return [module for module in scorer if isinstance(module, nn.Linear)]
+
+
+def _mraf_initial_parameter_snapshot(model):
+    linears = _mraf_scorer_linears(model)
+    if not linears:
+        return {}
+    scorer = (model.module if hasattr(model, "module") else model).mraf_fusion.scorer
+    return {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in scorer.named_parameters()
+    }
+
+
+def _mraf_scorer_parameter_stats(model, initial_snapshot):
+    linears = _mraf_scorer_linears(model)
+    if not linears:
+        return {}
+    runtime_model = model.module if hasattr(model, "module") else model
+    scorer = runtime_model.mraf_fusion.scorer
+    delta_square = 0.0
+    for name, parameter in scorer.named_parameters():
+        initial = initial_snapshot.get(name)
+        if initial is not None:
+            current = parameter.detach().float().cpu()
+            delta_square += float((current - initial).square().sum().item())
+    return {
+        "scorer_first_weight_norm": float(
+            linears[0].weight.detach().float().cpu().norm().item()
+        ),
+        "scorer_last_weight_norm": float(
+            linears[-1].weight.detach().float().cpu().norm().item()
+        ),
+        "scorer_parameter_delta_from_initial": math.sqrt(delta_square),
+    }
+
+
+def _optimizer_mraf_lrs(optimizer, model, base_lr):
+    linears = _mraf_scorer_linears(model)
+    first_weight_id = id(linears[0].weight) if linears else None
+    scorer_lr = None
+    base_group_lr = None
+    for group in optimizer.param_groups:
+        parameters = list(group["params"])
+        if any(id(parameter) == first_weight_id for parameter in parameters):
+            scorer_lr = float(group["lr"])
+        initial_lr = float(group.get("initial_lr", group["lr"]))
+        if (
+            base_group_lr is None
+            and math.isclose(initial_lr, float(base_lr), rel_tol=1e-9, abs_tol=0.0)
+            and not str(group.get("group_name", "")).startswith("mraf_scorer")
+        ):
+            base_group_lr = float(group["lr"])
+    if base_group_lr is None and optimizer.param_groups:
+        base_group_lr = float(optimizer.param_groups[0]["lr"])
+    return base_group_lr, scorer_lr
+
+
+def _append_tsv_row(path, fields, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: row.get(field) for field in fields})
+
+
+def _save_last_checkpoint(
+    checkpointer,
+    args,
+    arguments,
+    epoch,
+):
+    if not bool(getattr(args, "save_last_checkpoint", False)):
+        return None
+    path = os.path.join(args.output_dir, "last.pth")
+    if os.path.exists(path):
+        raise FileExistsError(f"Refusing to overwrite existing last checkpoint: {path}")
+    last_arguments = dict(arguments)
+    last_arguments["epoch"] = int(epoch)
+    checkpointer.save("last", **last_arguments)
+    return path
+
+
 def _to_scalar(value):
     # Convert tensor/number into python float for stable meter/log writing.
     if torch.is_tensor(value):
@@ -115,7 +335,7 @@ def _mraf_scorer_gradient_stats(model):
     def grad_norm(parameter):
         if parameter is None or parameter.grad is None:
             return 0.0
-        return float(parameter.grad.detach().float().norm().item())
+        return float(parameter.grad.detach().float().cpu().norm().item())
 
     return {
         "scorer_first_weight_grad_norm": grad_norm(linears[0].weight),
@@ -4521,6 +4741,7 @@ def _compute_mraf_reliability_terms(
         ),
         "drift_rgb_mean": target_outputs["drift_rgb"].mean(),
         "drift_ir_mean": target_outputs["drift_ir"].mean(),
+        "_target_rgb_for_epoch_metrics": target_rgb.detach(),
         "mraf_target_requires_grad": target_outputs["target"].requires_grad,
         "degrade_mode_counts": degraded_context["degrade_info"]["mode_counts"],
     }
@@ -4627,15 +4848,17 @@ def log_mraf_config(logger, args):
         return
     logger.info(
         "[MRAF] enabled=True hidden_dim=%d dropout=%.6f "
-        "gate_temperature=%.6f gate_fp32=%s gate_base_grad_scale=%.6f "
-        "rel_lambda=%.6f "
+        "gate_temperature=%.6f gate_logit_scale=%.6f gate_fp32=%s "
+        "gate_base_grad_scale=%.6f scorer_lr_multiplier=%.6f rel_lambda=%.6f "
         "target_temperature=%.6f rel_warmup_epoch=%d "
         "balance_lambda=%.6f precision_fusion=False",
         int(getattr(args, "mraf_hidden_dim", 128)),
         float(getattr(args, "mraf_dropout", 0.1)),
         float(getattr(args, "mraf_gate_temperature", 1.0)),
+        float(getattr(args, "mraf_gate_logit_scale", 1.0)),
         bool(getattr(args, "mraf_gate_fp32", False)),
         float(getattr(args, "mraf_gate_base_grad_scale", 1.0)),
+        float(getattr(args, "mraf_scorer_lr_multiplier", 1.0)),
         float(getattr(args, "mraf_rel_lambda", 0.01)),
         float(getattr(args, "mraf_target_temperature", 0.1)),
         int(getattr(args, "mraf_rel_warmup_epoch", 3)),
@@ -4935,6 +5158,17 @@ def do_train(
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
     best_top1 = 0.0
+    mraf_initial_parameters = (
+        _mraf_initial_parameter_snapshot(model) if _mraf_enabled(args) else {}
+    )
+    mraf_epoch_metrics_path = os.path.join(
+        args.output_dir, "mraf_epoch_metrics.tsv"
+    )
+    checkpoint_selection_path = os.path.join(
+        args.output_dir, "checkpoint_selection.tsv"
+    )
+    last_mraf_epoch_row = {}
+    last_eval_metrics = {}
     mtp_text_example_logged = False
     use_uspc = _uspc_enabled(args)
     use_dcalign_lite = _dcalign_lite_enabled(args)
@@ -4959,6 +5193,13 @@ def do_train(
         degraded_mode_counts = {}
         mraf_gate_logits_dtype = None
         mraf_alpha_dtype = None
+        mraf_tensor_stats = {
+            "raw_logit_diff": _DetachedRunningStats(),
+            "scaled_logit_diff": _DetachedRunningStats(),
+            "alpha_rgb": _DetachedRunningStats(),
+            "target_rgb": _DetachedRunningStats(),
+        }
+        mraf_alpha_target_stats = _DetachedPairedStats()
         attr_debug_batches_logged_this_epoch = 0
         uspc_slot_debug_batches_logged_this_epoch = 0
         for meter in meters.values():
@@ -5418,6 +5659,45 @@ def do_train(
                     weighted_rel_value / max(loss_base_value, 1e-12),
                     batch_size,
                 )
+                degraded_ret_for_metrics = degraded_context["degraded_ret"]
+                raw_logits_for_metrics = degraded_ret_for_metrics.get(
+                    "raw_mraf_logits",
+                    degraded_ret_for_metrics.get("mraf_logits"),
+                )
+                scaled_logits_for_metrics = degraded_ret_for_metrics.get(
+                    "scaled_mraf_logits",
+                    raw_logits_for_metrics,
+                )
+                alpha_for_metrics = degraded_ret_for_metrics.get("mraf_alpha")
+                target_for_metrics = mraf_terms.get(
+                    "_target_rgb_for_epoch_metrics"
+                )
+                if torch.is_tensor(raw_logits_for_metrics):
+                    raw_diff = (
+                        raw_logits_for_metrics[:, 0]
+                        - raw_logits_for_metrics[:, 1]
+                    )
+                    mraf_tensor_stats["raw_logit_diff"].update(raw_diff)
+                    mraf_gate_logits_dtype = str(raw_logits_for_metrics.dtype)
+                if torch.is_tensor(scaled_logits_for_metrics):
+                    scaled_diff = (
+                        scaled_logits_for_metrics[:, 0]
+                        - scaled_logits_for_metrics[:, 1]
+                    )
+                    mraf_tensor_stats["scaled_logit_diff"].update(scaled_diff)
+                if torch.is_tensor(alpha_for_metrics):
+                    alpha_rgb_for_metrics = alpha_for_metrics[:, 0]
+                    mraf_tensor_stats["alpha_rgb"].update(alpha_rgb_for_metrics)
+                    mraf_alpha_dtype = str(alpha_for_metrics.dtype)
+                else:
+                    alpha_rgb_for_metrics = None
+                if torch.is_tensor(target_for_metrics):
+                    mraf_tensor_stats["target_rgb"].update(target_for_metrics)
+                    if torch.is_tensor(alpha_rgb_for_metrics):
+                        mraf_alpha_target_stats.update(
+                            alpha_rgb_for_metrics,
+                            target_for_metrics,
+                        )
             elif _mraf_enabled(args):
                 meters["lambda_mraf_rel_cur"].update(
                     _resolve_mraf_rel_lambda(args, epoch),
@@ -6032,6 +6312,12 @@ def do_train(
                     "mraf_rel_lambda": float(
                         getattr(args, "mraf_rel_lambda", 0.01)
                     ),
+                    "mraf_gate_logit_scale": float(
+                        getattr(args, "mraf_gate_logit_scale", 1.0)
+                    ),
+                    "mraf_scorer_lr_multiplier": float(
+                        getattr(args, "mraf_scorer_lr_multiplier", 1.0)
+                    ),
                     "weighted_mraf_rel": (
                         meters["loss_mraf_rel_weighted"].avg
                         if meters["loss_mraf_rel_weighted"].count > 0
@@ -6041,6 +6327,90 @@ def do_train(
                     "alpha_dtype": mraf_alpha_dtype,
                 }
             )
+            base_lr_current, scorer_lr_current = _optimizer_mraf_lrs(
+                optimizer,
+                model,
+                getattr(args, "lr", 0.0),
+            )
+            scorer_parameter_stats = _mraf_scorer_parameter_stats(
+                model,
+                mraf_initial_parameters,
+            )
+            raw_stats = mraf_tensor_stats["raw_logit_diff"]
+            scaled_stats = mraf_tensor_stats["scaled_logit_diff"]
+            alpha_stats = mraf_tensor_stats["alpha_rgb"]
+            target_stats = mraf_tensor_stats["target_rgb"]
+            last_mraf_epoch_row = {
+                "epoch": int(epoch),
+                "base_lr": base_lr_current,
+                "scorer_lr": scorer_lr_current,
+                "scorer_lr_multiplier": float(
+                    getattr(args, "mraf_scorer_lr_multiplier", 1.0)
+                ),
+                "mraf_gate_logit_scale": float(
+                    getattr(args, "mraf_gate_logit_scale", 1.0)
+                ),
+                "mraf_rel_lambda": float(
+                    getattr(args, "mraf_rel_lambda", 0.01)
+                ),
+                "mraf_gate_base_grad_scale": float(
+                    getattr(args, "mraf_gate_base_grad_scale", 1.0)
+                ),
+                "raw_logit_diff_mean": raw_stats.mean,
+                "raw_logit_diff_std": raw_stats.std,
+                "raw_logit_diff_abs_max": raw_stats.abs_max,
+                "scaled_logit_diff_mean": scaled_stats.mean,
+                "scaled_logit_diff_std": scaled_stats.std,
+                "scaled_logit_diff_abs_max": scaled_stats.abs_max,
+                "alpha_rgb_mean": alpha_stats.mean,
+                "alpha_rgb_std": alpha_stats.std,
+                "alpha_rgb_min": alpha_stats.minimum,
+                "alpha_rgb_max": alpha_stats.maximum,
+                "target_rgb_mean": target_stats.mean,
+                "target_rgb_std": target_stats.std,
+                "alpha_target_pearson": mraf_alpha_target_stats.pearson(),
+                "loss_base": (
+                    meters["loss_base"].avg
+                    if meters["loss_base"].count > 0
+                    else None
+                ),
+                "loss_mraf_rel": (
+                    meters["loss_mraf_rel"].avg
+                    if meters["loss_mraf_rel"].count > 0
+                    else None
+                ),
+                "weighted_rel_base_ratio": (
+                    meters["weighted_mraf_rel_over_loss_base"].avg
+                    if meters["weighted_mraf_rel_over_loss_base"].count > 0
+                    else None
+                ),
+                "scorer_first_grad_norm": (
+                    meters["scorer_first_weight_grad_norm"].avg
+                    if meters["scorer_first_weight_grad_norm"].count > 0
+                    else None
+                ),
+                "scorer_last_grad_norm": (
+                    meters["scorer_last_weight_grad_norm"].avg
+                    if meters["scorer_last_weight_grad_norm"].count > 0
+                    else None
+                ),
+                "gate_logits_dtype": mraf_gate_logits_dtype,
+                "alpha_dtype": mraf_alpha_dtype,
+                **scorer_parameter_stats,
+            }
+            if get_rank() == 0:
+                _append_tsv_row(
+                    mraf_epoch_metrics_path,
+                    MRAF_EPOCH_METRIC_FIELDS,
+                    last_mraf_epoch_row,
+                )
+                append_optimizer_param_groups_tsv(
+                    optimizer,
+                    model,
+                    args.output_dir,
+                    epoch=epoch,
+                )
+            mraf_epoch_stats.update(last_mraf_epoch_row)
             logger.info(
                 "[MRAF_EPOCH] epoch=%d stats=%s",
                 int(epoch),
@@ -6104,6 +6474,7 @@ def do_train(
                 eval_metrics = {}
             metric_r1 = float(eval_metrics.get("R1", top1))
             eval_metrics.setdefault("R1", metric_r1)
+            last_eval_metrics = dict(eval_metrics)
 
             torch.cuda.empty_cache()
             if bool(getattr(args, "save_all_epoch_ckpt", False)):
@@ -6132,6 +6503,23 @@ def do_train(
                 best_top1 = top1
                 arguments["epoch"] = epoch
                 checkpointer.save("best", **arguments)
+                if bool(getattr(args, "save_last_checkpoint", False)):
+                    _append_tsv_row(
+                        checkpoint_selection_path,
+                        CHECKPOINT_SELECTION_FIELDS,
+                        {
+                            "checkpoint": "best.pth",
+                            "epoch": int(epoch),
+                            "clean_R1": metric_r1,
+                            "alpha_std": last_mraf_epoch_row.get("alpha_rgb_std"),
+                            "Pearson": last_mraf_epoch_row.get(
+                                "alpha_target_pearson"
+                            ),
+                            "weighted_rel_base_ratio": last_mraf_epoch_row.get(
+                                "weighted_rel_base_ratio"
+                            ),
+                        },
+                    )
                 if bool(getattr(args, "save_metric_best_ckpt", False)):
                     _save_metric_checkpoint(
                         checkpointer=checkpointer,
@@ -6165,6 +6553,29 @@ def do_train(
                 )
 
     if get_rank() == 0:
+        last_checkpoint_path = _save_last_checkpoint(
+            checkpointer,
+            args,
+            arguments,
+            num_epoch,
+        )
+        if last_checkpoint_path is not None:
+            _append_tsv_row(
+                checkpoint_selection_path,
+                CHECKPOINT_SELECTION_FIELDS,
+                {
+                    "checkpoint": "last.pth",
+                    "epoch": int(num_epoch),
+                    "clean_R1": last_eval_metrics.get("R1"),
+                    "alpha_std": last_mraf_epoch_row.get("alpha_rgb_std"),
+                    "Pearson": last_mraf_epoch_row.get(
+                        "alpha_target_pearson"
+                    ),
+                    "weighted_rel_base_ratio": last_mraf_epoch_row.get(
+                        "weighted_rel_base_ratio"
+                    ),
+                },
+            )
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
 
 

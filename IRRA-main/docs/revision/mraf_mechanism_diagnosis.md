@@ -36,6 +36,24 @@ python -B tools/revision/diagnose_mraf_mechanism.py \
   --output-dir /root/autodl-tmp/mraf_diagnosis
 ```
 
+同一 checkpoint 的只读 logit 校准可增加：
+
+```bash
+  --mraf-gate-logit-scale 10
+```
+
+该值在构建模型前只覆盖内存中的配置副本，不修改原 `configs.yaml` 或
+checkpoint。`diagnosis.json`、dry-run 元数据和每个 case 元数据会记录实际
+override；`scenario_gate_statistics.csv` 同时记录 raw/scaled logits 的
+FP32 统计、各自 dtype 以及实际 scale。旧的 `mraf_logits` 继续解释为 raw
+logits，避免历史分析含义漂移。
+
+上一轮 S0–S5 结果表明 Pearson 可以上升而 alpha 幅度仍约低于目标 50 倍；
+因此相关性只回答“方向是否一致”，不能回答“权重是否产生实际变化”。新的
+幅度流水线同时检查 alpha std、raw/scaled logit gap、缺失模态绝对权重、
+noise/blur 权重下降和融合路径敏感性。诊断阈值仍只用于筛选，不是训练行为
+或论文结论。
+
 先检查目录发现结果、但不加载模型和不创建输出目录：
 
 ```bash

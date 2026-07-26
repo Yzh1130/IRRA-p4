@@ -116,6 +116,9 @@ class IRRA(nn.Module):
                 gate_temperature=float(
                     getattr(args, "mraf_gate_temperature", 1.0)
                 ),
+                gate_logit_scale=float(
+                    getattr(args, "mraf_gate_logit_scale", 1.0)
+                ),
                 gate_fp32=bool(getattr(args, "mraf_gate_fp32", False)),
                 gate_base_grad_scale=float(
                     getattr(args, "mraf_gate_base_grad_scale", 1.0)
@@ -1725,6 +1728,8 @@ class IRRA(nn.Module):
                     "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
                     "mraf_alpha_ir": mraf_aux["alpha_ir"],
                     "mraf_logits": mraf_aux["logits"],
+                    "raw_mraf_logits": mraf_aux["raw_logits"],
+                    "scaled_mraf_logits": mraf_aux["scaled_logits"],
                 }
             )
         return outputs
@@ -2076,6 +2081,8 @@ class IRRA(nn.Module):
                         "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
                         "mraf_alpha_ir": mraf_aux["alpha_ir"],
                         "mraf_logits": mraf_aux["logits"],
+                        "raw_mraf_logits": mraf_aux["raw_logits"],
+                        "scaled_mraf_logits": mraf_aux["scaled_logits"],
                     }
                 )
             if self._use_diag_gaussian_global():
@@ -2330,6 +2337,8 @@ class IRRA(nn.Module):
                     "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
                     "mraf_alpha_ir": mraf_aux["alpha_ir"],
                     "mraf_logits": mraf_aux["logits"],
+                    "raw_mraf_logits": mraf_aux["raw_logits"],
+                    "scaled_mraf_logits": mraf_aux["scaled_logits"],
                 }
             )
         if hn_fused_det_feat is not None:

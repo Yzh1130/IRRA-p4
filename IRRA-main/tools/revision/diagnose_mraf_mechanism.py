@@ -53,7 +53,16 @@ from utils.metrics import Evaluator
 
 SUPPORTED_CASES = ("mraf_only", "mdrc_mraf", "mdrc_mraf_norel")
 STAT_SUFFIXES = ("mean", "std", "min", "p10", "p50", "p90", "max")
-GATE_VALUE_NAMES = ("logit_rgb", "logit_ir", "logit_gap", "alpha_rgb", "alpha_ir")
+GATE_VALUE_NAMES = (
+    "logit_rgb",
+    "logit_ir",
+    "logit_gap",
+    "scaled_logit_rgb",
+    "scaled_logit_ir",
+    "scaled_logit_gap",
+    "alpha_rgb",
+    "alpha_ir",
+)
 GRADIENT_PARAMETER_ROLES = (
     "scorer_first_weight",
     "scorer_first_bias",
@@ -106,7 +115,9 @@ SCENARIO_GATE_FIELDS = (
     "num_samples",
     "statistics_dtype",
     "raw_logits_dtype",
+    "scaled_logits_dtype",
     "raw_alpha_dtype",
+    "mraf_gate_logit_scale",
 ) + tuple(
     f"{value_name}_{suffix}"
     for value_name in GATE_VALUE_NAMES
@@ -208,6 +219,15 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive finite float, got {value!r}"
+        )
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -276,6 +296,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "positive microbatch size used only by gradient diagnostics "
             "(default: 4)"
+        ),
+    )
+    parser.add_argument(
+        "--mraf-gate-logit-scale",
+        "--mraf_gate_logit_scale",
+        dest="mraf_gate_logit_scale",
+        type=_positive_float,
+        default=None,
+        help=(
+            "read-only override applied before model construction; the saved "
+            "configs.yaml and checkpoint are never modified"
         ),
     )
     parser.add_argument(
@@ -736,16 +767,23 @@ def force_mraf_gate(
         if not return_aux:
             return fused
         temperature = float(getattr(self, "gate_temperature", 1.0))
-        logits = (
+        scaled_logits = (
             torch.log(alpha_fp32.clamp_min(torch.finfo(torch.float32).tiny))
             * temperature
         )
+        gate_logit_scale = float(
+            getattr(self, "gate_logit_scale", 1.0)
+        )
+        raw_logits = scaled_logits / gate_logit_scale
         return fused, {
             "fused": fused,
             "alpha_rgb": alpha_for_fusion[:, 0:1],
             "alpha_ir": alpha_for_fusion[:, 1:2],
             "alpha": alpha_for_fusion,
-            "logits": logits,
+            "logits": raw_logits,
+            "raw_logits": raw_logits,
+            "scaled_logits": scaled_logits,
+            "gate_logit_scale": gate_logit_scale,
         }
 
     mraf_module.forward = MethodType(_forced_forward, mraf_module)
@@ -969,6 +1007,15 @@ def _require_eval_outputs(outputs: Mapping[str, torch.Tensor]) -> None:
         raise RuntimeError(f"MRAF eval outputs are missing keys: {missing}")
 
 
+def _mraf_logit_outputs(
+    outputs: Mapping[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return explicit raw/scaled gate logits with legacy-checkpoint fallback."""
+    raw_logits = outputs.get("raw_mraf_logits", outputs["mraf_logits"])
+    scaled_logits = outputs.get("scaled_mraf_logits", raw_logits)
+    return raw_logits, scaled_logits
+
+
 def _collect_clean_cache(
     model: nn.Module,
     img_loader: Iterable,
@@ -995,6 +1042,7 @@ def _collect_clean_cache(
                 return_local_tokens=True,
             )
         _require_eval_outputs(outputs)
+        raw_logits, scaled_logits = _mraf_logit_outputs(outputs)
         pid_tensor = _sample_ids(pids)
         pid_batches.append(pid_tensor)
         feature_batches.append(
@@ -1015,9 +1063,11 @@ def _collect_clean_cache(
                 "rgb_feature": outputs["rgb_global_feat"].detach().cpu(),
                 "ir_feature": outputs["thermal_global_feat"].detach().cpu(),
                 "alpha": outputs["mraf_alpha"].detach().cpu().to(torch.float32),
-                "logits": outputs["mraf_logits"].detach().cpu().to(torch.float32),
+                "raw_logits": raw_logits.detach().cpu().to(torch.float32),
+                "scaled_logits": scaled_logits.detach().cpu().to(torch.float32),
                 "raw_alpha_dtype": str(outputs["mraf_alpha"].dtype),
-                "raw_logits_dtype": str(outputs["mraf_logits"].dtype),
+                "raw_logits_dtype": str(raw_logits.dtype),
+                "scaled_logits_dtype": str(scaled_logits.dtype),
             }
         )
         if batch_index + 1 >= max_batches:
@@ -1033,6 +1083,9 @@ def _concat_records(records: Sequence[Mapping[str, torch.Tensor]]) -> Dict[str, 
         "logit_rgb",
         "logit_ir",
         "logit_gap",
+        "scaled_logit_rgb",
+        "scaled_logit_ir",
+        "scaled_logit_gap",
         "alpha_rgb",
         "alpha_ir",
         "drift_rgb",
@@ -1071,13 +1124,18 @@ def _record_from_outputs(
         degraded_ir=degraded_ir,
         target_temperature=target_temperature,
     )
-    logits = degraded_outputs["mraf_logits"].detach().to(torch.float32).cpu()
+    raw_logits, scaled_logits = _mraf_logit_outputs(degraded_outputs)
+    raw_logits = raw_logits.detach().to(torch.float32).cpu()
+    scaled_logits = scaled_logits.detach().to(torch.float32).cpu()
     alpha = degraded_outputs["mraf_alpha"].detach().to(torch.float32).cpu()
     return {
         "sample_ids": sample_ids.detach().cpu(),
-        "logit_rgb": logits[:, 0],
-        "logit_ir": logits[:, 1],
-        "logit_gap": logits[:, 0] - logits[:, 1],
+        "logit_rgb": raw_logits[:, 0],
+        "logit_ir": raw_logits[:, 1],
+        "logit_gap": raw_logits[:, 0] - raw_logits[:, 1],
+        "scaled_logit_rgb": scaled_logits[:, 0],
+        "scaled_logit_ir": scaled_logits[:, 1],
+        "scaled_logit_gap": scaled_logits[:, 0] - scaled_logits[:, 1],
         "alpha_rgb": alpha[:, 0],
         "alpha_ir": alpha[:, 1],
         "drift_rgb": target_outputs["drift_rgb"].detach().to(torch.float32).cpu(),
@@ -1104,7 +1162,9 @@ def _clean_record(
         "rgb_global_feat": cache_item["rgb_feature"],
         "thermal_global_feat": cache_item["ir_feature"],
         "mraf_alpha": cache_item["alpha"],
-        "mraf_logits": cache_item["logits"],
+        "mraf_logits": cache_item["raw_logits"],
+        "raw_mraf_logits": cache_item["raw_logits"],
+        "scaled_mraf_logits": cache_item["scaled_logits"],
     }
     return _record_from_outputs(
         sample_ids=cache_item["sample_ids"],
@@ -1127,7 +1187,7 @@ def _collect_degraded_scenario(
     device: torch.device,
     degrade_seed: int,
     target_temperature: float,
-) -> Tuple[Dict[str, torch.Tensor], str, str]:
+) -> Tuple[Dict[str, torch.Tensor], str, str, str]:
     model.args.eval_degrade_mode = degrade_mode
     model.args.eval_degrade_strength = float(strength)
     model.args.eval_degrade_blur_kernel = int(blur_kernel)
@@ -1139,6 +1199,7 @@ def _collect_degraded_scenario(
     )
     records: List[Dict[str, torch.Tensor]] = []
     raw_logits_dtypes = set()
+    scaled_logits_dtypes = set()
     raw_alpha_dtypes = set()
     for batch_index, data in enumerate(img_loader):
         if batch_index >= len(clean_cache):
@@ -1169,7 +1230,9 @@ def _collect_degraded_scenario(
                 degraded_ir,
                 return_local_tokens=True,
             )
-        raw_logits_dtypes.add(str(outputs["mraf_logits"].dtype))
+        raw_logits, scaled_logits = _mraf_logit_outputs(outputs)
+        raw_logits_dtypes.add(str(raw_logits.dtype))
+        scaled_logits_dtypes.add(str(scaled_logits.dtype))
         raw_alpha_dtypes.add(str(outputs["mraf_alpha"].dtype))
         records.append(
             _record_from_outputs(
@@ -1188,6 +1251,7 @@ def _collect_degraded_scenario(
     return (
         _concat_records(records),
         ",".join(sorted(raw_logits_dtypes)),
+        ",".join(sorted(scaled_logits_dtypes)),
         ",".join(sorted(raw_alpha_dtypes)),
     )
 
@@ -1197,7 +1261,9 @@ def _gate_statistics_row(
     scenario: str,
     record: Mapping[str, torch.Tensor],
     raw_logits_dtype: str,
+    scaled_logits_dtype: str,
     raw_alpha_dtype: str,
+    mraf_gate_logit_scale: float,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "case": case,
@@ -1205,7 +1271,9 @@ def _gate_statistics_row(
         "num_samples": int(record["alpha_rgb"].numel()),
         "statistics_dtype": str(torch.float32),
         "raw_logits_dtype": raw_logits_dtype,
+        "scaled_logits_dtype": scaled_logits_dtype,
         "raw_alpha_dtype": raw_alpha_dtype,
+        "mraf_gate_logit_scale": float(mraf_gate_logit_scale),
     }
     for value_name in GATE_VALUE_NAMES:
         row.update(summarize_vector(record[value_name], value_name))
@@ -1305,8 +1373,14 @@ def collect_scenario_diagnostics(
     clean_logits_dtype = ",".join(
         sorted({item["raw_logits_dtype"] for item in clean_cache})
     )
+    clean_scaled_logits_dtype = ",".join(
+        sorted({item["scaled_logits_dtype"] for item in clean_cache})
+    )
     clean_alpha_dtype = ",".join(
         sorted({item["raw_alpha_dtype"] for item in clean_cache})
+    )
+    mraf_gate_logit_scale = float(
+        getattr(model.args, "mraf_gate_logit_scale", 1.0)
     )
 
     gate_rows: List[Dict[str, Any]] = []
@@ -1317,9 +1391,15 @@ def collect_scenario_diagnostics(
         if scenario_name == "clean":
             record = clean
             raw_logits_dtype = clean_logits_dtype
+            scaled_logits_dtype = clean_scaled_logits_dtype
             raw_alpha_dtype = clean_alpha_dtype
         else:
-            record, raw_logits_dtype, raw_alpha_dtype = _collect_degraded_scenario(
+            (
+                record,
+                raw_logits_dtype,
+                scaled_logits_dtype,
+                raw_alpha_dtype,
+            ) = _collect_degraded_scenario(
                 model=model,
                 img_loader=img_loader,
                 txt_loader=txt_loader,
@@ -1354,7 +1434,9 @@ def collect_scenario_diagnostics(
                 scenario=scenario_name,
                 record=record,
                 raw_logits_dtype=raw_logits_dtype,
+                scaled_logits_dtype=scaled_logits_dtype,
                 raw_alpha_dtype=raw_alpha_dtype,
+                mraf_gate_logit_scale=mraf_gate_logit_scale,
             )
         )
         target_rows.append(
@@ -1752,6 +1834,7 @@ def _load_config_args(
     artifact: RunArtifacts,
     data_root: Path,
     training: bool,
+    mraf_gate_logit_scale: Optional[float] = None,
 ) -> Any:
     args = copy.deepcopy(load_train_configs(str(artifact.config_path)))
     args.root_dir = str(data_root.resolve())
@@ -1759,6 +1842,8 @@ def _load_config_args(
     args.distributed = False
     if not bool(getattr(args, "mraf_enabled", False)):
         raise ValueError(f"Config does not enable MRAF: {artifact.config_path}")
+    if mraf_gate_logit_scale is not None:
+        args.mraf_gate_logit_scale = float(mraf_gate_logit_scale)
     return args
 
 
@@ -1774,10 +1859,21 @@ def build_case_resources(
     artifact: RunArtifacts,
     data_root: Path,
     device: torch.device,
+    mraf_gate_logit_scale: Optional[float] = None,
 ) -> Tuple[Any, nn.Module, Iterable, Iterable, Iterable, Mapping[str, Any], int]:
-    train_args = _load_config_args(artifact, data_root, training=True)
+    train_args = _load_config_args(
+        artifact,
+        data_root,
+        training=True,
+        mraf_gate_logit_scale=mraf_gate_logit_scale,
+    )
     train_loader, _, _, train_num_classes = build_dataloader(train_args)
-    eval_args = _load_config_args(artifact, data_root, training=False)
+    eval_args = _load_config_args(
+        artifact,
+        data_root,
+        training=False,
+        mraf_gate_logit_scale=mraf_gate_logit_scale,
+    )
     img_loader, txt_loader, eval_num_classes = build_dataloader(eval_args)
     if int(train_num_classes) != int(eval_num_classes):
         raise RuntimeError(
@@ -2148,6 +2244,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "gradient_microbatch_size": int(
                         args.gradient_microbatch_size
                     ),
+                    "mraf_gate_logit_scale_override": (
+                        None
+                        if args.mraf_gate_logit_scale is None
+                        else float(args.mraf_gate_logit_scale)
+                    ),
                     "artifacts": [artifact.serializable() for artifact in artifacts],
                 },
                 indent=2,
@@ -2203,6 +2304,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 artifact,
                 data_root,
                 device,
+                mraf_gate_logit_scale=args.mraf_gate_logit_scale,
             )
             case_checkpoint = None
 
@@ -2258,6 +2360,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "gradient_microbatch_size": int(
                     args.gradient_microbatch_size
                 ),
+                "mraf_gate_logit_scale": float(
+                    getattr(train_args, "mraf_gate_logit_scale", 1.0)
+                ),
+                "mraf_gate_logit_scale_override": (
+                    None
+                    if args.mraf_gate_logit_scale is None
+                    else float(args.mraf_gate_logit_scale)
+                ),
             }
         finally:
             if case_model is not None:
@@ -2281,6 +2391,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_batches": int(args.max_batches),
         "gradient_batches": int(args.gradient_batches),
         "gradient_microbatch_size": int(args.gradient_microbatch_size),
+        "mraf_gate_logit_scale_override": (
+            None
+            if args.mraf_gate_logit_scale is None
+            else float(args.mraf_gate_logit_scale)
+        ),
         "run_root": str(run_root) if run_root is not None else None,
         "input_mode": input_mode,
         "data_root": str(data_root),
