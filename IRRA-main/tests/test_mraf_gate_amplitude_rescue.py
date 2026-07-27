@@ -18,9 +18,11 @@ from processor.processor import (
     MRAF_EPOCH_METRIC_FIELDS,
     _DetachedPairedStats,
     _DetachedRunningStats,
+    _append_tsv_row,
     _mraf_initial_parameter_snapshot,
     _mraf_scorer_parameter_stats,
     _save_last_checkpoint,
+    _validate_tsv_schema,
 )
 from solver.build import (
     OPTIMIZER_PARAM_GROUP_FIELDS,
@@ -136,6 +138,239 @@ def _passing_unit():
             "fusion_path_sensitive": True,
         },
     }
+
+
+def _reference_tsv(
+    root,
+    relative="screen/rescue_screen_summary.tsv",
+    *,
+    clean_field="clean_R1",
+    degraded_field="key_degraded_mean_R1",
+    clean="49.8795",
+    degraded="41.7958",
+    bom=False,
+    candidate="S4",
+):
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "\ufeff" if bom else ""
+    path.write_text(
+        f"{prefix}candidate\t{clean_field}\t{degraded_field}\n"
+        f"{candidate}\t{clean}\t{degraded}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _legacy_epoch_text():
+    original = []
+    for field in MRAF_EPOCH_METRIC_FIELDS:
+        if field == "target_rgb_mean":
+            original.append("target_rgb_meantarget_rgb_std")
+        elif field == "target_rgb_std":
+            continue
+        elif field == "scorer_first_weight_norm":
+            original.append(
+                "scorer_first_weight_normscorer_last_weight_norm"
+            )
+        elif field == "scorer_last_weight_norm":
+            continue
+        else:
+            original.append(field)
+    values = [str(index) for index in range(len(MRAF_EPOCH_METRIC_FIELDS))]
+    return "\t".join(original) + "\n" + "\t".join(values) + "\n"
+
+
+def _write_resume_fixture(tmp_path, *, manifest_path_style="native"):
+    run_root = tmp_path / "existing_run"
+    reference_root = tmp_path / "reference"
+    data_root = tmp_path / "data"
+    base_config = tmp_path / "base_configs.yaml"
+    run_root.mkdir()
+    data_root.mkdir()
+    _reference_tsv(reference_root)
+    base_config.write_text("placeholder: true\n", encoding="utf-8")
+
+    def manifest_path(path):
+        if manifest_path_style == "native":
+            return str(path.resolve())
+        drive = path.drive.rstrip(":").lower()
+        suffix = path.resolve().as_posix().split(":/", 1)[-1]
+        return f"/mnt/{drive}/{suffix}"
+
+    manifest = {
+        "PIPELINE_ID": "mraf_gate_amplitude_rescue_v3",
+        "git_branch": "experiment/mraf-gate-amplitude-rescue-v3",
+        "git_head": rescue.EXPECTED_ORIGINAL_COMMIT,
+        "seed": "1",
+        "degrade_seed": "2026",
+        "device": "0",
+        "data_root": manifest_path(data_root),
+        "base_config": manifest_path(base_config),
+        "reference_screen_root": manifest_path(reference_root),
+        "reference_run_root": manifest_path(tmp_path / "old_run"),
+        "auto_continue": "true",
+        "shutdown_on_success": "false",
+        "mock": "false",
+    }
+    (tmp_path / "old_run").mkdir()
+    (run_root / "experiment_manifest.txt").write_bytes(
+        "".join(f"{key}={value}\n" for key, value in manifest.items()).encode(
+            "utf-8"
+        )
+    )
+    (run_root / "status.txt").write_text(
+        "STATUS=FAILED\nFAILED_STAGE=amplitude_screen\nEXIT_CODE=1\n",
+        encoding="utf-8",
+    )
+    status_rows = ["candidate\tcheckpoint\tstatus\texit_code\tfailed_stage"]
+    for candidate, matrix in rescue.STAGE1_MATRIX.items():
+        train_dir = run_root / "stage1" / "train" / candidate
+        train_dir.mkdir(parents=True)
+        for name in ("configs.yaml", "best.pth", "last.pth"):
+            (train_dir / name).write_text("complete\n", encoding="utf-8")
+        for checkpoint in rescue.CHECKPOINT_KINDS:
+            status_rows.append(f"{candidate}\t{checkpoint}\tCOMPLETED\t0\tNONE")
+            unit = run_root / "stage1" / "units" / f"{candidate}_{checkpoint}"
+            diagnostic = unit / "diagnostics"
+            diagnostic.mkdir(parents=True)
+            config = {
+                **rescue.RESUME_PROTOCOL,
+                **matrix,
+            }
+            (unit / "configs.yaml").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            (unit / "checkpoint.pth").write_text(
+                "checkpoint\n", encoding="utf-8"
+            )
+            (unit / "train.log").write_text("complete\n", encoding="utf-8")
+            (unit / "mraf_epoch_metrics.tsv").write_text(
+                _legacy_epoch_text(), encoding="utf-8"
+            )
+            (unit / "checkpoint_selection.tsv").write_text(
+                "checkpoint\tepoch\tclean_R1\talpha_std\tPearson\t"
+                "weighted_rel_base_ratio\n"
+                f"{checkpoint}.pth\t1\t49.9\t0.006\t0.5\t0.01\n",
+                encoding="utf-8",
+            )
+            (unit / "unit.json").write_text(
+                json.dumps(
+                    {
+                        "candidate": candidate,
+                        "checkpoint": checkpoint,
+                        **matrix,
+                        "has_nan": False,
+                        "has_inf": False,
+                        "has_oom": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for scenario in rescue.SCREEN_SCENARIOS:
+                score = unit / "eval" / scenario / "scores.json"
+                score.parent.mkdir(parents=True)
+                score.write_text(
+                    json.dumps(
+                        {
+                            "metrics": {
+                                "R1": 49.9 if scenario == "clean" else 42.0,
+                                "R5": 70.0,
+                                "R10": 80.0,
+                                "mAP": 45.0,
+                                "mINP": 30.0,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            diagnosis_payload = {
+                "cases": {
+                    candidate: {
+                        "alpha_rgb_std": 0.006,
+                        "alpha_target_pearson_degraded_scenarios": 0.5,
+                        "weighted_rel_base_ratio_median": 0.01,
+                        "fusion_path_sensitive": True,
+                        "alarms": {"PARAMETER_NOT_UPDATED": False},
+                    }
+                }
+            }
+            (diagnostic / "diagnosis.json").write_text(
+                json.dumps(diagnosis_payload), encoding="utf-8"
+            )
+            with (diagnostic / "scenario_gate_statistics.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=(
+                        "scenario",
+                        "alpha_rgb_mean",
+                        "alpha_ir_mean",
+                        "logit_gap_std",
+                        "scaled_logit_gap_std",
+                        "raw_logits_dtype",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "scenario": "clean",
+                            "alpha_rgb_mean": 0.5,
+                            "alpha_ir_mean": 0.5,
+                            "logit_gap_std": 0.02,
+                            "scaled_logit_gap_std": 0.02,
+                            "raw_logits_dtype": "torch.float32",
+                        },
+                        {
+                            "scenario": "rgb_missing",
+                            "alpha_rgb_mean": 0.3,
+                            "alpha_ir_mean": 0.7,
+                            "logit_gap_std": 0.02,
+                            "scaled_logit_gap_std": 0.02,
+                            "raw_logits_dtype": "torch.float32",
+                        },
+                        {
+                            "scenario": "ir_missing",
+                            "alpha_rgb_mean": 0.7,
+                            "alpha_ir_mean": 0.3,
+                            "logit_gap_std": 0.02,
+                            "scaled_logit_gap_std": 0.02,
+                            "raw_logits_dtype": "torch.float32",
+                        },
+                    ]
+                )
+            with (diagnostic / "gate_direction_statistics.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=("scenario", "degraded_alpha_delta_mean"),
+                )
+                writer.writeheader()
+                for scenario in (
+                    "rgb_noise_0.10",
+                    "ir_noise_0.10",
+                    "rgb_blur_k7",
+                    "ir_blur_k7",
+                ):
+                    writer.writerow(
+                        {
+                            "scenario": scenario,
+                            "degraded_alpha_delta_mean": -0.03,
+                        }
+                    )
+            (diagnostic / "gradient_diagnostics.csv").write_text(
+                "weighted_mraf_rel_over_loss_base\n0.01\n", encoding="utf-8"
+            )
+            (diagnostic / "fusion_path_check.json").write_text(
+                '{"sensitive": true}\n', encoding="utf-8"
+            )
+    (run_root / "candidate_status.tsv").write_text(
+        "\n".join(status_rows) + "\n", encoding="utf-8"
+    )
+    return run_root, reference_root
 
 
 def test_stage1_matrix_is_exact():
@@ -494,6 +729,8 @@ def test_pipeline_contains_safety_gates_and_read_only_calibration():
     assert "CONFIRMATION_FAILED" in script
     assert 'if [[ "$shutdown_on_success" == "true"' in script
     assert "git add ." not in script and "git add -A" not in script
+    assert 'mktemp "${status_file}.tmp.XXXXXX"' in script
+    assert 'mv -f "$temporary_status" "$status_file"' in script
 
 
 def test_pipeline_mock_never_calls_training_or_shutdown():
@@ -535,3 +772,358 @@ def test_pipeline_dry_run_writes_nothing():
     )
     assert "No directory, train.py, test.py, GPU" in completed.stdout
     assert "mraf_gate_amplitude_mock_DRY_RUN" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("relative", "clean_field", "degraded_field"),
+    [
+        ("screen/rescue_screen_summary.tsv", "clean_R1", "key_degraded_mean_R1"),
+        ("rescue_screen_summary.tsv", "clean_r1", "degraded_mean_R1"),
+        ("screen/rescue_screen_metrics.tsv", "clean_rank1", "mean_degraded_R1"),
+        ("rescue_screen_metrics.tsv", "R1_clean", "key_degraded_R1_mean"),
+    ],
+)
+def test_reference_s4_real_paths_and_aliases(
+    tmp_path, relative, clean_field, degraded_field
+):
+    source = _reference_tsv(
+        tmp_path,
+        relative,
+        clean_field=clean_field,
+        degraded_field=degraded_field,
+    )
+    result = rescue.load_reference_s4(tmp_path)
+    assert result["clean_R1"] == pytest.approx(49.8795)
+    assert result["key_degraded_mean_R1"] == pytest.approx(41.7958)
+    assert result["degraded_mean_R1"] == pytest.approx(41.7958)
+    assert result["source"] == str(source.resolve())
+
+
+def test_reference_s4_bom_whitespace_and_exact_candidate(tmp_path):
+    path = _reference_tsv(tmp_path, bom=True, candidate=" S4 ")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("S40\t99\t99\n")
+    result = rescue.load_reference_s4(tmp_path)
+    assert result["clean_R1"] == pytest.approx(49.8795)
+
+
+@pytest.mark.parametrize(
+    ("clean", "degraded", "message"),
+    [
+        ("NaN", "41.7", "must be finite"),
+        ("49.8", "Inf", "must be finite"),
+        ("bad", "41.7", "cannot be converted"),
+    ],
+)
+def test_reference_s4_rejects_nonfinite_and_invalid_values(
+    tmp_path, clean, degraded, message
+):
+    _reference_tsv(tmp_path, clean=clean, degraded=degraded)
+    with pytest.raises(ValueError, match=message):
+        rescue.load_reference_s4(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("header", "row", "expected"),
+    [
+        ("candidate\tkey_degraded_mean_R1", "S4\t41.7", "clean field missing"),
+        ("candidate\tclean_R1", "S4\t49.8", "degraded field missing"),
+        (
+            "candidate\tclean_R1\tkey_degraded_mean_R1",
+            "S40\t49.8\t41.7",
+            "exact candidate 'S4' was not found",
+        ),
+    ],
+)
+def test_reference_s4_errors_are_actionable(tmp_path, header, row, expected):
+    path = tmp_path / "screen" / "rescue_screen_summary.tsv"
+    path.parent.mkdir()
+    path.write_text(f"{header}\n{row}\n", encoding="utf-8")
+    with pytest.raises(ValueError) as captured:
+        rescue.load_reference_s4(tmp_path)
+    message = str(captured.value)
+    assert expected in message
+    assert "reference_root=" in message
+    assert "searched_paths=" in message
+    assert "headers=" in message
+    assert path.name in message
+
+
+def test_reference_summary_preferred_over_metrics(tmp_path):
+    _reference_tsv(
+        tmp_path,
+        "screen/rescue_screen_metrics.tsv",
+        clean="1",
+        degraded="2",
+    )
+    _reference_tsv(
+        tmp_path,
+        "screen/rescue_screen_summary.tsv",
+        clean="49.8795",
+        degraded="41.7958",
+    )
+    assert rescue.load_reference_s4(tmp_path)["clean_R1"] == pytest.approx(
+        49.8795
+    )
+
+
+def test_mraf_epoch_metric_schema_and_atomic_standard_write(tmp_path):
+    required = {
+        "target_rgb_mean",
+        "target_rgb_std",
+        "scorer_first_weight_norm",
+        "scorer_last_weight_norm",
+        "scorer_parameter_delta_from_initial",
+    }
+    assert len(MRAF_EPOCH_METRIC_FIELDS) == len(set(MRAF_EPOCH_METRIC_FIELDS))
+    assert required <= set(MRAF_EPOCH_METRIC_FIELDS)
+    assert _validate_tsv_schema(
+        MRAF_EPOCH_METRIC_FIELDS, require_mraf_epoch_fields=True
+    ) == MRAF_EPOCH_METRIC_FIELDS
+    path = tmp_path / "mraf_epoch_metrics.tsv"
+    row = {field: index for index, field in enumerate(MRAF_EPOCH_METRIC_FIELDS)}
+    _append_tsv_row(str(path), MRAF_EPOCH_METRIC_FIELDS, row)
+    _append_tsv_row(str(path), MRAF_EPOCH_METRIC_FIELDS, row)
+    raw = path.read_bytes()
+    assert b"\t" in raw and b"\r\n" not in raw
+    with path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle, delimiter="\t"))
+    assert tuple(rows[0]) == MRAF_EPOCH_METRIC_FIELDS
+    assert all(len(written) == len(MRAF_EPOCH_METRIC_FIELDS) for written in rows)
+    assert not list(tmp_path.glob(".mraf_epoch_metrics.tsv.*.tmp"))
+
+
+def test_mraf_epoch_metric_writer_rejects_bad_schema_and_extra_field(tmp_path):
+    with pytest.raises(ValueError, match="duplicate"):
+        _validate_tsv_schema(("epoch", "epoch"))
+    with pytest.raises(ValueError, match="empty"):
+        _validate_tsv_schema(("epoch", ""))
+    with pytest.raises(ValueError, match="missing required"):
+        _validate_tsv_schema(("epoch",), require_mraf_epoch_fields=True)
+    row = {field: 0 for field in MRAF_EPOCH_METRIC_FIELDS}
+    row["unexpected"] = 1
+    with pytest.raises(ValueError, match="outside schema"):
+        _append_tsv_row(
+            str(tmp_path / "metrics.tsv"), MRAF_EPOCH_METRIC_FIELDS, row
+        )
+
+
+def test_legacy_tsv_repairs_two_known_merges_read_only(tmp_path):
+    path = tmp_path / "mraf_epoch_metrics.tsv"
+    path.write_text(_legacy_epoch_text(), encoding="utf-8")
+    before_bytes = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+    result = rescue.read_tsv_compatible(path)
+    assert result.legacy_header_repaired is True
+    assert "target_rgb_mean" in result.fields
+    assert "target_rgb_std" in result.fields
+    assert "scorer_first_weight_norm" in result.fields
+    assert "scorer_last_weight_norm" in result.fields
+    assert len(result.fields) == len(MRAF_EPOCH_METRIC_FIELDS)
+    assert len(result.rows[0]) == len(result.fields)
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime
+
+
+def test_standard_tsv_does_not_trigger_legacy_repair(tmp_path):
+    path = tmp_path / "new.tsv"
+    rescue._write_tsv(
+        path,
+        MRAF_EPOCH_METRIC_FIELDS,
+        [{field: index for index, field in enumerate(MRAF_EPOCH_METRIC_FIELDS)}],
+    )
+    result = rescue.read_tsv_compatible(path)
+    assert result.legacy_header_repaired is False
+    assert result.fields == MRAF_EPOCH_METRIC_FIELDS
+
+
+def test_screen_reference_failure_does_not_publish_summary_outputs(tmp_path):
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    output = tmp_path / "output"
+    with pytest.raises(ValueError):
+        rescue.summarize_screen(tmp_path / "units", reference, output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "unknownmerged\tother\n1\t2\t3\n",
+        "a\tb\n1\t2\n3\n",
+    ],
+)
+def test_legacy_tsv_rejects_unknown_or_inconsistent_schema(tmp_path, text):
+    path = tmp_path / "bad.tsv"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError):
+        rescue.read_tsv_compatible(path)
+
+
+def test_resume_plan_accepts_complete_failed_amplitude_fixture(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    plan = rescue.validate_resume_plan(
+        run_root, ROOT.parent, rescue.EXPECTED_ORIGINAL_COMMIT
+    )
+    assert plan.valid, plan.reasons
+    assert plan.next_stage == "amplitude_screen"
+    assert plan.training_candidates_skipped == 4
+    assert plan.checkpoint_units_skipped == 8
+    assert plan.evaluations_skipped == 8
+    assert plan.diagnostics_skipped == 8
+    assert "STAGE1_CHECKPOINT_UNITS_SKIPPED=8" in plan.machine_lines()
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected"),
+    [
+        (
+            "stage1/units/A10_best/checkpoint.pth",
+            "missing or empty",
+        ),
+        (
+            "stage1/units/A10_best/eval/clean/scores.json",
+            "missing non-empty evaluation",
+        ),
+        (
+            "stage1/units/A10_best/diagnostics/diagnosis.json",
+            "missing or empty diagnostic",
+        ),
+    ],
+)
+def test_resume_plan_rejects_missing_artifacts(tmp_path, relative, expected):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    target = run_root / relative
+    target.unlink()
+    plan = rescue.validate_resume_plan(
+        run_root, ROOT.parent, rescue.EXPECTED_ORIGINAL_COMMIT
+    )
+    assert not plan.valid
+    assert expected in "\n".join(plan.reasons)
+
+
+def test_resume_plan_rejects_seed_matrix_and_arbitrary_cross_commit(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    manifest = run_root / "experiment_manifest.txt"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("seed=1", "seed=2"),
+        encoding="utf-8",
+    )
+    metadata = run_root / "stage1/units/A10_best/unit.json"
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["mraf_scorer_lr_multiplier"] = 999
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    plan = rescue.validate_resume_plan(
+        run_root,
+        ROOT.parent,
+        "descendant",
+        ancestry_checker=lambda *_: True,
+        changed_paths_reader=lambda *_: ("IRRA-main/model/build.py",),
+    )
+    errors = "\n".join(plan.reasons)
+    assert not plan.valid
+    assert "seed must remain 1" in errors
+    assert "fixed Stage-1 matrix" in errors
+    assert "non-hotfix paths" in errors
+
+
+def test_resume_plan_allows_strict_hotfix_descendant_and_records_history(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    plan = rescue.validate_resume_plan(
+        run_root,
+        ROOT.parent,
+        "hotfix-descendant",
+        ancestry_checker=lambda *_: True,
+        changed_paths_reader=lambda *_: tuple(rescue.ALLOWED_HOTFIX_PATHS),
+    )
+    assert plan.valid, plan.reasons
+    manifest_before = (run_root / "experiment_manifest.txt").read_bytes()
+    rescue.record_resume_history(run_root, plan)
+    assert (run_root / "experiment_manifest.txt").read_bytes() == manifest_before
+    rows = rescue.read_tsv_compatible(run_root / "resume_history.tsv").rows
+    assert rows[-1]["original_commit"] == rescue.EXPECTED_ORIGINAL_COMMIT
+    assert rows[-1]["resume_commit"] == "hotfix-descendant"
+    assert rows[-1]["old_status"] == "FAILED"
+    assert rows[-1]["old_failed_stage"] == "amplitude_screen"
+
+
+def _as_wsl_path(path):
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    suffix = resolved.as_posix().split(":/", 1)[-1]
+    return f"/mnt/{drive}/{suffix}"
+
+
+def test_pipeline_resume_dry_run_is_read_only_and_machine_readable(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path, manifest_path_style="wsl")
+    status_before = (run_root / "status.txt").read_bytes()
+    manifest_before = (run_root / "experiment_manifest.txt").read_bytes()
+    completed = subprocess.run(
+        [
+            "bash",
+            "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
+            "--resume-run-root",
+            _as_wsl_path(run_root),
+            "--device",
+            "0",
+            "--auto-continue",
+            "--mock",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert "RESUME_PLAN_VALID=true" in completed.stdout
+    assert "STAGE1_TRAIN_CANDIDATES_SKIPPED=4" in completed.stdout
+    assert "STAGE1_CHECKPOINT_UNITS_SKIPPED=8" in completed.stdout
+    assert "NEXT_STAGE=amplitude_screen" in completed.stdout
+    assert (run_root / "status.txt").read_bytes() == status_before
+    assert (run_root / "experiment_manifest.txt").read_bytes() == manifest_before
+    assert not (run_root / "resume_history.tsv").exists()
+
+
+def test_pipeline_mock_resume_skips_stage1_and_runs_summarizer(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path, manifest_path_style="wsl")
+    candidate_status_before = (run_root / "candidate_status.tsv").read_bytes()
+    completed = subprocess.run(
+        [
+            "bash",
+            "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
+            "--resume-run-root",
+            _as_wsl_path(run_root),
+            "--device",
+            "0",
+            "--auto-continue",
+            "--mock",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert "STATUS=MOCK_RESUME_COMPLETED" in completed.stdout
+    assert "STAGE1_TRAIN_CALLS=0" in completed.stdout
+    assert "STAGE1_TEST_CALLS=0" in completed.stdout
+    assert "STAGE1_DIAGNOSIS_CALLS=0" in completed.stdout
+    assert "SUMMARIZER_CALLED=true" in completed.stdout
+    assert "shutdown_executed=false" in completed.stdout
+    assert (run_root / "candidate_status.tsv").read_bytes() == candidate_status_before
+    assert (run_root / "resume_history.tsv").is_file()
+    assert (run_root / "selected_amplitude_candidate.json").is_file()
+    mechanism_rows = rescue.read_tsv_compatible(
+        run_root / "amplitude_screen_mechanism.tsv"
+    ).rows
+    assert mechanism_rows
+    assert {row["legacy_header_repaired"] for row in mechanism_rows} == {"True"}
+    assert all(row["legacy_header_path"] for row in mechanism_rows)
+    assert "STATUS=MOCK_RESUME_COMPLETED" in (
+        run_root / "status.txt"
+    ).read_text(encoding="utf-8")

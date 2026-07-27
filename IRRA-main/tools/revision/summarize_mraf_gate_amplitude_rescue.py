@@ -7,10 +7,26 @@ import argparse
 import csv
 import json
 import math
+import os
+import re
+import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,6 +42,7 @@ from tools.revision.summarize_mraf_gate_rescue import (  # noqa: E402
     _scenario_row,
     _scenario_score,
 )
+from utils.config import load_config_mapping  # noqa: E402
 
 
 STAGE1_MATRIX: Mapping[str, Mapping[str, Any]] = {
@@ -85,6 +102,66 @@ FORMAL_SCENARIOS = (
     "both_blur_k7",
 )
 KEY_DEGRADED_SCENARIOS = SCREEN_SCENARIOS[1:]
+EXPECTED_ORIGINAL_COMMIT = "c667946b2c51740bfa7892f5a2daee73d1279b44"
+ALLOWED_HOTFIX_PATHS = frozenset(
+    {
+        "IRRA-main/tools/revision/summarize_mraf_gate_amplitude_rescue.py",
+        "IRRA-main/processor/processor.py",
+        "IRRA-main/scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
+        "IRRA-main/tests/test_mraf_gate_amplitude_rescue.py",
+        "IRRA-main/docs/revision/mraf_gate_amplitude_rescue_pipeline.md",
+    }
+)
+LEGACY_MERGED_TSV_FIELDS: Mapping[str, Tuple[str, str]] = {
+    "target_rgb_meantarget_rgb_std": (
+        "target_rgb_mean",
+        "target_rgb_std",
+    ),
+    "scorer_first_weight_normscorer_last_weight_norm": (
+        "scorer_first_weight_norm",
+        "scorer_last_weight_norm",
+    ),
+}
+REFERENCE_CLEAN_ALIASES = (
+    "clean_R1",
+    "clean_r1",
+    "clean_rank1",
+    "R1_clean",
+)
+REFERENCE_DEGRADED_ALIASES = (
+    "key_degraded_mean_R1",
+    "degraded_mean_R1",
+    "mean_degraded_R1",
+    "key_degraded_R1_mean",
+)
+REFERENCE_RELATIVE_PATHS = (
+    Path("screen/rescue_screen_summary.tsv"),
+    Path("rescue_screen_summary.tsv"),
+    Path("screen/rescue_screen_metrics.tsv"),
+    Path("rescue_screen_metrics.tsv"),
+    Path("screen/rescue_candidate_ranking.tsv"),
+    Path("rescue_candidate_ranking.tsv"),
+    Path("screen/comparison_with_previous_screen.tsv"),
+    Path("comparison_with_previous_screen.tsv"),
+)
+RESUME_PROTOCOL: Mapping[str, Any] = {
+    "batch_size": 64,
+    "test_batch_size": 512,
+    "loss_names": "sdm+mlm+id",
+    "MLM": True,
+    "warmup_epochs": 5,
+    "eval_use_fused_mu": True,
+    "degrade_aug_mode": "none",
+    "mraf_enabled": True,
+    "mraf_gate_fp32": True,
+    "mdrc_enable": True,
+    "mdrc_prob": 0.5,
+    "mdrc_lambda": 0.05,
+    "mdrc_loss_scale": 100,
+    "mdrc_warmup_epoch": 3,
+    "num_epoch": 10,
+    "mraf_rel_warmup_epoch": 1,
+}
 
 METRIC_FIELDS = (
     "candidate",
@@ -119,6 +196,8 @@ MECHANISM_FIELDS = (
     "scorer_parameter_updated",
     "fusion_path_sensitive",
     "gate_logits_fp32",
+    "legacy_header_repaired",
+    "legacy_header_path",
 )
 COMPARISON_FIELDS = (
     "candidate",
@@ -177,15 +256,68 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("screen", "calibration", "confirmation", "final", "mock"),
+        choices=(
+            "screen",
+            "calibration",
+            "confirmation",
+            "final",
+            "mock",
+            "resume-plan",
+        ),
         required=True,
     )
     parser.add_argument("--candidate-root", default="")
     parser.add_argument("--reference-screen-root", default="")
     parser.add_argument("--reference-run-root", default="")
     parser.add_argument("--selected-json", default="")
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--output-dir", default="")
+    parser.add_argument("--run-root", default="")
+    parser.add_argument("--repo-root", default=str(PROJECT_ROOT.parent))
+    parser.add_argument("--resume-code-commit", default="")
+    parser.add_argument("--record-resume", action="store_true")
     return parser
+
+
+def _validate_fields(fields: Sequence[str]) -> Tuple[str, ...]:
+    normalized = tuple(str(field) for field in fields)
+    if not normalized or any(not field.strip() for field in normalized):
+        raise ValueError("TSV schema contains an empty field name")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"TSV schema contains duplicate fields: {normalized}")
+    return normalized
+
+
+def _atomic_replace_text(
+    path: Path,
+    write: Callable[[Any], None],
+    validate: Optional[Callable[[Path], None]] = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if validate is not None:
+            validate(Path(temporary_name))
+        os.replace(temporary_name, path)
+    except BaseException:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def _write_tsv(
@@ -193,31 +325,110 @@ def _write_tsv(
     fields: Sequence[str],
     rows: Iterable[Mapping[str, Any]],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    schema = _validate_fields(fields)
+    materialized = [dict(row) for row in rows]
+
+    def write(handle: Any) -> None:
         writer = csv.DictWriter(
             handle,
-            fieldnames=fields,
+            fieldnames=schema,
             delimiter="\t",
-            extrasaction="ignore",
+            lineterminator="\n",
+            extrasaction="raise",
         )
         writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field) for field in fields})
+        for row in materialized:
+            writer.writerow({field: row.get(field) for field in schema})
+
+    def validate(temporary: Path) -> None:
+        with temporary.open("r", encoding="utf-8", newline="") as handle:
+            parsed = list(csv.reader(handle, delimiter="\t"))
+        if not parsed or tuple(parsed[0]) != schema:
+            raise ValueError(
+                f"Atomic TSV validation failed for {path}: header mismatch"
+            )
+        if any(len(row) != len(schema) for row in parsed[1:]):
+            raise ValueError(
+                f"Atomic TSV validation failed for {path}: row width mismatch"
+            )
+
+    _atomic_replace_text(path, write, validate)
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    def write(handle: Any) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
+    def validate(temporary: Path) -> None:
+        with temporary.open("r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+        if not isinstance(parsed, Mapping):
+            raise ValueError(f"Atomic JSON validation failed for {path}")
+
+    _atomic_replace_text(path, write, validate)
+
+
+def _write_text(path: Path, text: str) -> None:
+    _atomic_replace_text(path, lambda handle: handle.write(text))
+
+
+@dataclass(frozen=True)
+class TSVReadResult:
+    rows: List[Dict[str, str]]
+    fields: Tuple[str, ...]
+    original_fields: Tuple[str, ...]
+    legacy_header_repaired: bool
+    source: str
+
+
+def read_tsv_compatible(path: Path) -> TSVReadResult:
+    """Read a standard TSV or split only the two known legacy merged headers."""
+    if not path.is_file():
+        return TSVReadResult([], (), (), False, str(path))
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        raw_rows = list(csv.reader(handle, delimiter="\t"))
+    if not raw_rows:
+        return TSVReadResult([], (), (), False, str(path.resolve()))
+    original_fields = tuple(field.strip() for field in raw_rows[0])
+    _validate_fields(original_fields)
+    data_rows = raw_rows[1:]
+    widths = {len(row) for row in data_rows}
+    if len(widths) > 1:
+        raise ValueError(
+            f"Inconsistent TSV row widths in {path}: header={len(original_fields)}, "
+            f"data_widths={sorted(widths)}"
+        )
+    data_width = next(iter(widths), len(original_fields))
+    repaired_fields: List[str] = []
+    repaired = False
+    for field in original_fields:
+        replacement = LEGACY_MERGED_TSV_FIELDS.get(field)
+        if replacement is None:
+            repaired_fields.append(field)
+        else:
+            repaired_fields.extend(replacement)
+            repaired = True
+    fields = _validate_fields(repaired_fields)
+    if len(fields) != data_width:
+        raise ValueError(
+            f"Unsupported TSV schema mismatch in {path}: "
+            f"original_header={list(original_fields)}, repaired_header={list(fields)}, "
+            f"header_columns={len(fields)}, data_columns={data_width}; "
+            "only whitelisted legacy merged headers may be repaired"
+        )
+    rows = [dict(zip(fields, row)) for row in data_rows]
+    return TSVReadResult(
+        rows=rows,
+        fields=fields,
+        original_fields=original_fields,
+        legacy_header_repaired=repaired,
+        source=str(path.resolve()),
+    )
+
 
 def _read_tsv(path: Path) -> List[Dict[str, str]]:
-    if not path.is_file():
-        return []
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle, delimiter="\t"))
+    return read_tsv_compatible(path).rows
 
 
 def _finite(value: Any) -> bool:
@@ -303,7 +514,8 @@ def collect_unit(
     gate_rows = _read_csv(diagnostic_dir / "scenario_gate_statistics.csv")
     direction_rows = _read_csv(diagnostic_dir / "gate_direction_statistics.csv")
     gradient_rows = _read_csv(diagnostic_dir / "gradient_diagnostics.csv")
-    epoch_rows = _read_tsv(unit_dir / "mraf_epoch_metrics.tsv")
+    epoch_result = read_tsv_compatible(unit_dir / "mraf_epoch_metrics.tsv")
+    epoch_rows = epoch_result.rows
     selection_rows = _read_tsv(unit_dir / "checkpoint_selection.tsv")
     selected_epoch = next(
         (
@@ -389,6 +601,10 @@ def collect_unit(
         ),
         "gate_logits_fp32": bool(raw_dtypes)
         and raw_dtypes == {"torch.float32"},
+        "legacy_header_repaired": epoch_result.legacy_header_repaired,
+        "legacy_header_path": (
+            epoch_result.source if epoch_result.legacy_header_repaired else ""
+        ),
     }
     result["mechanism"] = mechanism
     result["complete"] = (
@@ -401,52 +617,502 @@ def collect_unit(
     return result
 
 
-def _reference_from_tsv(path: Path) -> Optional[Tuple[float, float]]:
-    try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            rows = list(csv.DictReader(handle, delimiter="\t"))
-    except (OSError, UnicodeError, csv.Error):
-        return None
-    for row in rows:
-        if str(row.get("candidate", "")).split("_")[0] != "S4":
+def _parse_finite_reference_value(
+    row: Mapping[str, str],
+    aliases: Sequence[str],
+    metric_name: str,
+) -> Tuple[float, str]:
+    for alias in aliases:
+        if alias not in row:
             continue
-        clean = _as_float(row.get("clean_R1"))
-        degraded = _as_float(
-            row.get("key_degraded_mean_R1", row.get("degraded_mean_R1"))
-        )
-        if clean is not None and degraded is not None:
-            return clean, degraded
-    return None
+        raw = row.get(alias)
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{metric_name} field {alias!r} cannot be converted from "
+                f"{raw!r}: {error}"
+            ) from error
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{metric_name} field {alias!r} must be finite, got {raw!r}"
+            )
+        return value, alias
+    raise KeyError(
+        f"{metric_name} field missing; accepted aliases={list(aliases)}"
+    )
 
 
-def load_reference_s4(reference_root: Path) -> Dict[str, float]:
+def _reference_from_tsv(path: Path) -> Tuple[float, float, Tuple[str, ...]]:
+    fields: Tuple[str, ...] = ()
+    s4_found = False
+    s4_fields: Tuple[str, ...] = ()
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames is None:
+                raise ValueError("TSV has no header")
+            normalized_fields = tuple(field.strip() for field in reader.fieldnames)
+            _validate_fields(normalized_fields)
+            fields = normalized_fields
+            rows = []
+            for raw_row in reader:
+                normalized_row = {
+                    str(key).strip(): value
+                    for key, value in raw_row.items()
+                    if key is not None
+                }
+                rows.append(normalized_row)
+    except (OSError, UnicodeError, csv.Error, ValueError) as error:
+        raise ValueError(
+            f"path={path}; headers={list(fields)}; s4_found={s4_found}; "
+            f"s4_fields={list(s4_fields)}; reason={type(error).__name__}: {error}"
+        ) from error
+    for row in rows:
+        if str(row.get("candidate", "")).strip() != "S4":
+            continue
+        s4_found = True
+        s4_fields = tuple(sorted(row))
+        try:
+            clean, _ = _parse_finite_reference_value(
+                row, REFERENCE_CLEAN_ALIASES, "clean"
+            )
+            degraded, _ = _parse_finite_reference_value(
+                row, REFERENCE_DEGRADED_ALIASES, "degraded"
+            )
+        except (KeyError, ValueError) as error:
+            raise ValueError(
+                f"path={path}; headers={list(fields)}; s4_found=true; "
+                f"s4_fields={list(s4_fields)}; reason={type(error).__name__}: {error}"
+            ) from error
+        return clean, degraded, fields
+    raise ValueError(
+        f"path={path}; headers={list(fields)}; s4_found=false; "
+        f"s4_fields=[]; reason=exact candidate 'S4' was not found"
+    )
+
+
+def load_reference_s4(reference_root: Path) -> Dict[str, Any]:
     """Read historical S4 summaries without modifying the reference tree."""
     if not reference_root.is_dir():
         raise FileNotFoundError(
             f"Reference screen root not found: {reference_root}"
         )
-    names = (
+    searched: List[Path] = []
+    candidates: List[Path] = []
+    seen = set()
+    for relative in REFERENCE_RELATIVE_PATHS:
+        path = reference_root / relative
+        searched.append(path)
+        if path.is_file() and path.resolve() not in seen:
+            seen.add(path.resolve())
+            candidates.append(path)
+    for name in (
+        "rescue_screen_summary.tsv",
+        "rescue_screen_metrics.tsv",
         "rescue_summary.tsv",
         "rescue_candidate_ranking.tsv",
         "comparison_with_previous_screen.tsv",
-    )
-    matches = sorted(
-        path
-        for name in names
-        for path in reference_root.rglob(name)
-        if path.is_file()
-    )
-    for path in matches:
-        values = _reference_from_tsv(path)
-        if values is not None:
+    ):
+        for path in sorted(reference_root.rglob(name)):
+            if path not in searched:
+                searched.append(path)
+            if path.is_file() and path.resolve() not in seen:
+                seen.add(path.resolve())
+                candidates.append(path)
+
+    errors: List[str] = []
+    for path in candidates:
+        try:
+            clean, degraded, _ = _reference_from_tsv(path)
             return {
-                "clean_R1": values[0],
-                "degraded_mean_R1": values[1],
+                "clean_R1": clean,
+                "key_degraded_mean_R1": degraded,
+                "degraded_mean_R1": degraded,
                 "source": str(path.resolve()),
             }
+        except ValueError as error:
+            errors.append(str(error))
     raise ValueError(
-        "Could not read S4 clean/degraded metrics from --reference-screen-root."
+        "Could not read finite S4 clean/degraded metrics. "
+        f"reference_root={reference_root.resolve()}; "
+        f"searched_paths={[str(path) for path in searched]}; "
+        f"file_diagnostics={errors or ['no candidate TSV file exists']}"
     )
+
+
+def _read_key_value_file(path: Path) -> Dict[str, str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Required key-value file is missing: {path}")
+    values: Dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _numbers_equal(first: Any, second: Any) -> bool:
+    left = _as_float(first)
+    right = _as_float(second)
+    return (
+        left is not None
+        and right is not None
+        and math.isfinite(left)
+        and math.isfinite(right)
+        and math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12)
+    )
+
+
+def _git_is_ancestor(repo_root: Path, original: str, current: str) -> bool:
+    command = _git_command_prefix(repo_root)
+    completed = subprocess.run(
+        [*command, "merge-base", "--is-ancestor", original, current],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.returncode == 0
+
+
+def _git_changed_paths(
+    repo_root: Path, original: str, current: str
+) -> Sequence[str]:
+    command = _git_command_prefix(repo_root)
+    completed = subprocess.run(
+        [*command, "diff", "--name-only", f"{original}..{current}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return tuple(line.strip() for line in completed.stdout.splitlines() if line.strip())
+
+
+def _git_command_prefix(repo_root: Path) -> List[str]:
+    """Support normal repos and Windows worktree pointers invoked through WSL."""
+    pointer = repo_root / ".git"
+    if not pointer.is_file():
+        return ["git", "-C", str(repo_root)]
+    first_line = pointer.read_text(encoding="utf-8-sig").splitlines()[0].strip()
+    if not first_line.startswith("gitdir:"):
+        return ["git", "-C", str(repo_root)]
+    raw = first_line.split(":", 1)[1].strip()
+    match = re.match(r"^([A-Za-z]):[/\\](.*)$", raw)
+    if match and os.name != "nt":
+        git_dir = Path(f"/mnt/{match.group(1).lower()}/{match.group(2)}")
+    else:
+        git_dir = Path(raw)
+        if not git_dir.is_absolute():
+            git_dir = (repo_root / git_dir).resolve()
+    return [
+        "git",
+        f"--git-dir={git_dir}",
+        f"--work-tree={repo_root}",
+    ]
+
+
+@dataclass(frozen=True)
+class ResumePlan:
+    valid: bool
+    run_root: str
+    original_commit: str
+    resume_commit: str
+    old_status: str
+    old_failed_stage: str
+    next_stage: str
+    reasons: Tuple[str, ...]
+    training_candidates_skipped: int = 0
+    checkpoint_units_skipped: int = 0
+    evaluations_skipped: int = 0
+    diagnostics_skipped: int = 0
+
+    def machine_lines(self) -> List[str]:
+        lines = [
+            f"RESUME_PLAN_VALID={str(self.valid).lower()}",
+            f"ORIGINAL_RUN_COMMIT={self.original_commit or 'UNKNOWN'}",
+            f"RESUME_CODE_COMMIT={self.resume_commit or 'UNKNOWN'}",
+            (
+                "STAGE1_TRAIN_CANDIDATES_SKIPPED="
+                f"{self.training_candidates_skipped}"
+            ),
+            f"STAGE1_CHECKPOINT_UNITS_SKIPPED={self.checkpoint_units_skipped}",
+            f"STAGE1_EVALUATIONS_SKIPPED={self.evaluations_skipped}",
+            f"STAGE1_DIAGNOSTICS_SKIPPED={self.diagnostics_skipped}",
+            f"NEXT_STAGE={self.next_stage or 'NONE'}",
+            f"RUN_ROOT={self.run_root}",
+        ]
+        lines.extend(f"RESUME_PLAN_ERROR={reason}" for reason in self.reasons)
+        return lines
+
+
+def validate_resume_plan(
+    run_root: Path,
+    repo_root: Path,
+    resume_commit: str,
+    *,
+    ancestry_checker: Optional[Callable[[Path, str, str], bool]] = None,
+    changed_paths_reader: Optional[
+        Callable[[Path, str, str], Sequence[str]]
+    ] = None,
+) -> ResumePlan:
+    """Validate an aggregation-only Stage-1 resume without modifying artifacts."""
+    reasons: List[str] = []
+    try:
+        manifest = _read_key_value_file(run_root / "experiment_manifest.txt")
+    except (OSError, UnicodeError) as error:
+        manifest = {}
+        reasons.append(str(error))
+    try:
+        status = _read_key_value_file(run_root / "status.txt")
+    except (OSError, UnicodeError) as error:
+        status = {}
+        reasons.append(str(error))
+
+    original = manifest.get("git_head", "")
+    old_status = status.get("STATUS", "")
+    old_failed_stage = status.get("FAILED_STAGE", "")
+    if manifest.get("PIPELINE_ID") != "mraf_gate_amplitude_rescue_v3":
+        reasons.append("experiment_manifest PIPELINE_ID is not mraf_gate_amplitude_rescue_v3")
+    if original != EXPECTED_ORIGINAL_COMMIT:
+        reasons.append(
+            f"original commit must be {EXPECTED_ORIGINAL_COMMIT}, got {original or 'missing'}"
+        )
+    if old_status != "FAILED" or old_failed_stage != "amplitude_screen":
+        reasons.append(
+            "resume requires STATUS=FAILED and FAILED_STAGE=amplitude_screen, "
+            f"got STATUS={old_status or 'missing'} "
+            f"FAILED_STAGE={old_failed_stage or 'missing'}"
+        )
+    if manifest.get("seed") != "1":
+        reasons.append(f"resume seed must remain 1, got {manifest.get('seed', 'missing')}")
+    for key in ("data_root", "base_config", "reference_screen_root", "reference_run_root"):
+        if not manifest.get(key):
+            reasons.append(f"experiment_manifest lacks non-empty {key}")
+    reference_value = manifest.get("reference_screen_root", "")
+    if reference_value:
+        try:
+            load_reference_s4(Path(reference_value))
+        except (OSError, ValueError) as error:
+            reasons.append(f"reference S4 validation failed: {error}")
+
+    if original and resume_commit and resume_commit != original:
+        ancestry = ancestry_checker or _git_is_ancestor
+        changed_reader = changed_paths_reader or _git_changed_paths
+        try:
+            if not ancestry(repo_root, original, resume_commit):
+                reasons.append(
+                    f"resume commit {resume_commit} is not a descendant of {original}"
+                )
+            changed = set(changed_reader(repo_root, original, resume_commit))
+            disallowed = sorted(changed - ALLOWED_HOTFIX_PATHS)
+            if disallowed:
+                reasons.append(
+                    f"cross-commit resume contains non-hotfix paths: {disallowed}"
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            reasons.append(f"Git compatibility validation failed: {error}")
+    elif not resume_commit:
+        reasons.append("resume code commit is empty")
+
+    candidate_status_path = run_root / "candidate_status.tsv"
+    try:
+        status_rows = read_tsv_compatible(candidate_status_path).rows
+    except (OSError, UnicodeError, csv.Error, ValueError) as error:
+        status_rows = []
+        reasons.append(f"candidate status cannot be read: {error}")
+    latest_status: Dict[Tuple[str, str], str] = {}
+    for row in status_rows:
+        key = (
+            str(row.get("candidate", "")).strip(),
+            str(row.get("checkpoint", "")).strip(),
+        )
+        latest_status[key] = str(row.get("status", "")).strip()
+
+    completed_units = 0
+    completed_evaluations = 0
+    completed_diagnostics = 0
+    completed_train_candidates = 0
+    train_root = run_root / "stage1" / "train"
+    unit_root = run_root / "stage1" / "units"
+    for candidate, expected in STAGE1_MATRIX.items():
+        train_dir = train_root / candidate
+        if train_dir.is_dir() and all(
+            any(path.is_file() and path.stat().st_size > 0 for path in train_dir.rglob(name))
+            for name in ("configs.yaml", "best.pth", "last.pth")
+        ):
+            completed_train_candidates += 1
+        else:
+            reasons.append(f"{candidate}: complete Stage-1 training artifacts are missing")
+        for checkpoint in CHECKPOINT_KINDS:
+            label = f"{candidate}_{checkpoint}"
+            unit = unit_root / label
+            if latest_status.get((candidate, checkpoint)) != "COMPLETED":
+                reasons.append(
+                    f"{label}: candidate_status is "
+                    f"{latest_status.get((candidate, checkpoint), 'missing')}, expected COMPLETED"
+                )
+            required_files = (
+                "checkpoint.pth",
+                "configs.yaml",
+                "train.log",
+                "mraf_epoch_metrics.tsv",
+                "checkpoint_selection.tsv",
+                "unit.json",
+            )
+            unit_complete = True
+            for name in required_files:
+                path = unit / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    reasons.append(f"{label}: missing or empty {path}")
+                    unit_complete = False
+            metadata: Mapping[str, Any] = {}
+            metadata_path = unit / "unit.json"
+            if metadata_path.is_file():
+                try:
+                    loaded = _read_json(metadata_path)
+                    metadata = loaded if isinstance(loaded, Mapping) else {}
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    reasons.append(f"{label}: invalid unit.json: {error}")
+                    unit_complete = False
+            if metadata:
+                if str(metadata.get("candidate", "")).strip() != candidate:
+                    reasons.append(f"{label}: unit candidate matrix label changed")
+                    unit_complete = False
+                if str(metadata.get("checkpoint", "")).strip() != checkpoint:
+                    reasons.append(f"{label}: unit checkpoint label changed")
+                    unit_complete = False
+                for field in (
+                    "mraf_rel_lambda",
+                    "mraf_gate_base_grad_scale",
+                    "mraf_scorer_lr_multiplier",
+                    "mraf_gate_logit_scale",
+                ):
+                    if not _numbers_equal(metadata.get(field), expected[field]):
+                        reasons.append(
+                            f"{label}: {field} differs from fixed Stage-1 matrix"
+                        )
+                        unit_complete = False
+                for flag in ("has_nan", "has_inf", "has_oom"):
+                    if _is_true(metadata.get(flag, False)):
+                        reasons.append(f"{label}: {flag}=true")
+                        unit_complete = False
+            config_path = unit / "configs.yaml"
+            if config_path.is_file():
+                try:
+                    config = load_config_mapping(str(config_path))
+                except (OSError, ValueError, TypeError) as error:
+                    config = {}
+                    reasons.append(f"{label}: configs.yaml cannot be loaded: {error}")
+                    unit_complete = False
+                for field, expected_value in RESUME_PROTOCOL.items():
+                    actual = config.get(field)
+                    matches = (
+                        _is_true(actual) == expected_value
+                        if isinstance(expected_value, bool)
+                        else _numbers_equal(actual, expected_value)
+                        if isinstance(expected_value, (int, float))
+                        else str(actual).strip() == str(expected_value)
+                    )
+                    if not matches:
+                        reasons.append(
+                            f"{label}: protocol {field}={actual!r}, "
+                            f"expected {expected_value!r}"
+                        )
+                        unit_complete = False
+                for field in (
+                    "mraf_rel_lambda",
+                    "mraf_gate_base_grad_scale",
+                    "mraf_scorer_lr_multiplier",
+                    "mraf_gate_logit_scale",
+                ):
+                    if not _numbers_equal(config.get(field), expected[field]):
+                        reasons.append(
+                            f"{label}: config {field} differs from fixed Stage-1 matrix"
+                        )
+                        unit_complete = False
+            evaluation_complete = True
+            for scenario in SCREEN_SCENARIOS:
+                score = _scenario_score(unit, scenario)
+                if score is None or not score.is_file() or score.stat().st_size <= 0:
+                    reasons.append(f"{label}: missing non-empty evaluation for {scenario}")
+                    evaluation_complete = False
+            diagnostic = _active_diagnostic_dir(unit)
+            diagnostic_complete = True
+            for name in (
+                "diagnosis.json",
+                "scenario_gate_statistics.csv",
+                "gate_direction_statistics.csv",
+                "gradient_diagnostics.csv",
+                "fusion_path_check.json",
+            ):
+                path = diagnostic / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    reasons.append(f"{label}: missing or empty diagnostic {path}")
+                    diagnostic_complete = False
+            if unit_complete:
+                completed_units += 1
+            if evaluation_complete:
+                completed_evaluations += 1
+            if diagnostic_complete:
+                completed_diagnostics += 1
+
+    valid = not reasons
+    return ResumePlan(
+        valid=valid,
+        run_root=str(run_root.resolve()),
+        original_commit=original,
+        resume_commit=resume_commit,
+        old_status=old_status,
+        old_failed_stage=old_failed_stage,
+        next_stage="amplitude_screen" if valid else "",
+        reasons=tuple(reasons),
+        training_candidates_skipped=completed_train_candidates,
+        checkpoint_units_skipped=completed_units,
+        evaluations_skipped=completed_evaluations,
+        diagnostics_skipped=completed_diagnostics,
+    )
+
+
+RESUME_HISTORY_FIELDS = (
+    "timestamp",
+    "original_commit",
+    "resume_commit",
+    "old_status",
+    "old_failed_stage",
+    "next_stage",
+    "compatibility_reason",
+)
+
+
+def record_resume_history(run_root: Path, plan: ResumePlan) -> None:
+    if not plan.valid:
+        raise ValueError("Cannot record an invalid resume plan")
+    path = run_root / "resume_history.tsv"
+    rows = _read_tsv(path)
+    rows.append(
+        {
+            "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
+            "original_commit": plan.original_commit,
+            "resume_commit": plan.resume_commit,
+            "old_status": plan.old_status,
+            "old_failed_stage": plan.old_failed_stage,
+            "next_stage": plan.next_stage,
+            "compatibility_reason": (
+                "strict aggregation-only hotfix descendant; "
+                "completed Stage-1 artifacts verified"
+            ),
+        }
+    )
+    _write_tsv(path, RESUME_HISTORY_FIELDS, rows)
 
 
 def _criterion(
@@ -979,8 +1645,21 @@ def summarize_final(
             f"raw_gap_std={max(observed_amplitudes)[1]:.8g}"
         )
     )
+    manifest_path = output_dir / "experiment_manifest.txt"
+    manifest = (
+        _read_key_value_file(manifest_path) if manifest_path.is_file() else {}
+    )
+    history_rows = _read_tsv(output_dir / "resume_history.tsv")
+    training_commit = manifest.get("git_head", "UNKNOWN")
+    aggregation_commit = (
+        history_rows[-1].get("resume_commit", training_commit)
+        if history_rows
+        else training_commit
+    )
     report = [
         f"STATUS={status}",
+        f"training_commit={training_commit}",
+        f"resume_aggregation_commit={aggregation_commit}",
         f"selected_checkpoint={(selected or {}).get('checkpoint', 'NONE')}",
         f"scorer_lr_amplitude_observation={lr_amplitude_summary}",
         (
@@ -1005,10 +1684,7 @@ def summarize_final(
         "all_results_seed=1",
         "warning=short-cycle screening is not a final paper conclusion",
     ]
-    (output_dir / "FINAL_REPORT.txt").write_text(
-        "\n".join(report) + "\n",
-        encoding="utf-8",
-    )
+    _write_text(output_dir / "FINAL_REPORT.txt", "\n".join(report) + "\n")
     return {"status": status, "selected": selected}
 
 
@@ -1144,16 +1820,41 @@ def create_mock_outputs(output_dir: Path) -> Dict[str, Any]:
             },
         ),
     )
-    (output_dir / "FINAL_REPORT.txt").write_text(
+    _write_text(
+        output_dir / "FINAL_REPORT.txt",
         "STATUS=MOCK_COMPLETED\nmock=true\nall_results_seed=1\n"
-        "warning=short-cycle screening is not a final paper conclusion\n",
-        encoding="utf-8",
+        "warning=short-cycle screening is not a final paper conclusion\n"
     )
     return selection
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.mode == "resume-plan":
+        if not args.run_root:
+            raise SystemExit("--run-root is required for --mode resume-plan")
+        resume_commit = args.resume_code_commit
+        if not resume_commit:
+            completed = subprocess.run(
+                [*_git_command_prefix(Path(args.repo_root)), "rev-parse", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            resume_commit = completed.stdout.strip()
+        plan = validate_resume_plan(
+            Path(args.run_root),
+            Path(args.repo_root),
+            resume_commit,
+        )
+        for line in plan.machine_lines():
+            print(line)
+        if plan.valid and args.record_resume:
+            record_resume_history(Path(args.run_root), plan)
+        return 0 if plan.valid else 2
+    if not args.output_dir:
+        raise SystemExit("--output-dir is required unless --mode resume-plan")
     output_dir = Path(args.output_dir)
     if args.mode == "mock":
         create_mock_outputs(output_dir)

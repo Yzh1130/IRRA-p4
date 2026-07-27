@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import random
+import tempfile
 import time
 
 import torch
@@ -114,6 +115,15 @@ CHECKPOINT_SELECTION_FIELDS = (
     "alpha_std",
     "Pearson",
     "weighted_rel_base_ratio",
+)
+_REQUIRED_MRAF_EPOCH_METRIC_FIELDS = frozenset(
+    {
+        "target_rgb_mean",
+        "target_rgb_std",
+        "scorer_first_weight_norm",
+        "scorer_last_weight_norm",
+        "scorer_parameter_delta_from_initial",
+    }
 )
 
 
@@ -264,14 +274,82 @@ def _optimizer_mraf_lrs(optimizer, model, base_lr):
     return base_group_lr, scorer_lr
 
 
+def _validate_tsv_schema(fields, *, require_mraf_epoch_fields=False):
+    schema = tuple(str(field) for field in fields)
+    if not schema or any(not field.strip() for field in schema):
+        raise ValueError("TSV schema contains an empty field name")
+    if len(schema) != len(set(schema)):
+        raise ValueError(f"TSV schema contains duplicate fields: {schema}")
+    if require_mraf_epoch_fields:
+        missing = sorted(_REQUIRED_MRAF_EPOCH_METRIC_FIELDS - set(schema))
+        if missing:
+            raise ValueError(
+                f"MRAF epoch metric schema is missing required fields: {missing}"
+            )
+    return schema
+
+
 def _append_tsv_row(path, fields, row):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    write_header = not os.path.exists(path)
-    with open(path, "a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
-        if write_header:
+    schema = _validate_tsv_schema(
+        fields,
+        require_mraf_epoch_fields=tuple(fields) == MRAF_EPOCH_METRIC_FIELDS,
+    )
+    extras = sorted(set(row) - set(schema))
+    if extras:
+        raise ValueError(f"TSV row has fields outside schema for {path}: {extras}")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    existing_rows = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8", newline="") as source:
+            reader = csv.DictReader(source, delimiter="\t")
+            existing_header = tuple(reader.fieldnames or ())
+            if existing_header != schema:
+                raise ValueError(
+                    f"Existing TSV header differs from fixed schema for {path}: "
+                    f"{existing_header} != {schema}"
+                )
+            existing_rows = list(reader)
+    normalized_row = {field: row.get(field) for field in schema}
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=directory,
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=schema,
+                delimiter="\t",
+                lineterminator="\n",
+                extrasaction="raise",
+            )
             writer.writeheader()
-        writer.writerow({field: row.get(field) for field in fields})
+            for existing in existing_rows:
+                writer.writerow({field: existing.get(field) for field in schema})
+            writer.writerow(normalized_row)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with open(temporary_path, "r", encoding="utf-8", newline="") as source:
+            rows = list(csv.reader(source, delimiter="\t"))
+        if not rows or tuple(rows[0]) != schema:
+            raise ValueError(f"Written TSV header validation failed for {path}")
+        if any(len(written) != len(schema) for written in rows[1:]):
+            raise ValueError(f"Written TSV row width validation failed for {path}")
+        os.replace(temporary_path, path)
+        temporary_path = ""
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 def _save_last_checkpoint(

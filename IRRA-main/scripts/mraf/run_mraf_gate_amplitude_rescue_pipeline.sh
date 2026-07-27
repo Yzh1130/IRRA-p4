@@ -40,6 +40,12 @@ EOF
 
 die() {
   echo "Error: $*" >&2
+  if declare -F write_status >/dev/null 2>&1 \
+      && [[ "${status_writes_enabled:-false}" == "true" ]] \
+      && [[ -n "${run_dir:-}" && -d "${run_dir:-}" ]]; then
+    write_status "FAILED" 2 "${current_stage:-preflight}"
+    pipeline_completed=true
+  fi
   exit 2
 }
 
@@ -130,29 +136,32 @@ else
   run_dir="${output_root%/}/${timestamp}_${git_short}_mraf_gate_amplitude_rescue_seed${seed}"
   resume_mode=false
 fi
-[[ "$resume_mode" != "true" || "$mock" != "true" ]] || die \
-  "--mock cannot be combined with --resume-run-root"
 
 status_file="${run_dir}/status.txt"
 current_stage="preflight"
 pipeline_completed=false
 formal_completed=false
+status_writes_enabled=false
 
 write_status() {
   local status=$1
   local exit_code=$2
   local failed_stage=${3:-NONE}
+  local temporary_status
+  temporary_status="$(mktemp "${status_file}.tmp.XXXXXX")"
   {
     echo "STATUS=$status"
     echo "FAILED_STAGE=$failed_stage"
     echo "EXIT_CODE=$exit_code"
     echo "UPDATED_AT=$(date -Iseconds)"
-  } >"$status_file"
+  } >"$temporary_status"
+  mv -f "$temporary_status" "$status_file"
 }
 
 on_error() {
   local exit_code=$?
-  if [[ -d "$run_dir" && "$pipeline_completed" != "true" ]]; then
+  if [[ "$status_writes_enabled" == "true" && -d "$run_dir" \
+      && "$pipeline_completed" != "true" ]]; then
     write_status "FAILED" "$exit_code" "$current_stage"
   fi
   exit "$exit_code"
@@ -201,6 +210,17 @@ if [[ "$resume_mode" == "true" ]]; then
   [[ -n "$reference_run_root" ]] || reference_run_root="$(manifest_value reference_run_root)"
 fi
 
+resume_plan_output=""
+if [[ "$resume_mode" == "true" ]]; then
+  if ! resume_plan_output="$("$python_bin" -B \
+      tools/revision/summarize_mraf_gate_amplitude_rescue.py \
+      --mode resume-plan --run-root "$run_dir" --repo-root "$git_root" \
+      --resume-code-commit "$git_head" 2>&1)"; then
+    printf '%s\n' "$resume_plan_output"
+    exit 2
+  fi
+fi
+
 if [[ "$mock" != "true" ]]; then
   [[ -d "$data_root" ]] || die "--data-root is not a directory: $data_root"
   [[ -d "$output_root" || "$resume_mode" == "true" ]] || die \
@@ -240,8 +260,6 @@ for key in ("resume_ckpt_file", "load_ckpt_file"):
         )
 PY
   if [[ "$resume_mode" == "true" ]]; then
-    [[ "$(manifest_value git_head)" == "$git_head" ]] || die \
-      "Resume Git HEAD differs from the original run"
     [[ "$(manifest_value data_root)" == "$data_root" ]] || die \
       "Resume data root differs from the original run"
     [[ "$(manifest_value base_config)" == "$base_config" ]] || die \
@@ -254,6 +272,9 @@ PY
 fi
 
 if [[ "$dry_run" == "true" ]]; then
+  if [[ "$resume_mode" == "true" ]]; then
+    printf '%s\n' "$resume_plan_output"
+  fi
   echo "dry_run=true"
   echo "mock=$mock"
   echo "git_branch=$git_branch"
@@ -279,6 +300,7 @@ fi
 if [[ "$resume_mode" == "false" ]]; then
   [[ ! -e "$run_dir" ]] || die "Refusing to overwrite run directory: $run_dir"
   mkdir -p "$run_dir"
+  status_writes_enabled=true
   write_status "RUNNING" 0 "NONE"
   {
     echo "PIPELINE_ID=mraf_gate_amplitude_rescue_v3"
@@ -296,14 +318,35 @@ if [[ "$resume_mode" == "false" ]]; then
     echo "mock=$mock"
   } >"${run_dir}/experiment_manifest.txt"
 else
+  "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
+    --mode resume-plan --run-root "$run_dir" --repo-root "$git_root" \
+    --resume-code-commit "$git_head" --record-resume \
+    >"${run_dir}/resume_validation.log"
+  status_writes_enabled=true
   write_status "RUNNING" 0 "NONE"
-  {
-    echo "resume_at=$(date -Iseconds)"
-    echo "resume_git_head=$git_head"
-  } >>"${run_dir}/experiment_manifest.txt"
 fi
 
 if [[ "$mock" == "true" ]]; then
+  if [[ "$resume_mode" == "true" ]]; then
+    current_stage="amplitude_screen"
+    "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
+      --mode screen --candidate-root "${run_dir}/stage1/units" \
+      --reference-screen-root "$reference_screen_root" --output-dir "$run_dir" \
+      >"${run_dir}/screen_summary.log" 2>&1
+    selection_status="$("$python_bin" -B -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+      "${run_dir}/selected_amplitude_candidate.json")"
+    write_status "MOCK_RESUME_COMPLETED" 0 "NONE"
+    pipeline_completed=true
+    echo "STATUS=MOCK_RESUME_COMPLETED"
+    echo "SELECTION_STATUS=$selection_status"
+    echo "STAGE1_TRAIN_CALLS=0"
+    echo "STAGE1_TEST_CALLS=0"
+    echo "STAGE1_DIAGNOSIS_CALLS=0"
+    echo "SUMMARIZER_CALLED=true"
+    echo "shutdown_executed=false"
+    exit 0
+  fi
   current_stage="mock"
   mock_reports="${run_dir}/reports"
   "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
@@ -322,15 +365,24 @@ if [[ "$mock" == "true" ]]; then
   exit 0
 fi
 
-current_stage="real_preflight"
-[[ -z "$(run_git status --short)" ]] || die \
-  "Real pipeline requires a clean Git worktree"
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
-env "CUDA_VISIBLE_DEVICES=$device_index" "$python_bin" -B -c \
-  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))' \
-  >"${run_dir}/gpu.txt"
-if pgrep -af 'train.py.*mraf_gate_amplitude' | grep -v "$$" >/dev/null 2>&1; then
-  die "A matching gate-amplitude training process is already active"
+real_preflight_done=false
+run_real_preflight() {
+  [[ "$real_preflight_done" == "false" ]] || return 0
+  current_stage="real_preflight"
+  [[ -z "$(run_git status --short)" ]] || die \
+    "Real pipeline requires a clean Git worktree"
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
+  env "CUDA_VISIBLE_DEVICES=$device_index" "$python_bin" -B -c \
+    'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))' \
+    >"${run_dir}/gpu.txt"
+  if pgrep -af 'train.py.*mraf_gate_amplitude' | grep -v "$$" >/dev/null 2>&1; then
+    die "A matching gate-amplitude training process is already active"
+  fi
+  real_preflight_done=true
+}
+
+if [[ "$resume_mode" == "false" ]]; then
+  run_real_preflight
 fi
 
 check_space_gb() {
@@ -350,7 +402,9 @@ check_space_gb() {
     "Insufficient disk space: ${available_gb}GB available, ${required}GB required"
 }
 
-check_space_gb "$run_dir" 18
+if [[ "$resume_mode" == "false" ]]; then
+  check_space_gb "$run_dir" 18
+fi
 
 common_train_args=(
   --config_file "$base_config"
@@ -594,54 +648,59 @@ screen_scenarios="clean rgb_missing ir_missing rgb_noise_0.10 ir_noise_0.10 rgb_
 formal_scenarios="clean rgb_missing ir_missing rgb_noise_0.05 rgb_noise_0.10 ir_noise_0.05 ir_noise_0.10 rgb_blur_k7 ir_blur_k7 both_noise_0.05 both_blur_k7"
 stage1_train_root="${run_dir}/stage1/train"
 stage1_unit_root="${run_dir}/stage1/units"
-mkdir -p "$stage1_train_root" "$stage1_unit_root"
 candidate_status_file="${run_dir}/candidate_status.tsv"
-if [[ ! -e "$candidate_status_file" ]]; then
-  printf 'candidate\tcheckpoint\tstatus\texit_code\tfailed_stage\n' \
-    >"$candidate_status_file"
-fi
 
 current_stage="amplitude_screen"
-for candidate in A10 A50 A100 B50; do
-  read -r rel_lambda grad_scale lr_multiplier logit_scale < <(
-    candidate_values "$candidate"
-  )
-  train_container="${stage1_train_root}/${candidate}"
-  if ensure_training "$train_container" \
-      "mraf_gate_amplitude_${candidate}_seed${seed}" \
-      10 1 "$rel_lambda" "$grad_scale" "$lr_multiplier" "$logit_scale"; then
-    :
-  else
-    candidate_exit=$?
-    printf '%s\tALL\tFAILED\t%s\ttraining\n' \
-      "$candidate" "$candidate_exit" >>"$candidate_status_file"
-    continue
+if [[ "$resume_mode" == "true" ]]; then
+  printf '%s\n' "$resume_plan_output"
+  echo "Skipping completed Stage-1 training, evaluation, and diagnostics."
+else
+  mkdir -p "$stage1_train_root" "$stage1_unit_root"
+  if [[ ! -e "$candidate_status_file" ]]; then
+    printf 'candidate\tcheckpoint\tstatus\texit_code\tfailed_stage\n' \
+      >"$candidate_status_file"
   fi
-  train_dir=$effective_train_dir
-  for checkpoint_kind in best last; do
-    unit_dir="${stage1_unit_root}/${candidate}_${checkpoint_kind}"
-    if {
-      if [[ ! -d "$unit_dir" ]]; then
-        prepare_unit "$unit_dir" "$train_dir" "$candidate" "$checkpoint_kind" \
-          "$lr_multiplier" "$logit_scale" "$rel_lambda" "$grad_scale"
-      fi
-      evaluate_unit "$unit_dir" "$candidate" "$screen_scenarios" 4 "$logit_scale"
-    }; then
-      printf '%s\t%s\tCOMPLETED\t0\tNONE\n' \
-        "$candidate" "$checkpoint_kind" >>"$candidate_status_file"
+  for candidate in A10 A50 A100 B50; do
+    read -r rel_lambda grad_scale lr_multiplier logit_scale < <(
+      candidate_values "$candidate"
+    )
+    train_container="${stage1_train_root}/${candidate}"
+    if ensure_training "$train_container" \
+        "mraf_gate_amplitude_${candidate}_seed${seed}" \
+        10 1 "$rel_lambda" "$grad_scale" "$lr_multiplier" "$logit_scale"; then
+      :
     else
       candidate_exit=$?
-      printf '%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
-        "$candidate" "$checkpoint_kind" "$candidate_exit" \
-        >>"$candidate_status_file"
+      printf '%s\tALL\tFAILED\t%s\ttraining\n' \
+        "$candidate" "$candidate_exit" >>"$candidate_status_file"
+      continue
     fi
+    train_dir=$effective_train_dir
+    for checkpoint_kind in best last; do
+      unit_dir="${stage1_unit_root}/${candidate}_${checkpoint_kind}"
+      if {
+        if [[ ! -d "$unit_dir" ]]; then
+          prepare_unit "$unit_dir" "$train_dir" "$candidate" "$checkpoint_kind" \
+            "$lr_multiplier" "$logit_scale" "$rel_lambda" "$grad_scale"
+        fi
+        evaluate_unit "$unit_dir" "$candidate" "$screen_scenarios" 4 "$logit_scale"
+      }; then
+        printf '%s\t%s\tCOMPLETED\t0\tNONE\n' \
+          "$candidate" "$checkpoint_kind" >>"$candidate_status_file"
+      else
+        candidate_exit=$?
+        printf '%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
+          "$candidate" "$checkpoint_kind" "$candidate_exit" \
+          >>"$candidate_status_file"
+      fi
+    done
   done
-done
+fi
 
 "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
   --mode screen --candidate-root "$stage1_unit_root" \
   --reference-screen-root "$reference_screen_root" --output-dir "$run_dir" \
-  >"${run_dir}/screen_summary.log"
+  >"${run_dir}/screen_summary.log" 2>&1
 selection_json="${run_dir}/selected_amplitude_candidate.json"
 selection_status="$("$python_bin" -B -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$selection_json")"
@@ -653,6 +712,7 @@ if [[ "$selection_status" == "AMPLITUDE_SCREEN_FAILED" ]]; then
 fi
 
 if [[ "$selection_status" == "VIABLE_SELECTED_FOR_CALIBRATION" ]]; then
+  run_real_preflight
   current_stage="calibration"
   calibration_root="${run_dir}/calibration"
   mkdir -p "$calibration_root"
@@ -732,6 +792,11 @@ if [[ "$auto_continue" != "true" ]]; then
   echo "selected_candidate_json=$selection_json"
   echo "Confirmation/formal skipped because --auto-continue was not supplied."
   exit 0
+fi
+
+run_real_preflight
+if [[ "$resume_mode" == "true" ]]; then
+  check_space_gb "$run_dir" 18
 fi
 
 selected_candidate="$("$python_bin" -B -c \
@@ -832,7 +897,7 @@ final_status="$("$python_bin" -B -c \
   echo "formal_last_sha256=$(sha256sum "${formal_units}/last/checkpoint.pth" | awk '{print $1}')"
 } >>"${run_dir}/experiment_manifest.txt"
 archive="${run_dir}/mraf_gate_amplitude_rescue_reports.tar.gz"
-tar -czf "$archive" -C "$run_dir" \
+archive_files=(
   amplitude_screen_metrics.tsv amplitude_screen_mechanism.tsv \
   checkpoint_comparison.tsv amplitude_candidate_ranking.tsv \
   calibration_screen.tsv selected_amplitude_candidate.json \
@@ -840,6 +905,11 @@ tar -czf "$archive" -C "$run_dir" \
   final_robustness_summary.tsv final_mechanism_summary.tsv \
   comparison_with_previous_screen.tsv comparison_with_old_seed1.tsv \
   FINAL_REPORT.txt experiment_manifest.txt candidate_status.tsv
+)
+if [[ -s "${run_dir}/resume_history.tsv" ]]; then
+  archive_files+=(resume_history.tsv)
+fi
+tar -czf "$archive" -C "$run_dir" "${archive_files[@]}"
 [[ -s "$archive" ]] || die "Final report archive is missing or empty"
 
 write_status "COMPLETED" 0 "NONE"

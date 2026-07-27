@@ -160,5 +160,115 @@ mock/dry-run 不调用真实 `train.py`、`test.py`，不访问 GPU，不启动�
 - `experiment_manifest.txt`
 - `mraf_gate_amplitude_rescue_reports.tar.gz`
 
+## Legacy 输出兼容与 amplitude_screen 恢复
+
+2026-07-27 的真实 AutoDL 失败不是 Stage 1 数据缺失：A10、A50、A100、B50
+的 best/last 共 8 个单元均已完成训练、8 场景评估和快速机制诊断。失败发生在
+`amplitude_screen` 汇总器只搜索新版文件名，未找到历史 S4 的真实文件
+`<reference-root>/screen/rescue_screen_summary.tsv`。旧文件的退化指标字段为
+`key_degraded_mean_R1`。
+
+汇总器现在按固定优先级只读搜索：
+
+1. `screen/rescue_screen_summary.tsv`
+2. `rescue_screen_summary.tsv`
+3. `screen/rescue_screen_metrics.tsv`
+4. 其他已知的旧版 summary、metrics、ranking 和 comparison 位置
+
+`clean_R1`、`clean_r1`、`clean_rank1`、`R1_clean` 会统一为
+`clean_R1`；`key_degraded_mean_R1`、`degraded_mean_R1`、
+`mean_degraded_R1`、`key_degraded_R1_mean` 会统一为
+`key_degraded_mean_R1`。候选必须在去除首尾空白后精确等于 `S4`，不会把
+`S40` 当作 S4；NaN、Inf 和无法转换的数值会被明确拒绝。历史目录、文件内容
+和 mtime 均不会被修改。
+
+历史 `mraf_epoch_metrics.tsv` 若包含
+`target_rgb_meantarget_rgb_std` 或
+`scorer_first_weight_normscorer_last_weight_norm`，只读解析器仅按这两个白名单
+拆分表头，并要求拆分后的列数严格等于每一行的数据列数。未知合并表头或行宽不一致
+会失败，不会猜测 schema，也不会回写历史 TSV。报告中的
+`legacy_header_repaired` 和 `legacy_header_path` 仅表示读取时做了兼容映射，
+不表示原文件已修复。
+
+未来训练写出的 `mraf_epoch_metrics.tsv` 使用唯一固定字段表、
+`csv.DictWriter(delimiter="\t", lineterminator="\n",
+extrasaction="raise")`，写入前校验字段唯一、非空和关键字段齐全。每次追加都会在
+同目录临时文件中生成并校验完整 header/row 列数，再用 `os.replace` 原子替换。
+汇总 TSV/JSON 和 `status.txt` 同样采用临时文件后原子替换，避免失败时留下半行
+或半个文件。
+
+### 恢复前只读 dry-run
+
+先部署 hotfix，再执行：
+
+```bash
+conda activate rgbt5090
+cd /root/autodl-tmp/IRRA-main-mraf/IRRA-main
+
+bash scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh \
+  --resume-run-root /root/autodl-tmp/MRAF_GATE_AMPLITUDE_RUNS_c667946b/20260727_092554_c667946b_mraf_gate_amplitude_rescue_seed1 \
+  --device 0 \
+  --auto-continue \
+  --dry-run
+```
+
+有效计划必须输出 `RESUME_PLAN_VALID=true`、原训练 commit、当前聚合 commit、
+四个训练候选和 8 个 checkpoint/evaluation/diagnosis 单元的跳过计数，以及
+`NEXT_STAGE=amplitude_screen`。dry-run 不写 `status.txt`、
+`resume_history.tsv` 或任何报告，不调用训练、评估、诊断、GPU 或 shutdown。
+
+恢复只接受原始 commit 精确为
+`c667946b2c51740bfa7892f5a2daee73d1279b44` 的 run，且当前 commit 必须是其
+Git 后代；跨 commit 的差异只能包含本次兼容/resume 热修文件。还会校验：
+
+- 原状态为 `FAILED/amplitude_screen`，seed、base config 和 reference roots 不变；
+- 固定 A10/A50/A100/B50 矩阵与 Stage 1 协议未变；
+- `candidate_status.tsv` 的 8 个单元均为 `COMPLETED`；
+- 每个单元的 checkpoint、config、训练日志、两份训练期 TSV 均非空；
+- 8 场景评分和快速诊断必需文件均非空；
+- `unit.json` 没有 NaN、Inf 或 OOM 标记。
+
+任何一项不满足都会输出 `RESUME_PLAN_VALID=false` 和具体缺失项并退出，绝不会
+静默重跑整个 Stage 1。
+
+### 正式 nohup 恢复
+
+dry-run 通过后：
+
+```bash
+nohup bash scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh \
+  --resume-run-root /root/autodl-tmp/MRAF_GATE_AMPLITUDE_RUNS_c667946b/20260727_092554_c667946b_mraf_gate_amplitude_rescue_seed1 \
+  --device 0 \
+  --auto-continue \
+  --shutdown-on-success \
+  > /root/autodl-tmp/mraf_gate_amplitude_resume.log 2>&1 &
+
+tail -f /root/autodl-tmp/mraf_gate_amplitude_resume.log
+```
+
+正式恢复复用原 run-root，先把旧状态写入 `resume_history.tsv`，再原子更新
+`status.txt` 为 RUNNING；不改 `experiment_manifest.txt` 中的训练 commit，
+不追加重复的 candidate status，也不调用 Stage 1 的 `train.py`、`test.py`
+或诊断工具，而是直接重新执行 screen 汇总。随后仍按原门禁进入 STRONG 的确认训练、
+VIABLE 的只读校准或无 VIABLE 的 `AMPLITUDE_SCREEN_FAILED`。失败绝不关机，只有
+最终正式产物完整且状态为 COMPLETED 才允许 shutdown。
+
+检查没有重跑 Stage 1 及恢复结果：
+
+```bash
+cat <run-root>/resume_history.tsv
+cat <run-root>/status.txt
+cat <run-root>/screen_summary.log
+cat <run-root>/selected_amplitude_candidate.json
+column -t -s $'\t' <run-root>/amplitude_candidate_ranking.tsv
+grep -E 'STAGE1_.*_SKIPPED|Skipping completed Stage-1' \
+  /root/autodl-tmp/mraf_gate_amplitude_resume.log
+```
+
+最终 `FINAL_REPORT.txt` 会分别记录
+`training_commit=c667946b...` 与
+`resume_aggregation_commit=<hotfix SHA>`；后者只是兼容汇总代码，不能写成训练
+权重所用的 commit。失败的汇总目录或部分日志不能作为最终实验结论。
+
 所有结果仍只属于 seed 1。短周期筛选只用于选择实验配置，不能直接作为论文
 最终结论；只有通过后才具备继续 seed 2–5 的条件。
