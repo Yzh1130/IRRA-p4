@@ -194,9 +194,7 @@ def _write_resume_fixture(tmp_path, *, manifest_path_style="native"):
     def manifest_path(path):
         if manifest_path_style == "native":
             return str(path.resolve())
-        drive = path.drive.rstrip(":").lower()
-        suffix = path.resolve().as_posix().split(":/", 1)[-1]
-        return f"/mnt/{drive}/{suffix}"
+        return _as_shell_path(path.resolve())
 
     manifest = {
         "PIPELINE_ID": "mraf_gate_amplitude_rescue_v3",
@@ -1047,11 +1045,53 @@ def test_resume_plan_allows_strict_hotfix_descendant_and_records_history(tmp_pat
     assert rows[-1]["old_failed_stage"] == "amplitude_screen"
 
 
-def _as_wsl_path(path):
-    resolved = path.resolve()
-    drive = resolved.drive.rstrip(":").lower()
-    suffix = resolved.as_posix().split(":/", 1)[-1]
-    return f"/mnt/{drive}/{suffix}"
+def _as_shell_path(path):
+    """Return a Bash path, converting only an explicit Windows drive path."""
+    raw = str(path)
+    normalized = raw.replace("\\", "/")
+    if (
+        len(normalized) >= 3
+        and normalized[0].isalpha()
+        and normalized[1] == ":"
+        and normalized[2] == "/"
+    ):
+        drive = normalized[0].lower()
+        suffix = normalized[3:].lstrip("/")
+        return f"/mnt/{drive}/{suffix}"
+    return normalized
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("/tmp/a/b", "/tmp/a/b"),
+        ("/root/project", "/root/project"),
+        ("/home/user/project", "/home/user/project"),
+        (r"C:\Users\name\project", "/mnt/c/Users/name/project"),
+        (r"D:\Data\project", "/mnt/d/Data/project"),
+        (r"c:\Users\Name With Space\project", "/mnt/c/Users/Name With Space/project"),
+        ("/mnt/c/Users/name/project", "/mnt/c/Users/name/project"),
+        ("/tmp/path with space/project", "/tmp/path with space/project"),
+    ],
+)
+def test_as_shell_path_is_cross_platform(source, expected):
+    assert _as_shell_path(source) == expected
+
+
+def test_as_shell_path_never_rewrites_posix_roots_as_wsl_mounts():
+    assert not _as_shell_path("/tmp/project").startswith("/mnt//")
+    assert not _as_shell_path("/root/project").startswith("/mnt//")
+    assert "/mnt///tmp" not in _as_shell_path("/tmp/project")
+    assert "/mnt//root" not in _as_shell_path("/root/project")
+
+
+def test_as_shell_path_does_not_call_wslpath_or_a_subprocess(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise AssertionError("path conversion must be a pure function")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert _as_shell_path(r"C:\Users\name\project") == "/mnt/c/Users/name/project"
+    assert _as_shell_path("/tmp/project") == "/tmp/project"
 
 
 def test_pipeline_resume_dry_run_is_read_only_and_machine_readable(tmp_path):
@@ -1063,7 +1103,7 @@ def test_pipeline_resume_dry_run_is_read_only_and_machine_readable(tmp_path):
             "bash",
             "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
             "--resume-run-root",
-            _as_wsl_path(run_root),
+            _as_shell_path(run_root),
             "--device",
             "0",
             "--auto-continue",
@@ -1095,7 +1135,7 @@ def test_pipeline_mock_resume_skips_stage1_and_runs_summarizer(tmp_path):
             "bash",
             "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
             "--resume-run-root",
-            _as_wsl_path(run_root),
+            _as_shell_path(run_root),
             "--device",
             "0",
             "--auto-continue",
