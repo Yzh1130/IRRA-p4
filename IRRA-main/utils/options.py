@@ -127,6 +127,8 @@ def get_args():
     mraf_group.add_argument("--mraf_gate_logit_scale", type=float, default=1.0, help="positive multiplier applied to raw MRAF logits before temperature and softmax")
     mraf_group.add_argument("--mraf_gate_fp32", default=False, action='store_true', help="keep only the MRAF scorer, logits, alpha, and fusion arithmetic in FP32")
     mraf_group.add_argument("--mraf_gate_base_grad_scale", type=float, default=1.0, help="scale only base-task gate gradients into the MRAF scorer; valid range [0,1]")
+    mraf_group.add_argument("--mraf_equalize_modality_norm", default=False, action='store_true', help="equalize RGB/IR feature norms to their per-sample mean before MRAF weighted fusion; the gate and scorer path is unchanged")
+    mraf_group.add_argument("--mraf_freeze_gate", default=False, action='store_true', help="freeze MRAF gate weights at 0.5/0.5 for ablation; the scorer is still constructed but produces no effect on fusion")
     mraf_group.add_argument("--mraf_scorer_lr_multiplier", type=float, default=1.0, help="positive learning-rate multiplier applied only to MRAF scorer parameters")
     mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
     mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")

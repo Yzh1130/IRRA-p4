@@ -68,6 +68,8 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         gate_logit_scale: float = 1.0,
         gate_fp32: bool = False,
         gate_base_grad_scale: float = 1.0,
+        equalize_modality_norm: bool = False,
+        freeze_gate: bool = False,
     ) -> None:
         super().__init__()
         if int(feature_dim) <= 0:
@@ -100,6 +102,8 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         self.gate_logit_scale = float(gate_logit_scale)
         self.gate_fp32 = bool(gate_fp32)
         self.gate_base_grad_scale = float(gate_base_grad_scale)
+        self.equalize_modality_norm = bool(equalize_modality_norm)
+        self.freeze_gate = bool(freeze_gate)
         self.scorer = nn.Sequential(
             nn.Linear(self.feature_dim, self.hidden_dim),
             nn.GELU(),
@@ -118,6 +122,18 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
     def _zero_initialize_output_layer(self) -> None:
         nn.init.zeros_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
+
+    @staticmethod
+    def _equalize_feature_norms(
+        f_rgb: torch.Tensor,
+        f_ir: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scale both modalities to their per-sample arithmetic mean norm."""
+        n_rgb = f_rgb.norm(p=2, dim=-1, keepdim=True).clamp_min(float(eps))
+        n_ir = f_ir.norm(p=2, dim=-1, keepdim=True).clamp_min(float(eps))
+        n_bar = 0.5 * (n_rgb + n_ir)
+        return f_rgb * (n_bar / n_rgb), f_ir * (n_bar / n_ir)
 
     def _apply(self, fn):
         """Keep the optional scorer in FP32 across model.half()/to()/conversion."""
@@ -158,13 +174,22 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 ir_for_fusion = f_ir.float()
                 rgb_normalized = F.normalize(rgb_for_fusion, p=2, dim=-1)
                 ir_normalized = F.normalize(ir_for_fusion, p=2, dim=-1)
-                rgb_logit = self.scorer(rgb_normalized)
-                ir_logit = self.scorer(ir_normalized)
-                raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
-                scaled_logits = raw_logits * self.gate_logit_scale
-                alpha = F.softmax(
-                    scaled_logits / self.gate_temperature, dim=-1
-                )
+                if self.freeze_gate:
+                    raw_logits = rgb_normalized.new_zeros(
+                        (f_rgb.shape[0], 2)
+                    )
+                    scaled_logits = raw_logits.clone()
+                    alpha = rgb_normalized.new_full(
+                        (f_rgb.shape[0], 2), 0.5
+                    )
+                else:
+                    rgb_logit = self.scorer(rgb_normalized)
+                    ir_logit = self.scorer(ir_normalized)
+                    raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+                    scaled_logits = raw_logits * self.gate_logit_scale
+                    alpha = F.softmax(
+                        scaled_logits / self.gate_temperature, dim=-1
+                    )
                 if self.gate_base_grad_scale == 1.0:
                     alpha_for_base = alpha
                 else:
@@ -175,6 +200,12 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 alpha_rgb = alpha_for_base[:, 0:1]
                 alpha_ir = alpha_for_base[:, 1:2]
                 alpha_aux = alpha
+                if self.equalize_modality_norm:
+                    rgb_for_fusion, ir_for_fusion = (
+                        self._equalize_feature_norms(
+                            rgb_for_fusion, ir_for_fusion
+                        )
+                    )
                 fused = 2.0 * (
                     alpha_rgb * rgb_for_fusion
                     + alpha_ir * ir_for_fusion
@@ -186,13 +217,18 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             ir_normalized = F.normalize(f_ir, p=2, dim=-1).to(
                 dtype=scorer_dtype
             )
-            rgb_logit = self.scorer(rgb_normalized)
-            ir_logit = self.scorer(ir_normalized)
-            raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
-            scaled_logits = raw_logits * self.gate_logit_scale
-            alpha = F.softmax(
-                scaled_logits / self.gate_temperature, dim=-1
-            )
+            if self.freeze_gate:
+                raw_logits = rgb_normalized.new_zeros((f_rgb.shape[0], 2))
+                scaled_logits = raw_logits.clone()
+                alpha = rgb_normalized.new_full((f_rgb.shape[0], 2), 0.5)
+            else:
+                rgb_logit = self.scorer(rgb_normalized)
+                ir_logit = self.scorer(ir_normalized)
+                raw_logits = torch.cat([rgb_logit, ir_logit], dim=-1)
+                scaled_logits = raw_logits * self.gate_logit_scale
+                alpha = F.softmax(
+                    scaled_logits / self.gate_temperature, dim=-1
+                )
             if self.gate_base_grad_scale == 1.0:
                 alpha_for_base = alpha
             else:
@@ -205,7 +241,16 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             alpha_aux = alpha.to(dtype=f_rgb.dtype)
             alpha_rgb = alpha_for_fusion[:, 0:1]
             alpha_ir = alpha_for_fusion[:, 1:2]
-            fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
+            if self.equalize_modality_norm:
+                rgb_for_fusion, ir_for_fusion = (
+                    self._equalize_feature_norms(f_rgb, f_ir)
+                )
+                fused = 2.0 * (
+                    alpha_rgb * rgb_for_fusion
+                    + alpha_ir * ir_for_fusion
+                )
+            else:
+                fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
         if not bool(torch.isfinite(alpha).all().item()):
             raise ValueError("MRAF reliability weights contain NaN or Inf values.")
         if not bool(torch.isfinite(fused).all().item()):

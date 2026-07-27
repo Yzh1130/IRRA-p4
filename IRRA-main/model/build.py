@@ -123,6 +123,12 @@ class IRRA(nn.Module):
                 gate_base_grad_scale=float(
                     getattr(args, "mraf_gate_base_grad_scale", 1.0)
                 ),
+                equalize_modality_norm=bool(
+                    getattr(args, "mraf_equalize_modality_norm", False)
+                ),
+                freeze_gate=bool(
+                    getattr(args, "mraf_freeze_gate", False)
+                ),
             )
 
         # Temperature scalar used by global alignment losses.
