@@ -103,6 +103,7 @@ FORMAL_SCENARIOS = (
 )
 KEY_DEGRADED_SCENARIOS = SCREEN_SCENARIOS[1:]
 EXPECTED_ORIGINAL_COMMIT = "c667946b2c51740bfa7892f5a2daee73d1279b44"
+CALIBRATION_RESUME_BASE_COMMIT = "ed217ac5875c31a2d818fb643554b8fd8dcbc732"
 ALLOWED_HOTFIX_PATHS = frozenset(
     {
         "IRRA-main/tools/revision/summarize_mraf_gate_amplitude_rescue.py",
@@ -161,6 +162,16 @@ RESUME_PROTOCOL: Mapping[str, Any] = {
     "mdrc_warmup_epoch": 3,
     "num_epoch": 10,
     "mraf_rel_warmup_epoch": 1,
+}
+CALIBRATION_RESUME_SELECTION: Mapping[str, Any] = {
+    "selected_candidate": "B50",
+    "selected_checkpoint": "best",
+    "status": "STRONG_SELECTED",
+    "selection_source": "read_only_calibration",
+    "mraf_scorer_lr_multiplier": 50.0,
+    "mraf_gate_logit_scale": 2.0,
+    "mraf_rel_lambda": 1.0,
+    "mraf_gate_base_grad_scale": 1.0,
 }
 
 METRIC_FIELDS = (
@@ -820,6 +831,32 @@ def _git_command_prefix(repo_root: Path) -> List[str]:
     ]
 
 
+def _process_snapshot() -> str:
+    completed = subprocess.run(
+        ["ps", "-eo", "args="],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.stdout
+
+
+def _active_run_processes(snapshot: str, run_root: Path) -> List[str]:
+    run_markers = {str(run_root), str(run_root.resolve())}
+    executable_markers = (
+        "train.py",
+        "test.py",
+        "diagnose_mraf_mechanism.py",
+    )
+    return [
+        line.strip()
+        for line in snapshot.splitlines()
+        if any(marker in line for marker in run_markers)
+        and any(marker in line for marker in executable_markers)
+    ]
+
+
 @dataclass(frozen=True)
 class ResumePlan:
     valid: bool
@@ -834,6 +871,13 @@ class ResumePlan:
     checkpoint_units_skipped: int = 0
     evaluations_skipped: int = 0
     diagnostics_skipped: int = 0
+    calibration_units_skipped: int = 0
+    calibration_evaluations_skipped: int = 0
+    calibration_diagnostics_skipped: int = 0
+    selected_candidate: str = ""
+    selected_checkpoint: str = ""
+    selected_logit_scale: Optional[float] = None
+    compatibility_reason: str = ""
 
     def machine_lines(self) -> List[str]:
         lines = [
@@ -847,6 +891,21 @@ class ResumePlan:
             f"STAGE1_CHECKPOINT_UNITS_SKIPPED={self.checkpoint_units_skipped}",
             f"STAGE1_EVALUATIONS_SKIPPED={self.evaluations_skipped}",
             f"STAGE1_DIAGNOSTICS_SKIPPED={self.diagnostics_skipped}",
+            f"CALIBRATION_UNITS_SKIPPED={self.calibration_units_skipped}",
+            (
+                "CALIBRATION_EVALUATIONS_SKIPPED="
+                f"{self.calibration_evaluations_skipped}"
+            ),
+            (
+                "CALIBRATION_DIAGNOSTICS_SKIPPED="
+                f"{self.calibration_diagnostics_skipped}"
+            ),
+            f"SELECTED_CANDIDATE={self.selected_candidate or 'NONE'}",
+            f"SELECTED_CHECKPOINT={self.selected_checkpoint or 'NONE'}",
+            (
+                "SELECTED_LOGIT_SCALE="
+                f"{self.selected_logit_scale if self.selected_logit_scale is not None else 'NONE'}"
+            ),
             f"NEXT_STAGE={self.next_stage or 'NONE'}",
             f"RUN_ROOT={self.run_root}",
         ]
@@ -863,8 +922,9 @@ def validate_resume_plan(
     changed_paths_reader: Optional[
         Callable[[Path, str, str], Sequence[str]]
     ] = None,
+    process_snapshot_reader: Optional[Callable[[], str]] = None,
 ) -> ResumePlan:
-    """Validate an aggregation-only Stage-1 resume without modifying artifacts."""
+    """Validate a strict Stage-1 aggregation or post-calibration resume."""
     reasons: List[str] = []
     try:
         manifest = _read_key_value_file(run_root / "experiment_manifest.txt")
@@ -880,17 +940,31 @@ def validate_resume_plan(
     original = manifest.get("git_head", "")
     old_status = status.get("STATUS", "")
     old_failed_stage = status.get("FAILED_STAGE", "")
+    old_exit_code = status.get("EXIT_CODE", "")
+    amplitude_resume = (
+        old_status == "FAILED" and old_failed_stage == "amplitude_screen"
+    )
+    calibration_resume = (
+        old_status == "FAILED"
+        and old_failed_stage in {"calibration", "confirmation_preflight"}
+    )
     if manifest.get("PIPELINE_ID") != "mraf_gate_amplitude_rescue_v3":
         reasons.append("experiment_manifest PIPELINE_ID is not mraf_gate_amplitude_rescue_v3")
     if original != EXPECTED_ORIGINAL_COMMIT:
         reasons.append(
             f"original commit must be {EXPECTED_ORIGINAL_COMMIT}, got {original or 'missing'}"
         )
-    if old_status != "FAILED" or old_failed_stage != "amplitude_screen":
+    if not amplitude_resume and not calibration_resume:
         reasons.append(
-            "resume requires STATUS=FAILED and FAILED_STAGE=amplitude_screen, "
+            "resume requires STATUS=FAILED and FAILED_STAGE in "
+            "{amplitude_screen, calibration, confirmation_preflight}, "
             f"got STATUS={old_status or 'missing'} "
             f"FAILED_STAGE={old_failed_stage or 'missing'}"
+        )
+    if calibration_resume and old_exit_code != "2":
+        reasons.append(
+            "post-calibration resume requires EXIT_CODE=2 from disk-space "
+            f"preflight, got {old_exit_code or 'missing'}"
         )
     if manifest.get("seed") != "1":
         reasons.append(f"resume seed must remain 1, got {manifest.get('seed', 'missing')}")
@@ -922,6 +996,20 @@ def validate_resume_plan(
             reasons.append(f"Git compatibility validation failed: {error}")
     elif not resume_commit:
         reasons.append("resume code commit is empty")
+    if calibration_resume and resume_commit:
+        ancestry = ancestry_checker or _git_is_ancestor
+        try:
+            if not ancestry(
+                repo_root, CALIBRATION_RESUME_BASE_COMMIT, resume_commit
+            ):
+                reasons.append(
+                    f"post-calibration resume commit {resume_commit} is not a "
+                    f"descendant of {CALIBRATION_RESUME_BASE_COMMIT}"
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            reasons.append(
+                f"Post-calibration Git ancestry validation failed: {error}"
+            )
 
     candidate_status_path = run_root / "candidate_status.tsv"
     try:
@@ -929,13 +1017,13 @@ def validate_resume_plan(
     except (OSError, UnicodeError, csv.Error, ValueError) as error:
         status_rows = []
         reasons.append(f"candidate status cannot be read: {error}")
-    latest_status: Dict[Tuple[str, str], str] = {}
+    latest_status: Dict[Tuple[str, str], Dict[str, str]] = {}
     for row in status_rows:
         key = (
             str(row.get("candidate", "")).strip(),
             str(row.get("checkpoint", "")).strip(),
         )
-        latest_status[key] = str(row.get("status", "")).strip()
+        latest_status[key] = row
 
     completed_units = 0
     completed_evaluations = 0
@@ -955,10 +1043,14 @@ def validate_resume_plan(
         for checkpoint in CHECKPOINT_KINDS:
             label = f"{candidate}_{checkpoint}"
             unit = unit_root / label
-            if latest_status.get((candidate, checkpoint)) != "COMPLETED":
+            status_row = latest_status.get((candidate, checkpoint), {})
+            unit_status = str(status_row.get("status", "")).strip()
+            unit_exit_code = str(status_row.get("exit_code", "")).strip()
+            if unit_status != "COMPLETED" or unit_exit_code != "0":
                 reasons.append(
                     f"{label}: candidate_status is "
-                    f"{latest_status.get((candidate, checkpoint), 'missing')}, expected COMPLETED"
+                    f"{unit_status or 'missing'}/{unit_exit_code or 'missing'}, "
+                    "expected COMPLETED/0"
                 )
             required_files = (
                 "checkpoint.pth",
@@ -983,6 +1075,9 @@ def validate_resume_plan(
                 except (OSError, ValueError, json.JSONDecodeError) as error:
                     reasons.append(f"{label}: invalid unit.json: {error}")
                     unit_complete = False
+            if not metadata:
+                reasons.append(f"{label}: unit.json must contain an object")
+                unit_complete = False
             if metadata:
                 if str(metadata.get("candidate", "")).strip() != candidate:
                     reasons.append(f"{label}: unit candidate matrix label changed")
@@ -1065,7 +1160,257 @@ def validate_resume_plan(
             if diagnostic_complete:
                 completed_diagnostics += 1
 
+    calibration_units = 0
+    calibration_evaluations = 0
+    calibration_diagnostics = 0
+    selected_candidate = ""
+    selected_checkpoint = ""
+    selected_logit_scale: Optional[float] = None
+    if calibration_resume:
+        for name in (
+            "amplitude_screen_metrics.tsv",
+            "amplitude_screen_mechanism.tsv",
+            "checkpoint_comparison.tsv",
+            "amplitude_candidate_ranking.tsv",
+        ):
+            path = run_root / name
+            if not path.is_file() or path.stat().st_size <= 0:
+                reasons.append(f"post-calibration resume missing non-empty {path}")
+
+        calibration_root = run_root / "calibration"
+        for scale in CALIBRATION_SCALES:
+            scale_label = format(scale, "g")
+            label = f"calibration_scale_{scale_label}"
+            unit = calibration_root / f"scale_{scale_label}"
+            status_row = latest_status.get((label, "best"), {})
+            unit_status = str(status_row.get("status", "")).strip()
+            unit_exit_code = str(status_row.get("exit_code", "")).strip()
+            if unit_status != "COMPLETED" or unit_exit_code != "0":
+                reasons.append(
+                    f"{label}: candidate_status is "
+                    f"{unit_status or 'missing'}/{unit_exit_code or 'missing'}, "
+                    "expected COMPLETED/0"
+                )
+            required_files = (
+                "checkpoint.pth",
+                "configs.yaml",
+                "train.log",
+                "mraf_epoch_metrics.tsv",
+                "checkpoint_selection.tsv",
+                "unit.json",
+            )
+            unit_complete = True
+            for name in required_files:
+                path = unit / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    reasons.append(f"{label}: missing or empty {path}")
+                    unit_complete = False
+            metadata: Mapping[str, Any] = {}
+            metadata_path = unit / "unit.json"
+            if metadata_path.is_file():
+                try:
+                    loaded = _read_json(metadata_path)
+                    metadata = loaded if isinstance(loaded, Mapping) else {}
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    reasons.append(f"{label}: invalid unit.json: {error}")
+                    unit_complete = False
+            if not metadata:
+                reasons.append(f"{label}: unit.json must contain an object")
+                unit_complete = False
+            expected_metadata = {
+                "candidate": "B50",
+                "checkpoint": "best",
+                "mraf_scorer_lr_multiplier": 50.0,
+                "mraf_gate_logit_scale": scale,
+                "mraf_rel_lambda": 1.0,
+                "mraf_gate_base_grad_scale": 1.0,
+            }
+            if metadata:
+                for field, expected_value in expected_metadata.items():
+                    actual = metadata.get(field)
+                    matches = (
+                        str(actual).strip() == expected_value
+                        if isinstance(expected_value, str)
+                        else _numbers_equal(actual, expected_value)
+                    )
+                    if not matches:
+                        reasons.append(
+                            f"{label}: {field}={actual!r}, "
+                            f"expected {expected_value!r}"
+                        )
+                        unit_complete = False
+                if not _is_true(metadata.get("read_only_calibration", False)):
+                    reasons.append(f"{label}: read_only_calibration is not true")
+                    unit_complete = False
+                for flag in ("has_nan", "has_inf", "has_oom"):
+                    if _is_true(metadata.get(flag, False)):
+                        reasons.append(f"{label}: {flag}=true")
+                        unit_complete = False
+            config_path = unit / "configs.yaml"
+            if config_path.is_file():
+                try:
+                    config = load_config_mapping(str(config_path))
+                except (OSError, ValueError, TypeError) as error:
+                    config = {}
+                    reasons.append(f"{label}: configs.yaml cannot be loaded: {error}")
+                    unit_complete = False
+                expected_config = {
+                    "mraf_gate_fp32": True,
+                    "mraf_rel_warmup_epoch": 1,
+                    "mraf_scorer_lr_multiplier": 50.0,
+                    "mraf_rel_lambda": 1.0,
+                    "mraf_gate_base_grad_scale": 1.0,
+                }
+                for field, expected_value in expected_config.items():
+                    actual = config.get(field)
+                    matches = (
+                        _is_true(actual) == expected_value
+                        if isinstance(expected_value, bool)
+                        else _numbers_equal(actual, expected_value)
+                    )
+                    if not matches:
+                        reasons.append(
+                            f"{label}: config {field}={actual!r}, "
+                            f"expected {expected_value!r}"
+                        )
+                        unit_complete = False
+            evaluation_complete = True
+            for scenario in SCREEN_SCENARIOS:
+                score = _scenario_score(unit, scenario)
+                if score is None or not score.is_file() or score.stat().st_size <= 0:
+                    reasons.append(
+                        f"{label}: missing non-empty evaluation for {scenario}"
+                    )
+                    evaluation_complete = False
+            diagnostic = _active_diagnostic_dir(unit)
+            diagnostic_complete = True
+            for name in (
+                "diagnosis.json",
+                "scenario_gate_statistics.csv",
+                "gate_direction_statistics.csv",
+                "gradient_diagnostics.csv",
+                "fusion_path_check.json",
+            ):
+                path = diagnostic / name
+                if not path.is_file() or path.stat().st_size <= 0:
+                    reasons.append(
+                        f"{label}: missing or empty diagnostic {path}"
+                    )
+                    diagnostic_complete = False
+            if unit_complete:
+                calibration_units += 1
+            if evaluation_complete:
+                calibration_evaluations += 1
+            if diagnostic_complete:
+                calibration_diagnostics += 1
+
+        calibration_screen = run_root / "calibration_screen.tsv"
+        try:
+            calibration_rows = read_tsv_compatible(calibration_screen).rows
+        except (OSError, UnicodeError, csv.Error, ValueError) as error:
+            calibration_rows = []
+            reasons.append(f"calibration_screen.tsv cannot be parsed: {error}")
+        if not calibration_rows:
+            reasons.append("calibration_screen.tsv is missing, empty, or has no rows")
+        scale_two = [
+            row
+            for row in calibration_rows
+            if _numbers_equal(row.get("mraf_gate_logit_scale"), 2.0)
+        ]
+        if len(scale_two) != 1:
+            reasons.append(
+                "calibration_screen.tsv must contain exactly one scale=2 row"
+            )
+        elif (
+            str(scale_two[0].get("source_candidate", "")).strip() != "B50"
+            or str(scale_two[0].get("source_checkpoint", "")).strip() != "best"
+            or str(scale_two[0].get("classification", "")).strip()
+            != "STRONG_PASS"
+            or not _is_true(scale_two[0].get("strong_pass", False))
+        ):
+            reasons.append(
+                "calibration scale=2 must be B50/best with STRONG_PASS"
+            )
+
+        selected_path = run_root / "selected_amplitude_candidate.json"
+        selection: Mapping[str, Any] = {}
+        if not selected_path.is_file() or selected_path.stat().st_size <= 0:
+            reasons.append(
+                "selected_amplitude_candidate.json is missing or empty"
+            )
+        else:
+            try:
+                loaded = _read_json(selected_path)
+                selection = loaded if isinstance(loaded, Mapping) else {}
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                reasons.append(
+                    f"selected_amplitude_candidate.json cannot be parsed: {error}"
+                )
+        for field, expected_value in CALIBRATION_RESUME_SELECTION.items():
+            actual = selection.get(field)
+            matches = (
+                str(actual).strip() == expected_value
+                if isinstance(expected_value, str)
+                else _numbers_equal(actual, expected_value)
+            )
+            if not matches:
+                reasons.append(
+                    f"selected_amplitude_candidate.json {field}={actual!r}, "
+                    f"expected {expected_value!r}"
+                )
+        selected_candidate = str(selection.get("selected_candidate", "")).strip()
+        selected_checkpoint = str(selection.get("selected_checkpoint", "")).strip()
+        selected_logit_scale = _as_float(selection.get("mraf_gate_logit_scale"))
+
+        confirmation_summary = run_root / "confirmation_summary.tsv"
+        if confirmation_summary.exists():
+            reasons.append(
+                "confirmation_summary.tsv already exists; refusing to repeat "
+                "or overwrite confirmation"
+            )
+        confirmation_root = run_root / "confirmation"
+        if confirmation_root.exists() and any(confirmation_root.iterdir()):
+            reasons.append(
+                "partial confirmation artifacts already exist; manual review "
+                "is required before resume"
+            )
+        confirmation_status_rows = [
+            row
+            for (candidate, _), row in latest_status.items()
+            if candidate == "confirmation"
+        ]
+        if confirmation_status_rows:
+            reasons.append(
+                "candidate_status already contains confirmation units; manual "
+                "review is required before resume"
+            )
+        snapshot_reader = process_snapshot_reader or _process_snapshot
+        try:
+            active = _active_run_processes(snapshot_reader(), run_root)
+        except (OSError, subprocess.SubprocessError) as error:
+            active = []
+            reasons.append(f"active process validation failed: {error}")
+        if active:
+            reasons.append(
+                f"active training/evaluation/diagnosis processes found: {active}"
+            )
+
     valid = not reasons
+    next_stage = (
+        "confirmation"
+        if valid and calibration_resume
+        else "amplitude_screen"
+        if valid
+        else ""
+    )
+    compatibility_reason = (
+        "completed calibration artifacts and STRONG_SELECTED candidate "
+        "verified; previous exit caused by disk-space preflight; resume "
+        "skips Stage 1 and calibration"
+        if calibration_resume
+        else "strict aggregation-only hotfix descendant; completed Stage-1 "
+        "artifacts verified"
+    )
     return ResumePlan(
         valid=valid,
         run_root=str(run_root.resolve()),
@@ -1073,12 +1418,19 @@ def validate_resume_plan(
         resume_commit=resume_commit,
         old_status=old_status,
         old_failed_stage=old_failed_stage,
-        next_stage="amplitude_screen" if valid else "",
+        next_stage=next_stage,
         reasons=tuple(reasons),
         training_candidates_skipped=completed_train_candidates,
         checkpoint_units_skipped=completed_units,
         evaluations_skipped=completed_evaluations,
         diagnostics_skipped=completed_diagnostics,
+        calibration_units_skipped=calibration_units,
+        calibration_evaluations_skipped=calibration_evaluations,
+        calibration_diagnostics_skipped=calibration_diagnostics,
+        selected_candidate=selected_candidate,
+        selected_checkpoint=selected_checkpoint,
+        selected_logit_scale=selected_logit_scale,
+        compatibility_reason=compatibility_reason,
     )
 
 
@@ -1107,8 +1459,7 @@ def record_resume_history(run_root: Path, plan: ResumePlan) -> None:
             "old_failed_stage": plan.old_failed_stage,
             "next_stage": plan.next_stage,
             "compatibility_reason": (
-                "strict aggregation-only hotfix descendant; "
-                "completed Stage-1 artifacts verified"
+                plan.compatibility_reason
             ),
         }
     )

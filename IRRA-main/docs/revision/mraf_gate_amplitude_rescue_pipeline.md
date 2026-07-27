@@ -265,6 +265,87 @@ grep -E 'STAGE1_.*_SKIPPED|Skipping completed Stage-1' \
   /root/autodl-tmp/mraf_gate_amplitude_resume.log
 ```
 
+## calibration 完成后的安全恢复
+
+2026-07-27 的真实 AutoDL run 已完成 Stage 1 的 8 个单元和 calibration 的
+5 个 scale（`2/5/10/20/50`），随后在进入确认训练前因磁盘预检失败。历史状态为
+`STATUS=FAILED`、`FAILED_STAGE=calibration`、`EXIT_CODE=2`；该失败不表示 calibration
+产物无效。兼容未来版本时，同一恢复入口也接受
+`FAILED_STAGE=confirmation_preflight`，但不会放宽其他校验。
+
+恢复器只在以下条件全部满足时跳过 Stage 1 和 calibration：
+
+- 原训练 commit 为 `c667946b2c51740bfa7892f5a2daee73d1279b44`，当前 commit 是
+  `ed217ac5875c31a2d818fb643554b8fd8dcbc732` 的 Git 后代，跨 commit
+  变更仅包含允许的 Pipeline、汇总器、测试和文档热修文件；
+- seed 为 1，Stage 1 的 8 个单元和 calibration 的 5 个单元均为
+  `COMPLETED/EXIT_CODE=0`，每个单元都有完整 checkpoint、配置、日志、8 场景评估和诊断；
+- `calibration_screen.tsv` 中唯一通过强门槛的是
+  `scale=2, candidate=B50, checkpoint=best`；
+- `selected_amplitude_candidate.json` 精确记录
+  `selection_status=STRONG_SELECTED`、`source=read_only_calibration`、
+  `mraf_scorer_lr_mult=50`、`mraf_logit_scale=2`、
+  `mraf_rel_lambda=1`、`mraf_base_grad_scale=1`；
+- 不存在 confirmation 汇总、非空 confirmation 目录或已完成 confirmation 状态，
+  且 run-root 下没有活跃的训练、评估或诊断进程。
+
+任一条件不满足都会输出 `RESUME_PLAN_VALID=false` 并退出；不会猜测、覆盖或重跑已有
+Stage 1/calibration。正式恢复会在 `resume_history.tsv` 追加兼容性说明，并保留原
+manifest 和历史状态行。恢复后的下一阶段固定为 `confirmation`：确认训练仍从原始
+pretrained 初始化开始跑 12 epoch，不从 screening/calibration checkpoint 续训；
+通过后正式 60 epoch 同样从原始 pretrained 初始化开始，实验协议不变。
+
+磁盘检查发生在确认训练前时，失败阶段写为 `confirmation_preflight`；正式训练前的
+磁盘检查仍写为 `formal_preflight`。失败时不会关机，只有最终正式产物完整且状态为
+`COMPLETED` 时，`--shutdown-on-success` 才允许关机。
+
+### AutoDL 恢复前只读检查
+
+```bash
+conda activate rgbt5090
+cd /root/autodl-tmp/IRRA-main-mraf/IRRA-main
+
+bash scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh \
+  --resume-run-root /root/autodl-tmp/MRAF_GATE_AMPLITUDE_RUNS_c667946b/20260727_092554_c667946b_mraf_gate_amplitude_rescue_seed1 \
+  --device 0 \
+  --auto-continue \
+  --dry-run
+```
+
+有效 dry-run 必须至少显示：
+
+```text
+RESUME_PLAN_VALID=true
+CALIBRATION_UNITS_SKIPPED=5
+CALIBRATION_EVALUATIONS_SKIPPED=5
+CALIBRATION_DIAGNOSTICS_SKIPPED=5
+SELECTED_CANDIDATE=B50
+SELECTED_CHECKPOINT=best
+SELECTED_LOGIT_SCALE=2
+NEXT_STAGE=confirmation
+```
+
+dry-run 是只读的：不写 `status.txt`/`resume_history.tsv`，不创建 confirmation
+目录，不运行训练、评估、诊断、GPU 命令或关机命令。
+
+### AutoDL 正式恢复
+
+磁盘空间满足要求且 dry-run 校验通过后：
+
+```bash
+nohup bash scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh \
+  --resume-run-root /root/autodl-tmp/MRAF_GATE_AMPLITUDE_RUNS_c667946b/20260727_092554_c667946b_mraf_gate_amplitude_rescue_seed1 \
+  --device 0 \
+  --auto-continue \
+  --shutdown-on-success \
+  > /root/autodl-tmp/mraf_gate_amplitude_resume_after_calibration.log 2>&1 &
+
+tail -f /root/autodl-tmp/mraf_gate_amplitude_resume_after_calibration.log
+```
+
+该命令不会重跑 Stage 1 或 calibration。失败时保留现场且不关机；成功时仅在全部正式
+产物校验完成后关机。
+
 最终 `FINAL_REPORT.txt` 会分别记录
 `training_commit=c667946b...` 与
 `resume_aggregation_commit=<hotfix SHA>`；后者只是兼容汇总代码，不能写成训练

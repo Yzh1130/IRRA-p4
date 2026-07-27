@@ -211,6 +211,7 @@ if [[ "$resume_mode" == "true" ]]; then
 fi
 
 resume_plan_output=""
+resume_next_stage=""
 if [[ "$resume_mode" == "true" ]]; then
   if ! resume_plan_output="$("$python_bin" -B \
       tools/revision/summarize_mraf_gate_amplitude_rescue.py \
@@ -219,6 +220,8 @@ if [[ "$resume_mode" == "true" ]]; then
     printf '%s\n' "$resume_plan_output"
     exit 2
   fi
+  resume_next_stage="$(printf '%s\n' "$resume_plan_output" | \
+    sed -n 's/^NEXT_STAGE=//p' | head -n1)"
 fi
 
 if [[ "$mock" != "true" ]]; then
@@ -328,6 +331,21 @@ fi
 
 if [[ "$mock" == "true" ]]; then
   if [[ "$resume_mode" == "true" ]]; then
+    if [[ "$resume_next_stage" == "confirmation" ]]; then
+      current_stage="confirmation_preflight"
+      write_status "MOCK_RESUME_CONFIRMATION_READY" 0 "NONE"
+      pipeline_completed=true
+      printf '%s\n' "$resume_plan_output"
+      echo "STATUS=MOCK_RESUME_CONFIRMATION_READY"
+      echo "STAGE1_TRAIN_CALLS=0"
+      echo "STAGE1_TEST_CALLS=0"
+      echo "STAGE1_DIAGNOSIS_CALLS=0"
+      echo "CALIBRATION_TEST_CALLS=0"
+      echo "CALIBRATION_DIAGNOSIS_CALLS=0"
+      echo "CONFIRMATION_TRAIN_CALLS_PLANNED=1"
+      echo "shutdown_executed=false"
+      exit 0
+    fi
     current_stage="amplitude_screen"
     "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
       --mode screen --candidate-root "${run_dir}/stage1/units" \
@@ -650,89 +668,97 @@ stage1_train_root="${run_dir}/stage1/train"
 stage1_unit_root="${run_dir}/stage1/units"
 candidate_status_file="${run_dir}/candidate_status.tsv"
 
-current_stage="amplitude_screen"
-if [[ "$resume_mode" == "true" ]]; then
+if [[ "$resume_mode" == "true" && "$resume_next_stage" == "confirmation" ]]; then
+  current_stage="confirmation_preflight"
   printf '%s\n' "$resume_plan_output"
   echo "Skipping completed Stage-1 training, evaluation, and diagnostics."
+  echo "Skipping completed read-only calibration units and summary."
+  selection_json="${run_dir}/selected_amplitude_candidate.json"
+  selection_status="STRONG_SELECTED"
 else
-  mkdir -p "$stage1_train_root" "$stage1_unit_root"
-  if [[ ! -e "$candidate_status_file" ]]; then
-    printf 'candidate\tcheckpoint\tstatus\texit_code\tfailed_stage\n' \
-      >"$candidate_status_file"
-  fi
-  for candidate in A10 A50 A100 B50; do
-    read -r rel_lambda grad_scale lr_multiplier logit_scale < <(
-      candidate_values "$candidate"
-    )
-    train_container="${stage1_train_root}/${candidate}"
-    if ensure_training "$train_container" \
-        "mraf_gate_amplitude_${candidate}_seed${seed}" \
-        10 1 "$rel_lambda" "$grad_scale" "$lr_multiplier" "$logit_scale"; then
-      :
-    else
-      candidate_exit=$?
-      printf '%s\tALL\tFAILED\t%s\ttraining\n' \
-        "$candidate" "$candidate_exit" >>"$candidate_status_file"
-      continue
+  current_stage="amplitude_screen"
+  if [[ "$resume_mode" == "true" ]]; then
+    printf '%s\n' "$resume_plan_output"
+    echo "Skipping completed Stage-1 training, evaluation, and diagnostics."
+  else
+    mkdir -p "$stage1_train_root" "$stage1_unit_root"
+    if [[ ! -e "$candidate_status_file" ]]; then
+      printf 'candidate\tcheckpoint\tstatus\texit_code\tfailed_stage\n' \
+        >"$candidate_status_file"
     fi
-    train_dir=$effective_train_dir
-    for checkpoint_kind in best last; do
-      unit_dir="${stage1_unit_root}/${candidate}_${checkpoint_kind}"
-      if {
-        if [[ ! -d "$unit_dir" ]]; then
-          prepare_unit "$unit_dir" "$train_dir" "$candidate" "$checkpoint_kind" \
-            "$lr_multiplier" "$logit_scale" "$rel_lambda" "$grad_scale"
-        fi
-        evaluate_unit "$unit_dir" "$candidate" "$screen_scenarios" 4 "$logit_scale"
-      }; then
-        printf '%s\t%s\tCOMPLETED\t0\tNONE\n' \
-          "$candidate" "$checkpoint_kind" >>"$candidate_status_file"
+    for candidate in A10 A50 A100 B50; do
+      read -r rel_lambda grad_scale lr_multiplier logit_scale < <(
+        candidate_values "$candidate"
+      )
+      train_container="${stage1_train_root}/${candidate}"
+      if ensure_training "$train_container" \
+          "mraf_gate_amplitude_${candidate}_seed${seed}" \
+          10 1 "$rel_lambda" "$grad_scale" "$lr_multiplier" "$logit_scale"; then
+        :
       else
         candidate_exit=$?
-        printf '%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
-          "$candidate" "$checkpoint_kind" "$candidate_exit" \
-          >>"$candidate_status_file"
+        printf '%s\tALL\tFAILED\t%s\ttraining\n' \
+          "$candidate" "$candidate_exit" >>"$candidate_status_file"
+        continue
       fi
+      train_dir=$effective_train_dir
+      for checkpoint_kind in best last; do
+        unit_dir="${stage1_unit_root}/${candidate}_${checkpoint_kind}"
+        if {
+          if [[ ! -d "$unit_dir" ]]; then
+            prepare_unit "$unit_dir" "$train_dir" "$candidate" "$checkpoint_kind" \
+              "$lr_multiplier" "$logit_scale" "$rel_lambda" "$grad_scale"
+          fi
+          evaluate_unit "$unit_dir" "$candidate" "$screen_scenarios" 4 "$logit_scale"
+        }; then
+          printf '%s\t%s\tCOMPLETED\t0\tNONE\n' \
+            "$candidate" "$checkpoint_kind" >>"$candidate_status_file"
+        else
+          candidate_exit=$?
+          printf '%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
+            "$candidate" "$checkpoint_kind" "$candidate_exit" \
+            >>"$candidate_status_file"
+        fi
+      done
     done
-  done
-fi
+  fi
 
-"$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
-  --mode screen --candidate-root "$stage1_unit_root" \
-  --reference-screen-root "$reference_screen_root" --output-dir "$run_dir" \
-  >"${run_dir}/screen_summary.log" 2>&1
-selection_json="${run_dir}/selected_amplitude_candidate.json"
-selection_status="$("$python_bin" -B -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$selection_json")"
+  "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
+    --mode screen --candidate-root "$stage1_unit_root" \
+    --reference-screen-root "$reference_screen_root" --output-dir "$run_dir" \
+    >"${run_dir}/screen_summary.log" 2>&1
+  selection_json="${run_dir}/selected_amplitude_candidate.json"
+  selection_status="$("$python_bin" -B -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$selection_json")"
 
-if [[ "$selection_status" == "AMPLITUDE_SCREEN_FAILED" ]]; then
-  write_status "AMPLITUDE_SCREEN_FAILED" 3 "amplitude_screen"
-  pipeline_completed=true
-  exit 3
-fi
+  if [[ "$selection_status" == "AMPLITUDE_SCREEN_FAILED" ]]; then
+    write_status "AMPLITUDE_SCREEN_FAILED" 3 "amplitude_screen"
+    pipeline_completed=true
+    exit 3
+  fi
 
-if [[ "$selection_status" == "VIABLE_SELECTED_FOR_CALIBRATION" ]]; then
-  run_real_preflight
-  current_stage="calibration"
-  calibration_root="${run_dir}/calibration"
-  mkdir -p "$calibration_root"
-  source_candidate="$("$python_bin" -B -c \
-    'import json,sys; print(json.load(open(sys.argv[1]))["calibration_candidate"])' \
-    "$selection_json")"
-  source_checkpoint="$("$python_bin" -B -c \
-    'import json,sys; print(json.load(open(sys.argv[1]))["calibration_checkpoint"])' \
-    "$selection_json")"
-  source_unit="${stage1_unit_root}/${source_candidate}_${source_checkpoint}"
-  for scale in 2 5 10 20 50; do
-    unit_dir="${calibration_root}/scale_${scale}"
-    if [[ ! -d "$unit_dir" ]]; then
-      mkdir -p "$unit_dir"
-      ln -s "${source_unit}/configs.yaml" "${unit_dir}/configs.yaml"
-      ln -s "${source_unit}/checkpoint.pth" "${unit_dir}/checkpoint.pth"
-      ln -s "${source_unit}/train.log" "${unit_dir}/train.log"
-      ln -s "${source_unit}/mraf_epoch_metrics.tsv" "${unit_dir}/mraf_epoch_metrics.tsv"
-      ln -s "${source_unit}/checkpoint_selection.tsv" "${unit_dir}/checkpoint_selection.tsv"
-      cat >"${unit_dir}/unit.json" <<EOF
+  if [[ "$selection_status" == "VIABLE_SELECTED_FOR_CALIBRATION" ]]; then
+    run_real_preflight
+    current_stage="calibration"
+    calibration_root="${run_dir}/calibration"
+    mkdir -p "$calibration_root"
+    source_candidate="$("$python_bin" -B -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["calibration_candidate"])' \
+      "$selection_json")"
+    source_checkpoint="$("$python_bin" -B -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["calibration_checkpoint"])' \
+      "$selection_json")"
+    source_unit="${stage1_unit_root}/${source_candidate}_${source_checkpoint}"
+    for scale in 2 5 10 20 50; do
+      unit_dir="${calibration_root}/scale_${scale}"
+      if [[ ! -d "$unit_dir" ]]; then
+        mkdir -p "$unit_dir"
+        ln -s "${source_unit}/configs.yaml" "${unit_dir}/configs.yaml"
+        ln -s "${source_unit}/checkpoint.pth" "${unit_dir}/checkpoint.pth"
+        ln -s "${source_unit}/train.log" "${unit_dir}/train.log"
+        ln -s "${source_unit}/mraf_epoch_metrics.tsv" "${unit_dir}/mraf_epoch_metrics.tsv"
+        ln -s "${source_unit}/checkpoint_selection.tsv" "${unit_dir}/checkpoint_selection.tsv"
+        cat >"${unit_dir}/unit.json" <<EOF
 {
   "candidate": "$source_candidate",
   "checkpoint": "$source_checkpoint",
@@ -746,33 +772,33 @@ if [[ "$selection_status" == "VIABLE_SELECTED_FOR_CALIBRATION" ]]; then
   "has_oom": false
 }
 EOF
+      fi
+      if evaluate_unit "$unit_dir" "$source_candidate" \
+          "$screen_scenarios" 4 "$scale"; then
+        printf 'calibration_scale_%s\t%s\tCOMPLETED\t0\tNONE\n' \
+          "$scale" "$source_checkpoint" >>"$candidate_status_file"
+      else
+        calibration_exit=$?
+        printf 'calibration_scale_%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
+          "$scale" "$source_checkpoint" "$calibration_exit" \
+          >>"$candidate_status_file"
+      fi
+    done
+    "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
+      --mode calibration --candidate-root "$calibration_root" \
+      --reference-screen-root "$reference_screen_root" \
+      --selected-json "$selection_json" --output-dir "$run_dir" \
+      >"${run_dir}/calibration_summary.log"
+    selection_status="$("$python_bin" -B -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$selection_json")"
+    if [[ "$selection_status" != "STRONG_SELECTED" ]]; then
+      write_status "CALIBRATION_FAILED" 4 "calibration"
+      pipeline_completed=true
+      exit 4
     fi
-    if evaluate_unit "$unit_dir" "$source_candidate" \
-        "$screen_scenarios" 4 "$scale"; then
-      printf 'calibration_scale_%s\t%s\tCOMPLETED\t0\tNONE\n' \
-        "$scale" "$source_checkpoint" >>"$candidate_status_file"
-    else
-      calibration_exit=$?
-      printf 'calibration_scale_%s\t%s\tFAILED\t%s\tevaluation_or_diagnosis\n' \
-        "$scale" "$source_checkpoint" "$calibration_exit" \
-        >>"$candidate_status_file"
-    fi
-  done
-  "$python_bin" -B tools/revision/summarize_mraf_gate_amplitude_rescue.py \
-    --mode calibration --candidate-root "$calibration_root" \
-    --reference-screen-root "$reference_screen_root" \
-    --selected-json "$selection_json" --output-dir "$run_dir" \
-    >"${run_dir}/calibration_summary.log"
-  selection_status="$("$python_bin" -B -c \
-    'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$selection_json")"
-  if [[ "$selection_status" != "STRONG_SELECTED" ]]; then
-    write_status "CALIBRATION_FAILED" 4 "calibration"
-    pipeline_completed=true
-    exit 4
-  fi
-else
-  _write_empty_calibration="$python_bin"
-  "$_write_empty_calibration" -B - "$run_dir" <<'PY'
+  else
+    _write_empty_calibration="$python_bin"
+    "$_write_empty_calibration" -B - "$run_dir" <<'PY'
 import csv, pathlib, sys
 p = pathlib.Path(sys.argv[1]) / "calibration_screen.tsv"
 with p.open("w", newline="", encoding="utf-8") as f:
@@ -783,6 +809,7 @@ with p.open("w", newline="", encoding="utf-8") as f:
          "alpha_target_pearson", "failed_strong_criteria"]
     )
 PY
+  fi
 fi
 
 if [[ "$auto_continue" != "true" ]]; then
@@ -795,6 +822,7 @@ if [[ "$auto_continue" != "true" ]]; then
 fi
 
 run_real_preflight
+current_stage="confirmation_preflight"
 if [[ "$resume_mode" == "true" ]]; then
   check_space_gb "$run_dir" 18
 fi

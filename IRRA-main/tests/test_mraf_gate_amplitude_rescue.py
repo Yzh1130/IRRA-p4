@@ -3,6 +3,7 @@ import csv
 import importlib.util
 import json
 import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -369,6 +370,88 @@ def _write_resume_fixture(tmp_path, *, manifest_path_style="native"):
         "\n".join(status_rows) + "\n", encoding="utf-8"
     )
     return run_root, reference_root
+
+
+def _add_completed_calibration_fixture(
+    run_root, *, failed_stage="calibration"
+):
+    (run_root / "status.txt").write_bytes(
+        (
+            "STATUS=FAILED\n"
+            f"FAILED_STAGE={failed_stage}\n"
+            "EXIT_CODE=2\n"
+        ).encode("utf-8")
+    )
+    status_path = run_root / "candidate_status.tsv"
+    status_lines = status_path.read_text(encoding="utf-8").splitlines()
+    source = run_root / "stage1" / "units" / "B50_best"
+    calibration_rows = []
+    for index, scale in enumerate(rescue.CALIBRATION_SCALES, start=1):
+        scale_label = format(scale, "g")
+        target = run_root / "calibration" / f"scale_{scale_label}"
+        shutil.copytree(source, target)
+        metadata = {
+            "candidate": "B50",
+            "checkpoint": "best",
+            "mraf_scorer_lr_multiplier": 50.0,
+            "mraf_gate_logit_scale": scale,
+            "mraf_rel_lambda": 1.0,
+            "mraf_gate_base_grad_scale": 1.0,
+            "read_only_calibration": True,
+            "has_nan": False,
+            "has_inf": False,
+            "has_oom": False,
+        }
+        (target / "unit.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        status_lines.append(
+            f"calibration_scale_{scale_label}\tbest\tCOMPLETED\t0\tNONE"
+        )
+        strong = scale == 2.0
+        calibration_rows.append(
+            {
+                "rank": index,
+                "source_candidate": "B50",
+                "source_checkpoint": "best",
+                "mraf_gate_logit_scale": scale,
+                "classification": "STRONG_PASS" if strong else "FAIL",
+                "strong_pass": strong,
+                "clean_R1": 49.9,
+                "degraded_mean_R1": 42.0,
+                "alpha_std": 0.006 if strong else 0.001,
+                "alpha_target_pearson": 0.5,
+                "failed_strong_criteria": "" if strong else "ALPHA_STD",
+            }
+        )
+    status_path.write_bytes(
+        ("\n".join(status_lines) + "\n").encode("utf-8")
+    )
+    for name, fields in (
+        ("amplitude_screen_metrics.tsv", rescue.METRIC_FIELDS),
+        ("amplitude_screen_mechanism.tsv", rescue.MECHANISM_FIELDS),
+        ("checkpoint_comparison.tsv", rescue.COMPARISON_FIELDS),
+        ("amplitude_candidate_ranking.tsv", rescue.RANKING_FIELDS),
+    ):
+        rescue._write_tsv(
+            run_root / name,
+            fields,
+            [{field: "fixture" for field in fields}],
+        )
+    rescue._write_tsv(
+        run_root / "calibration_screen.tsv",
+        rescue.CALIBRATION_FIELDS,
+        calibration_rows,
+    )
+    selection = {
+        **rescue.CALIBRATION_RESUME_SELECTION,
+        "calibration_candidate": "B50",
+        "calibration_checkpoint": "best",
+    }
+    rescue._write_json(
+        run_root / "selected_amplitude_candidate.json", selection
+    )
+    return selection
 
 
 def test_stage1_matrix_is_exact():
@@ -1045,6 +1128,217 @@ def test_resume_plan_allows_strict_hotfix_descendant_and_records_history(tmp_pat
     assert rows[-1]["old_failed_stage"] == "amplitude_screen"
 
 
+def _validate_completed_calibration(run_root, resume_commit=None, **kwargs):
+    return rescue.validate_resume_plan(
+        run_root,
+        ROOT.parent,
+        resume_commit or rescue.CALIBRATION_RESUME_BASE_COMMIT,
+        ancestry_checker=lambda *_: True,
+        changed_paths_reader=lambda *_: tuple(rescue.ALLOWED_HOTFIX_PATHS),
+        process_snapshot_reader=lambda: "",
+        **kwargs,
+    )
+
+
+def test_resume_plan_accepts_completed_calibration_and_selects_confirmation(
+    tmp_path,
+):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    plan = _validate_completed_calibration(run_root)
+    assert plan.valid, plan.reasons
+    assert plan.next_stage == "confirmation"
+    assert plan.training_candidates_skipped == 4
+    assert plan.checkpoint_units_skipped == 8
+    assert plan.evaluations_skipped == 8
+    assert plan.diagnostics_skipped == 8
+    assert plan.calibration_units_skipped == 5
+    assert plan.calibration_evaluations_skipped == 5
+    assert plan.calibration_diagnostics_skipped == 5
+    assert plan.selected_candidate == "B50"
+    assert plan.selected_checkpoint == "best"
+    assert plan.selected_logit_scale == pytest.approx(2.0)
+    lines = plan.machine_lines()
+    assert "CALIBRATION_UNITS_SKIPPED=5" in lines
+    assert "CALIBRATION_EVALUATIONS_SKIPPED=5" in lines
+    assert "CALIBRATION_DIAGNOSTICS_SKIPPED=5" in lines
+    assert "SELECTED_CANDIDATE=B50" in lines
+    assert "SELECTED_CHECKPOINT=best" in lines
+    assert "SELECTED_LOGIT_SCALE=2.0" in lines
+    assert "NEXT_STAGE=confirmation" in lines
+
+
+def test_resume_plan_accepts_future_confirmation_preflight_state(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(
+        run_root, failed_stage="confirmation_preflight"
+    )
+    plan = _validate_completed_calibration(run_root)
+    assert plan.valid, plan.reasons
+    assert plan.next_stage == "confirmation"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("selected_candidate", "A50", "expected 'B50'"),
+        ("selected_checkpoint", "last", "expected 'best'"),
+        ("status", "CALIBRATION_FAILED", "expected 'STRONG_SELECTED'"),
+        ("selection_source", "screen", "expected 'read_only_calibration'"),
+        ("mraf_scorer_lr_multiplier", 10, "expected 50.0"),
+        ("mraf_gate_logit_scale", 5, "expected 2.0"),
+        ("mraf_rel_lambda", 0.25, "expected 1.0"),
+        ("mraf_gate_base_grad_scale", 0.1, "expected 1.0"),
+    ],
+)
+def test_post_calibration_resume_rejects_wrong_selection(
+    tmp_path, field, value, expected
+):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    path = run_root / "selected_amplitude_candidate.json"
+    selection = json.loads(path.read_text(encoding="utf-8"))
+    selection[field] = value
+    path.write_text(json.dumps(selection), encoding="utf-8")
+    plan = _validate_completed_calibration(run_root)
+    assert not plan.valid
+    assert expected in "\n".join(plan.reasons)
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected"),
+    [
+        (
+            "calibration/scale_2/checkpoint.pth",
+            "calibration_scale_2: missing or empty",
+        ),
+        (
+            "calibration/scale_5/eval/clean/scores.json",
+            "missing non-empty evaluation for clean",
+        ),
+        (
+            "calibration/scale_10/diagnostics/diagnosis.json",
+            "missing or empty diagnostic",
+        ),
+        (
+            "calibration_screen.tsv",
+            "calibration_screen.tsv is missing",
+        ),
+        (
+            "selected_amplitude_candidate.json",
+            "selected_amplitude_candidate.json is missing",
+        ),
+    ],
+)
+def test_post_calibration_resume_rejects_missing_artifacts(
+    tmp_path, relative, expected
+):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    (run_root / relative).unlink()
+    plan = _validate_completed_calibration(run_root)
+    assert not plan.valid
+    assert expected in "\n".join(plan.reasons)
+
+
+def test_post_calibration_resume_rejects_bad_status_exit_and_scale2_row(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    status = run_root / "status.txt"
+    status.write_bytes(
+        b"STATUS=FAILED\nFAILED_STAGE=calibration\nEXIT_CODE=1\n"
+    )
+    screen = run_root / "calibration_screen.tsv"
+    text = screen.read_text(encoding="utf-8").replace(
+        "STRONG_PASS\tTrue", "FAIL\tFalse", 1
+    )
+    screen.write_text(text, encoding="utf-8")
+    plan = _validate_completed_calibration(run_root)
+    errors = "\n".join(plan.reasons)
+    assert not plan.valid
+    assert "requires EXIT_CODE=2" in errors
+    assert "scale=2 must be B50/best with STRONG_PASS" in errors
+
+
+@pytest.mark.parametrize(
+    "kind", ["summary", "partial", "completed_status", "failed_status"]
+)
+def test_post_calibration_resume_never_repeats_existing_confirmation(
+    tmp_path, kind
+):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    if kind == "summary":
+        (run_root / "confirmation_summary.tsv").write_text(
+            "complete\n", encoding="utf-8"
+        )
+    elif kind == "partial":
+        partial = run_root / "confirmation" / "train"
+        partial.mkdir(parents=True)
+        (partial / "train.log").write_text("partial\n", encoding="utf-8")
+    elif kind == "completed_status":
+        with (run_root / "candidate_status.tsv").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write("confirmation\tbest\tCOMPLETED\t0\tNONE\n")
+    else:
+        with (run_root / "candidate_status.tsv").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                "confirmation\tbest\tFAILED\t9\tevaluation_or_diagnosis\n"
+            )
+    plan = _validate_completed_calibration(run_root)
+    assert not plan.valid
+    assert "confirmation" in "\n".join(plan.reasons)
+
+
+def test_post_calibration_resume_rejects_active_run_process(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    plan = rescue.validate_resume_plan(
+        run_root,
+        ROOT.parent,
+        rescue.CALIBRATION_RESUME_BASE_COMMIT,
+        ancestry_checker=lambda *_: True,
+        changed_paths_reader=lambda *_: tuple(rescue.ALLOWED_HOTFIX_PATHS),
+        process_snapshot_reader=lambda: (
+            f"python train.py --output_dir {run_root}/confirmation/train"
+        ),
+    )
+    assert not plan.valid
+    assert "active training/evaluation/diagnosis" in "\n".join(plan.reasons)
+
+
+def test_post_calibration_resume_history_appends_without_overwriting(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    old_plan = rescue.ResumePlan(
+        valid=True,
+        run_root=str(run_root),
+        original_commit=rescue.EXPECTED_ORIGINAL_COMMIT,
+        resume_commit="old-hotfix",
+        old_status="FAILED",
+        old_failed_stage="amplitude_screen",
+        next_stage="amplitude_screen",
+        reasons=(),
+        compatibility_reason="old history row",
+    )
+    rescue.record_resume_history(run_root, old_plan)
+    manifest_before = (run_root / "experiment_manifest.txt").read_bytes()
+    plan = _validate_completed_calibration(run_root)
+    rescue.record_resume_history(run_root, plan)
+    rows = rescue.read_tsv_compatible(run_root / "resume_history.tsv").rows
+    assert len(rows) == 2
+    assert rows[0]["compatibility_reason"] == "old history row"
+    assert rows[1]["old_status"] == "FAILED"
+    assert rows[1]["old_failed_stage"] == "calibration"
+    assert rows[1]["next_stage"] == "confirmation"
+    assert "completed calibration artifacts" in rows[1]["compatibility_reason"]
+    assert "disk-space preflight" in rows[1]["compatibility_reason"]
+    assert (run_root / "experiment_manifest.txt").read_bytes() == manifest_before
+
+
 def _as_shell_path(path):
     """Return a Bash path, converting only an explicit Windows drive path."""
     raw = str(path)
@@ -1167,3 +1461,145 @@ def test_pipeline_mock_resume_skips_stage1_and_runs_summarizer(tmp_path):
     assert "STATUS=MOCK_RESUME_COMPLETED" in (
         run_root / "status.txt"
     ).read_text(encoding="utf-8")
+
+
+def test_post_calibration_resume_requires_ed217ac_descendant(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+
+    def ancestry(_repo, original, _current):
+        return original != rescue.CALIBRATION_RESUME_BASE_COMMIT
+
+    plan = rescue.validate_resume_plan(
+        run_root,
+        ROOT.parent,
+        "unrelated-hotfix",
+        ancestry_checker=ancestry,
+        changed_paths_reader=lambda *_: tuple(rescue.ALLOWED_HOTFIX_PATHS),
+        process_snapshot_reader=lambda: "",
+    )
+    assert not plan.valid
+    assert "is not a descendant of" in "\n".join(plan.reasons)
+
+
+def test_post_calibration_resume_rejects_incomplete_candidate_status(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path)
+    _add_completed_calibration_fixture(run_root)
+    path = run_root / "candidate_status.tsv"
+    text = path.read_text(encoding="utf-8").replace(
+        "calibration_scale_20\tbest\tCOMPLETED\t0",
+        "calibration_scale_20\tbest\tFAILED\t7",
+    )
+    path.write_text(text, encoding="utf-8")
+    plan = _validate_completed_calibration(run_root)
+    assert not plan.valid
+    assert "calibration_scale_20: candidate_status is FAILED/7" in "\n".join(
+        plan.reasons
+    )
+
+
+def test_pipeline_post_calibration_resume_dry_run_is_read_only(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path, manifest_path_style="wsl")
+    _add_completed_calibration_fixture(run_root)
+    status_before = (run_root / "status.txt").read_bytes()
+    candidate_status_before = (run_root / "candidate_status.tsv").read_bytes()
+    selection_before = (
+        run_root / "selected_amplitude_candidate.json"
+    ).read_bytes()
+    completed = subprocess.run(
+        [
+            "bash",
+            "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
+            "--resume-run-root",
+            _as_shell_path(run_root),
+            "--device",
+            "0",
+            "--auto-continue",
+            "--mock",
+            "--dry-run",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    expected = {
+        "RESUME_PLAN_VALID=true",
+        "STAGE1_TRAIN_CANDIDATES_SKIPPED=4",
+        "STAGE1_CHECKPOINT_UNITS_SKIPPED=8",
+        "STAGE1_EVALUATIONS_SKIPPED=8",
+        "STAGE1_DIAGNOSTICS_SKIPPED=8",
+        "CALIBRATION_UNITS_SKIPPED=5",
+        "CALIBRATION_EVALUATIONS_SKIPPED=5",
+        "CALIBRATION_DIAGNOSTICS_SKIPPED=5",
+        "SELECTED_CANDIDATE=B50",
+        "SELECTED_CHECKPOINT=best",
+        "SELECTED_LOGIT_SCALE=2.0",
+        "NEXT_STAGE=confirmation",
+    }
+    assert all(line in completed.stdout for line in expected)
+    assert (run_root / "status.txt").read_bytes() == status_before
+    assert (run_root / "candidate_status.tsv").read_bytes() == candidate_status_before
+    assert (
+        run_root / "selected_amplitude_candidate.json"
+    ).read_bytes() == selection_before
+    assert not (run_root / "resume_history.tsv").exists()
+    assert not (run_root / "confirmation").exists()
+
+
+def test_pipeline_mock_post_calibration_resume_skips_completed_work(tmp_path):
+    run_root, _ = _write_resume_fixture(tmp_path, manifest_path_style="wsl")
+    _add_completed_calibration_fixture(run_root)
+    candidate_status_before = (run_root / "candidate_status.tsv").read_bytes()
+    calibration_before = (run_root / "calibration_screen.tsv").read_bytes()
+    completed = subprocess.run(
+        [
+            "bash",
+            "scripts/mraf/run_mraf_gate_amplitude_rescue_pipeline.sh",
+            "--resume-run-root",
+            _as_shell_path(run_root),
+            "--device",
+            "0",
+            "--auto-continue",
+            "--mock",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert "STATUS=MOCK_RESUME_CONFIRMATION_READY" in completed.stdout
+    assert "STAGE1_TRAIN_CALLS=0" in completed.stdout
+    assert "STAGE1_TEST_CALLS=0" in completed.stdout
+    assert "STAGE1_DIAGNOSIS_CALLS=0" in completed.stdout
+    assert "CALIBRATION_TEST_CALLS=0" in completed.stdout
+    assert "CALIBRATION_DIAGNOSIS_CALLS=0" in completed.stdout
+    assert "CONFIRMATION_TRAIN_CALLS_PLANNED=1" in completed.stdout
+    assert "shutdown_executed=false" in completed.stdout
+    assert (run_root / "candidate_status.tsv").read_bytes() == candidate_status_before
+    assert (run_root / "calibration_screen.tsv").read_bytes() == calibration_before
+    assert not (run_root / "confirmation").exists()
+    history = rescue.read_tsv_compatible(run_root / "resume_history.tsv").rows
+    assert history[-1]["old_failed_stage"] == "calibration"
+    assert history[-1]["next_stage"] == "confirmation"
+
+
+def test_confirmation_route_uses_fresh_initialization_and_precise_preflight():
+    script = PIPELINE.read_text(encoding="utf-8")
+    assert 'resume_next_stage" == "confirmation"' in script
+    assert 'current_stage="confirmation_preflight"' in script
+    assert script.count('if ensure_training "$confirmation_train"') == 1
+    confirmation_call = script.split(
+        'if ensure_training "$confirmation_train"', 1
+    )[1].split("then", 1)[0]
+    assert "12 1" in confirmation_call
+    assert "--resume" not in confirmation_call
+    assert "checkpoint.pth" not in confirmation_call
+    assert 'current_stage="formal_preflight"' in script
+    assert "60 3" in script
