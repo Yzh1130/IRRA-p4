@@ -37,3 +37,5 @@ IRRA-main/datasets/
 # Local documents / experiment notes
 IRRA日志/
 *.docx
+audit_out/
+_stage0_leftover_backup/
