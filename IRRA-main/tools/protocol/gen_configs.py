@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""Generate the nine locked Stage 1 training configurations."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.config import (  # noqa: E402
+    ConfigLoadError,
+    HistoricalConfigSafeLoader,
+    load_config_mapping,
+)
+
+
+ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
+E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
+
+COMMON_OVERRIDES: dict[str, Any] = {
+    "num_epoch": 60,
+    "batch_size": 64,
+    "lr": 1e-5,
+    "optimizer": "Adam",
+    "loss_names": "sdm+mlm+id",
+    "degrade_aug_mode": "none",
+    "eval_period": 1,
+    "save_last_checkpoint": True,
+    "save_all_epoch_ckpt": False,
+    "save_metric_best_ckpt": False,
+    "save_model_only": True,
+    "mdrc_lambda": 0.05,
+    "mdrc_loss_scale": 100,
+    "mdrc_prob": 0.5,
+    "mdrc_warmup_epoch": 3,
+    "mdrc_temp": 0.07,
+    "mraf_hidden_dim": 128,
+    "mraf_dropout": 0.1,
+    "mraf_gate_temperature": 1.0,
+    "mraf_gate_base_grad_scale": 1.0,
+    "mraf_rel_warmup_epoch": 1,
+    "mraf_balance_lambda": 0.0,
+}
+
+GATE_ENABLED_OVERRIDES: dict[str, Any] = {
+    "mraf_scorer_lr_multiplier": 50.0,
+    "mraf_gate_logit_scale": 5.0,
+    "mraf_gate_fp32": True,
+}
+
+GATE_DISABLED_OVERRIDES: dict[str, Any] = {
+    "mraf_scorer_lr_multiplier": 1.0,
+    "mraf_gate_logit_scale": 1.0,
+    "mraf_gate_fp32": False,
+}
+
+
+class ProtocolConfigError(ValueError):
+    """Raised when locked protocol inputs or generated configs are invalid."""
+
+
+class HistoricalConfigSafeDumper(yaml.SafeDumper):
+    """Safe dumper preserving the tuple tag emitted by save_train_configs."""
+
+
+def _represent_python_tuple(
+    dumper: yaml.SafeDumper,
+    value: tuple[Any, ...],
+) -> yaml.nodes.SequenceNode:
+    return dumper.represent_sequence(
+        "tag:yaml.org,2002:python/tuple",
+        value,
+    )
+
+
+HistoricalConfigSafeDumper.add_representer(tuple, _represent_python_tuple)
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolConfigError(f"{label} must be a finite number.")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ProtocolConfigError(f"{label} must be a finite number.")
+    return result
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ProtocolConfigError(f"{label} must be a JSON object.")
+    return value
+
+
+def load_frozen_hparams(path: Path) -> tuple[float, list[float]]:
+    """Read the two dev-selected values without any numerical fallback."""
+    frozen_path = path.expanduser().resolve()
+    if not frozen_path.is_file():
+        raise ProtocolConfigError(f"Frozen hyperparameter file not found: {frozen_path}")
+    try:
+        with frozen_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProtocolConfigError(
+            f"Failed to read frozen hyperparameters {frozen_path}: {exc}"
+        ) from exc
+
+    root = _require_mapping(payload, "FROZEN_HPARAMS.json top level")
+    e_values = _require_mapping(root.get("E"), "FROZEN_HPARAMS.json['E']")
+    u_values = _require_mapping(root.get("U"), "FROZEN_HPARAMS.json['U']")
+
+    if "mraf_target_temperature" not in e_values:
+        raise ProtocolConfigError(
+            "FROZEN_HPARAMS.json['E']['mraf_target_temperature'] is required."
+        )
+    e_temperature = _finite_number(
+        e_values["mraf_target_temperature"],
+        "FROZEN_HPARAMS.json['E']['mraf_target_temperature']",
+    )
+    if e_temperature not in E_TEMPERATURE_CANDIDATES:
+        raise ProtocolConfigError(
+            "FROZEN_HPARAMS.json['E']['mraf_target_temperature'] must be one of "
+            f"{list(E_TEMPERATURE_CANDIDATES)}."
+        )
+
+    if "mraf_utility_prior" not in u_values:
+        raise ProtocolConfigError(
+            "FROZEN_HPARAMS.json['U']['mraf_utility_prior'] is required."
+        )
+    prior_value = u_values["mraf_utility_prior"]
+    if (
+        isinstance(prior_value, (str, bytes))
+        or not isinstance(prior_value, Sequence)
+        or len(prior_value) != 2
+    ):
+        raise ProtocolConfigError(
+            "FROZEN_HPARAMS.json['U']['mraf_utility_prior'] must contain exactly "
+            "two positive finite numbers."
+        )
+    utility_prior = [
+        _finite_number(item, f"FROZEN_HPARAMS.json['U']['mraf_utility_prior'][{index}]")
+        for index, item in enumerate(prior_value)
+    ]
+    if any(item <= 0.0 for item in utility_prior):
+        raise ProtocolConfigError(
+            "FROZEN_HPARAMS.json['U']['mraf_utility_prior'] values must be > 0."
+        )
+    return e_temperature, utility_prior
+
+
+def load_base_config(path: Path) -> dict[str, Any]:
+    base_path = path.expanduser().resolve()
+    try:
+        return load_config_mapping(base_path)
+    except ConfigLoadError as exc:
+        raise ProtocolConfigError(str(exc)) from exc
+
+
+def arm_overrides(
+    e_temperature: float,
+    utility_prior: list[float],
+) -> dict[str, dict[str, Any]]:
+    return {
+        "A": {
+            "mdrc_enable": False,
+            "mraf_enabled": False,
+            "mraf_rel_lambda": 0.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "B": {
+            "mdrc_enable": True,
+            "mraf_enabled": False,
+            "mraf_rel_lambda": 0.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "C": {
+            "mdrc_enable": False,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 1.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "D": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 1.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "E": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 1.0,
+            "mraf_target_temperature": e_temperature,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "F": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 0.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "H1": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 0.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": True,
+            "mraf_freeze_gate": True,
+            "mraf_utility_prior": None,
+        },
+        "H2": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 1.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": True,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": None,
+        },
+        "U": {
+            "mdrc_enable": True,
+            "mraf_enabled": True,
+            "mraf_rel_lambda": 1.0,
+            "mraf_target_temperature": 0.1,
+            "mraf_equalize_modality_norm": False,
+            "mraf_freeze_gate": False,
+            "mraf_utility_prior": list(utility_prior),
+        },
+    }
+
+
+def build_configs(
+    base_config: Mapping[str, Any],
+    e_temperature: float,
+    utility_prior: list[float],
+) -> dict[str, dict[str, Any]]:
+    per_arm = arm_overrides(e_temperature, utility_prior)
+    configs: dict[str, dict[str, Any]] = {}
+    for arm in ARM_NAMES:
+        config = dict(base_config)
+        config.update(COMMON_OVERRIDES)
+        config.update(
+            GATE_ENABLED_OVERRIDES
+            if bool(per_arm[arm]["mraf_enabled"])
+            else GATE_DISABLED_OVERRIDES
+        )
+        config.update(per_arm[arm])
+        configs[arm] = config
+    validate_configs(configs, e_temperature, utility_prior)
+    return configs
+
+
+def validate_configs(
+    configs: Mapping[str, Mapping[str, Any]],
+    e_temperature: float,
+    utility_prior: list[float],
+) -> None:
+    if tuple(configs) != ARM_NAMES:
+        raise ProtocolConfigError(
+            f"Generated arm order must be {list(ARM_NAMES)}, got {list(configs)}."
+        )
+    expected_arm_values = arm_overrides(e_temperature, utility_prior)
+    for arm in ARM_NAMES:
+        config = configs[arm]
+        for key, expected in COMMON_OVERRIDES.items():
+            if config.get(key) != expected:
+                raise ProtocolConfigError(
+                    f"{arm}.{key} must be {expected!r}, got {config.get(key)!r}."
+                )
+        expected_gate = (
+            GATE_ENABLED_OVERRIDES
+            if bool(expected_arm_values[arm]["mraf_enabled"])
+            else GATE_DISABLED_OVERRIDES
+        )
+        for key, expected in expected_gate.items():
+            if config.get(key) != expected:
+                raise ProtocolConfigError(
+                    f"{arm}.{key} must be {expected!r}, got {config.get(key)!r}."
+                )
+        for key, expected in expected_arm_values[arm].items():
+            if config.get(key) != expected:
+                raise ProtocolConfigError(
+                    f"{arm}.{key} must be {expected!r}, got {config.get(key)!r}."
+                )
+
+
+def serialize_configs(
+    configs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, str]:
+    serialized: dict[str, str] = {}
+    for arm in ARM_NAMES:
+        try:
+            text = yaml.dump(
+                dict(configs[arm]),
+                Dumper=HistoricalConfigSafeDumper,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+            )
+            loaded = yaml.load(text, Loader=HistoricalConfigSafeLoader)
+        except yaml.YAMLError as exc:
+            raise ProtocolConfigError(f"Failed to serialize {arm}.yaml: {exc}") from exc
+        if loaded != dict(configs[arm]):
+            raise ProtocolConfigError(f"In-memory YAML round-trip failed for {arm}.yaml.")
+        serialized[arm] = text
+    return serialized
+
+
+def write_configs(out_dir: Path, serialized: Mapping[str, str]) -> None:
+    output_dir = out_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary_paths: list[Path] = []
+    try:
+        for arm in ARM_NAMES:
+            temp_path = output_dir / f".{arm}.yaml.tmp"
+            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(serialized[arm])
+            temporary_paths.append(temp_path)
+        for arm in ARM_NAMES:
+            (output_dir / f".{arm}.yaml.tmp").replace(output_dir / f"{arm}.yaml")
+    finally:
+        for temp_path in temporary_paths:
+            if temp_path.exists():
+                temp_path.unlink()
+
+
+def read_back_configs(out_dir: Path) -> dict[str, dict[str, Any]]:
+    output_dir = out_dir.expanduser().resolve()
+    configs: dict[str, dict[str, Any]] = {}
+    for arm in ARM_NAMES:
+        path = output_dir / f"{arm}.yaml"
+        try:
+            configs[arm] = load_config_mapping(path)
+        except ConfigLoadError as exc:
+            raise ProtocolConfigError(str(exc)) from exc
+    return configs
+
+
+def print_validation_table(configs: Mapping[str, Mapping[str, Any]]) -> None:
+    print(
+        "| arm | mdrc | mraf | rel_lambda | T_r | equalize | freeze | "
+        "utility_prior | scorer_lr_multiplier | gate_logit_scale | gate_fp32 |"
+    )
+    print(
+        "| --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- |"
+    )
+    for arm in ARM_NAMES:
+        config = configs[arm]
+        utility = config["mraf_utility_prior"]
+        utility_text = "None" if utility is None else json.dumps(utility)
+        print(
+            f"| {arm} | {config['mdrc_enable']} | {config['mraf_enabled']} | "
+            f"{config['mraf_rel_lambda']} | {config['mraf_target_temperature']} | "
+            f"{config['mraf_equalize_modality_norm']} | "
+            f"{config['mraf_freeze_gate']} | {utility_text} | "
+            f"{config['mraf_scorer_lr_multiplier']} | "
+            f"{config['mraf_gate_logit_scale']} | {config['mraf_gate_fp32']} |"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate locked A/B/C/D/E/F/H1/H2/U flat training YAML configs "
+            "from a saved base config and committed frozen dev selections."
+        )
+    )
+    parser.add_argument(
+        "--base-config",
+        type=Path,
+        required=True,
+        help="flat configs.yaml produced by save_train_configs",
+    )
+    parser.add_argument(
+        "--frozen-hparams",
+        type=Path,
+        default=Path("FROZEN_HPARAMS.json"),
+        help="committed JSON containing E.mraf_target_temperature and U.mraf_utility_prior",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="output directory for A.yaml through U.yaml",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        base_config = load_base_config(args.base_config)
+        e_temperature, utility_prior = load_frozen_hparams(args.frozen_hparams)
+        configs = build_configs(base_config, e_temperature, utility_prior)
+        serialized = serialize_configs(configs)
+        write_configs(args.out_dir, serialized)
+        read_back = read_back_configs(args.out_dir)
+        validate_configs(read_back, e_temperature, utility_prior)
+    except ProtocolConfigError as exc:
+        parser.exit(2, f"error: {exc}\n")
+    print_validation_table(read_back)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

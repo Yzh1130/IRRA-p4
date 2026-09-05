@@ -446,8 +446,14 @@ def build_dataloader(args, tranforms=None):
     logger = logging.getLogger("IRRA.dataset")
 
     num_workers = args.num_workers
-    # Instantiate dataset by name from factory.
-    dataset = __factory[args.dataset_name](root=args.root_dir)
+    # Instantiate dataset by name from factory. The optional development split is
+    # specific to RGBT-PEDES; all other datasets retain their original constructor.
+    dataset_kwargs = {"root": args.root_dir}
+    if args.dataset_name == "RGBT-PEDES":
+        dataset_kwargs["dev_split_file"] = (
+            getattr(args, "dev_split_file", "") or None
+        )
+    dataset = __factory[args.dataset_name](**dataset_kwargs)
     num_classes = len(dataset.train_id_container)
     
     if args.training:

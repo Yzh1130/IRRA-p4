@@ -34,16 +34,18 @@ class Checkpointer:
         if not self.save_to_disk:
             return
 
-        data = {}
-        # Always save model weights.
-        data["model"] = self.model.state_dict()
-        if self.optimizer is not None:
-            # Save optimizer state for exact resume.
-            data["optimizer"] = self.optimizer.state_dict()
-        if self.scheduler is not None:
-            # Save scheduler state to keep LR progression consistent after resume.
-            data["scheduler"] = self.scheduler.state_dict()
-        data.update(kwargs)
+        data = {"model": self.model.state_dict()}
+        target_model = self.model.module if hasattr(self.model, "module") else self.model
+        model_args = getattr(target_model, "args", None)
+        save_model_only = bool(getattr(model_args, "save_model_only", False))
+        if not save_model_only:
+            if self.optimizer is not None:
+                # Save optimizer state for exact resume.
+                data["optimizer"] = self.optimizer.state_dict()
+            if self.scheduler is not None:
+                # Save scheduler state to keep LR progression consistent after resume.
+                data["scheduler"] = self.scheduler.state_dict()
+            data.update(kwargs)
 
         save_file = os.path.join(self.save_dir, "{}.pth".format(name))
         self.logger.info("Saving checkpoint to {}".format(save_file))

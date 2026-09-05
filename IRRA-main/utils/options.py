@@ -43,6 +43,15 @@ def validate_mraf_options(args):
         raise ValueError("--mraf_gate_base_grad_scale must be in [0.0, 1.0].")
     if int(getattr(args, "mraf_rel_warmup_epoch", 3)) < 0:
         raise ValueError("--mraf_rel_warmup_epoch must be >= 0.")
+    utility_prior = getattr(args, "mraf_utility_prior", None)
+    if utility_prior is not None:
+        if not isinstance(utility_prior, (list, tuple)) or len(utility_prior) != 2:
+            raise ValueError("--mraf_utility_prior requires exactly two values.")
+        if any(
+            not math.isfinite(float(value)) or float(value) <= 0.0
+            for value in utility_prior
+        ):
+            raise ValueError("--mraf_utility_prior values must be finite and > 0.")
 
     configured_precision = getattr(args, "use_precision_fusion", None)
     effective_precision = (
@@ -83,6 +92,7 @@ def get_args():
     parser.add_argument("--verify_ckpt_immediately_after_save", default=False, action='store_true', help="immediately re-evaluate in-memory and reloaded full-state checkpoints after validation")
     parser.add_argument("--verify_ckpt_epochs", type=str, default="", help="comma-separated 1-based epochs for immediate checkpoint verification, e.g. '9,13'; empty means all validation epochs")
     parser.add_argument("--save_last_checkpoint", default=False, action='store_true', help="save one additional last.pth after the final training epoch")
+    parser.add_argument("--save_model_only", default=False, action='store_true', help="save only the model state_dict in checkpoints")
 
     ######################## model general settings ########################
     # pretrain_choice chooses which CLIP checkpoint to initialize.
@@ -132,6 +142,7 @@ def get_args():
     mraf_group.add_argument("--mraf_scorer_lr_multiplier", type=float, default=1.0, help="positive learning-rate multiplier applied only to MRAF scorer parameters")
     mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
     mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")
+    mraf_group.add_argument("--mraf_utility_prior", type=float, nargs=2, default=None, metavar=("U_RGB", "U_IR"), help="optional positive RGB/IR utility prior for MRAF reliability targets")
     mraf_group.add_argument("--mraf_rel_warmup_epoch", type=int, default=3, help="number of epochs used to linearly warm up MRAF reliability supervision")
     mraf_group.add_argument("--mraf_balance_lambda", type=float, default=0.0, help="reserved MRAF balance-loss weight; inactive in the first implementation")
     # Ablation-only degradation data augmentation (single-branch; no consistency loss).
@@ -522,6 +533,7 @@ def get_args():
     parser.add_argument("--sampler", default="random", help="choose sampler from [idtentity, random]")
     parser.add_argument("--num_instance", type=int, default=4)
     parser.add_argument("--root_dir", default="./data")
+    parser.add_argument("--dev_split_file", default="", help="optional RGBT-PEDES identity-level development split JSON")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=8)

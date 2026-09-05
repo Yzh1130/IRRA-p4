@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -279,6 +279,7 @@ def compute_mraf_reliability_targets(
     degraded_ir: torch.Tensor,
     target_temperature: float = 0.1,
     eps: float = 1e-8,
+    utility_prior: Optional[Sequence[float]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build detached reliability targets from clean/degraded feature drift."""
     if float(target_temperature) <= 0.0:
@@ -305,7 +306,43 @@ def compute_mraf_reliability_targets(
         eps=float(eps),
     )
     target_logits = torch.stack([-drift_rgb, -drift_ir], dim=-1)
-    target = F.softmax(target_logits / float(target_temperature), dim=-1).detach()
+    effective_utility_prior = target_logits.new_ones(2)
+    if utility_prior is not None:
+        try:
+            effective_utility_prior = torch.as_tensor(utility_prior).detach().to(
+                device=target_logits.device,
+                dtype=target_logits.dtype,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "utility_prior must be a length-2 sequence of positive values."
+            ) from exc
+        if effective_utility_prior.dim() != 1 or effective_utility_prior.numel() != 2:
+            raise ValueError(
+                "utility_prior must be a length-2 sequence ordered as "
+                "[u_rgb, u_ir]."
+            )
+        if not bool(
+            (
+                torch.isfinite(effective_utility_prior)
+                & (effective_utility_prior > 0.0)
+            ).all().item()
+        ):
+            raise ValueError("utility_prior values must be finite and > 0.")
+
+    scaled_target_logits = target_logits / float(target_temperature)
+    if not bool(
+        torch.equal(
+            effective_utility_prior,
+            torch.ones_like(effective_utility_prior),
+        )
+    ):
+        # Add log(u) after temperature division. Adding it to target_logits
+        # before division would incorrectly produce (-d + log(u)) / T_r.
+        scaled_target_logits = (
+            scaled_target_logits + effective_utility_prior.log()
+        )
+    target = F.softmax(scaled_target_logits, dim=-1).detach()
     if not bool(torch.isfinite(target).all().item()):
         raise ValueError("MRAF reliability targets contain NaN or Inf values.")
     return {
@@ -314,6 +351,7 @@ def compute_mraf_reliability_targets(
         "target_ir": target[:, 1:2],
         "drift_rgb": drift_rgb,
         "drift_ir": drift_ir,
+        "utility_prior": effective_utility_prior,
     }
 
 

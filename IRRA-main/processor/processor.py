@@ -4783,6 +4783,7 @@ def _compute_mraf_reliability_terms(
         target_temperature=float(
             getattr(args, "mraf_target_temperature", 0.1)
         ),
+        utility_prior=getattr(args, "mraf_utility_prior", None),
     )
     alpha_degraded = degraded_ret["mraf_alpha"]
     loss_mraf_rel = compute_mraf_reliability_loss(

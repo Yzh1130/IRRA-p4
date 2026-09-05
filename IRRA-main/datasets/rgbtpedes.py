@@ -16,7 +16,7 @@ class RGBTPEDES(BaseDataset):
 
     dataset_dir = "RGBT-PEDES"
 
-    def __init__(self, root="", verbose=True):
+    def __init__(self, root="", verbose=True, dev_split_file=None):
         super(RGBTPEDES, self).__init__()
 
         # dataset root, e.g. <root>/RGBT-PEDES
@@ -28,7 +28,7 @@ class RGBTPEDES(BaseDataset):
         self._check_before_run()
 
         self.train_annos, self.test_annos, self.val_annos = self._split_anno(
-            self.anno_path
+            self.anno_path, dev_split_file=dev_split_file
         )
         self.train, self.train_id_container = self._process_anno(
             self.train_annos, training=True
@@ -64,20 +64,48 @@ class RGBTPEDES(BaseDataset):
         # Return default path for clearer downstream error message.
         return op.join(data_dir, "Caption.json")
 
-    def _split_anno(self, anno_path: str):
+    def _split_anno(self, anno_path: str, dev_split_file=None):
         train_annos, test_annos, val_annos = [], [], []
         annos = read_json(anno_path)
+        dev_ids = None
+        if dev_split_file is not None:
+            split_data = read_json(dev_split_file)
+            if not isinstance(split_data, dict) or "dev_ids" not in split_data:
+                raise ValueError(
+                    "dev split file must be a JSON object containing 'dev_ids'."
+                )
+            dev_ids = {int(pid) for pid in split_data["dev_ids"]}
+            official_train_ids = {
+                int(anno["id"])
+                for anno in annos
+                if anno.get("split", "train") == "train"
+            }
+            official_test_ids = {
+                int(anno["id"])
+                for anno in annos
+                if anno.get("split", "train") == "test"
+            }
+            unknown_ids = sorted(dev_ids - official_train_ids)
+            test_overlap = sorted(dev_ids & official_test_ids)
+            if unknown_ids or test_overlap:
+                raise ValueError(
+                    "dev_ids must be drawn only from the official train split; "
+                    f"unknown_train_ids={unknown_ids}, test_overlap={test_overlap}."
+                )
         for anno in annos:
             split = anno.get("split", "train")
             if split == "train":
-                train_annos.append(anno)
+                if dev_ids is not None and int(anno["id"]) in dev_ids:
+                    val_annos.append(anno)
+                else:
+                    train_annos.append(anno)
             elif split == "test":
                 test_annos.append(anno)
             else:
                 val_annos.append(anno)
 
         # This dataset usually has train/test only.
-        if len(val_annos) == 0:
+        if dev_ids is None and len(val_annos) == 0:
             val_annos = test_annos
         return train_annos, test_annos, val_annos
 
