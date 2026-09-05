@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import fnmatch
 import hashlib
 import importlib
 import itertools
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -26,7 +28,6 @@ from typing import Any, Iterable, Mapping, Sequence
 if __package__:
     from .common import (
         AuditFinding,
-        find_files,
         get_load_error,
         resolve_audit_output_dir,
         safe_json_load,
@@ -37,7 +38,6 @@ else:  # 兼容 ``python tools/audit/probe_dataset.py --help``。
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from tools.audit.common import (  # type: ignore
         AuditFinding,
-        find_files,
         get_load_error,
         resolve_audit_output_dir,
         safe_json_load,
@@ -319,6 +319,94 @@ def _probe_candidate(path: Path, repo: Path) -> dict[str, Any]:
     return probe
 
 
+def _walk_identity(path: Path) -> tuple[Any, ...]:
+    """Return a stable directory identity while following symlinks."""
+    try:
+        stat_result = path.stat()
+        if int(getattr(stat_result, "st_ino", 0)) != 0:
+            return ("inode", int(stat_result.st_dev), int(stat_result.st_ino))
+    except (OSError, RuntimeError):
+        pass
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(str(path)))
+    return ("path", os.path.normcase(str(resolved)))
+
+
+def _is_walk_excluded(path: Path, exclusions: Sequence[str]) -> bool:
+    candidates = [path]
+    try:
+        candidates.append(path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        pass
+    normalized = [candidate.as_posix().casefold() for candidate in candidates]
+    return any(
+        token and any(token in candidate for candidate in normalized)
+        for token in (
+            Path(str(exclusion)).as_posix().casefold()
+            for exclusion in exclusions
+        )
+    )
+
+
+def _find_files_followlinks(
+    root: Path,
+    patterns: Sequence[str],
+    exclude_substrings: Sequence[str],
+    max_depth: int,
+) -> list[Path]:
+    """Find files below ``root``, following links without revisiting targets."""
+    base = root.expanduser()
+    if not base.is_dir():
+        return []
+
+    found: list[Path] = []
+    visited: set[tuple[Any, ...]] = set()
+    pending: list[tuple[Path, int]] = [(base, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        identity = _walk_identity(directory)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if _is_walk_excluded(directory, exclude_substrings):
+            continue
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(
+                    iterator,
+                    key=lambda entry: entry.name.casefold(),
+                    reverse=True,
+                )
+        except (OSError, RuntimeError):
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            if _is_walk_excluded(path, exclude_substrings):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=True):
+                    if depth < max_depth:
+                        pending.append((path, depth + 1))
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+            except OSError:
+                continue
+            try:
+                relative = path.relative_to(base).as_posix()
+            except ValueError:
+                relative = path.as_posix()
+            if any(
+                fnmatch.fnmatchcase(entry.name, pattern)
+                or fnmatch.fnmatchcase(relative, Path(pattern).as_posix())
+                for pattern in patterns
+            ):
+                found.append(path)
+    return sorted(found, key=lambda item: item.as_posix().casefold())
+
+
 def _find_candidates(data_root: Path, explicit: Path | None) -> tuple[list[Path], list[str]]:
     notes: list[str] = []
     if explicit is not None:
@@ -329,20 +417,12 @@ def _find_candidates(data_root: Path, explicit: Path | None) -> tuple[list[Path]
     if not data_root.exists():
         notes.append(f"数据根未找到：{data_root.resolve(strict=False)}")
         return [], notes
-    try:
-        found = find_files(
-            data_root,
-            patterns=("*.json", "*.pkl", "*.pickle", "*.csv"),
-            exclude_substrings=("site-packages", "__pycache__", ".git/objects", ".cache"),
-            max_depth=12,
-        )
-    except TypeError:
-        found = find_files(
-            data_root,
-            ("*.json", "*.pkl", "*.pickle", "*.csv"),
-            ("site-packages", "__pycache__", ".git/objects", ".cache"),
-            12,
-        )
+    found = _find_files_followlinks(
+        data_root,
+        patterns=("*.json", "*.pkl", "*.pickle", "*.csv"),
+        exclude_substrings=("site-packages", "__pycache__", ".git/objects", ".cache"),
+        max_depth=12,
+    )
     candidates: list[Path] = []
     for item in found or []:
         path = Path(item)

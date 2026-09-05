@@ -172,7 +172,12 @@ def _classify_file(path: Path) -> frozenset[str]:
     suffix = path.suffix.lower()
     kinds: set[str] = set()
 
-    score_like = "score" in stem and suffix in _SCORE_SUFFIXES
+    under_scores_dir = any(
+        part.casefold() == "scores" for part in path.parts[:-1]
+    )
+    score_like = suffix in _SCORE_SUFFIXES and (
+        "score" in stem or under_scores_dir
+    )
     if score_like:
         kinds.add("scores")
 
@@ -673,9 +678,36 @@ def _infer_seed(wrapper: Path, values: Sequence[ValueMatch]) -> ValueMatch:
 
 
 def _infer_label(wrapper: Path, values: Sequence[ValueMatch]) -> ValueMatch:
+    seed_suffix_pattern = re.compile(
+        r"^(?P<label>.+?)[_-]seed[_-]?\d+$", re.IGNORECASE
+    )
+
     match = _resolve_value(values, "config_label")
     if match is not None and str(match.value).strip():
+        raw_label = str(match.value).strip()
+        found = seed_suffix_pattern.fullmatch(raw_label)
+        if found:
+            label = re.sub(r"^\d{8}_\d{6}_?", "", found.group("label"))
+            if label:
+                return ValueMatch(
+                    label,
+                    match.actual_key,
+                    f"{match.source}; 配置值 _seed 后缀归一化",
+                    match.priority,
+                )
         return match
+
+    for part in reversed(wrapper.parts):
+        found = seed_suffix_pattern.fullmatch(part)
+        if found:
+            label = re.sub(r"^\d{8}_\d{6}_?", "", found.group("label"))
+            if label:
+                return ValueMatch(
+                    label,
+                    "path:config_label",
+                    f"{wrapper}:目录名 _seed 后缀推断",
+                    0,
+                )
     label_pattern = re.compile(r"(?:^|[_\-.])(H1|H2|A|B|C|D|E|F)(?:[_\-.]|$)", re.IGNORECASE)
     for part in reversed(wrapper.parts):
         found = label_pattern.search(part)
@@ -1658,7 +1690,7 @@ def _report_lines(
                 "log",
                 "config",
                 "metrics",
-                "scores",
+                "分数矩阵",
                 "gate",
                 "drift",
                 "clean R1",

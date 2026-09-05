@@ -6,6 +6,7 @@ import os.path as op
 import torch
 
 from datasets import build_dataloader
+from datasets.rgbtpedes import RGBTPEDES
 from model import build_model
 from processor.processor import (
     apply_img_local_filter_stage,
@@ -16,7 +17,7 @@ from processor.processor import (
     restore_eval_extra_state,
 )
 from utils.checkpoint import Checkpointer
-from utils.iotools import load_train_configs
+from utils.iotools import load_train_configs, read_json
 from utils.logger import setup_logger
 
 
@@ -271,6 +272,19 @@ if __name__ == "__main__":
         default=False,
         action="store_true",
         help="build eval dataloaders through the same training validation branch used by train.py",
+    )
+    parser.add_argument(
+        "--eval_split",
+        type=str,
+        default="test",
+        choices=["test", "val"],
+        help="evaluation split; val requires an explicit --dev_split_file",
+    )
+    parser.add_argument(
+        "--dev_split_file",
+        type=str,
+        default=None,
+        help="explicit development split JSON required by --eval_split val",
     )
     parser.add_argument(
         "--save_eval_scores",
@@ -907,6 +921,8 @@ if __name__ == "__main__":
     args.eval_degrade_strength = float(cli_args.eval_degrade_strength)
     args.eval_degrade_blur_kernel = int(cli_args.eval_degrade_blur_kernel)
     args.eval_degrade_seed = int(cli_args.eval_degrade_seed)
+    if cli_args.dev_split_file is not None:
+        args.dev_split_file = op.abspath(op.expanduser(cli_args.dev_split_file))
     args.config_file = op.abspath(cli_args.config_file)
     args.test_ckpt_file = ""
 
@@ -941,11 +957,70 @@ if __name__ == "__main__":
         )
     device = "cuda"
 
+    args.eval_dataset = str(cli_args.eval_split)
+    expected_dev_ids = None
+    if args.eval_dataset == "val":
+        if not str(cli_args.dev_split_file or "").strip():
+            raise ValueError(
+                "--eval_split val requires --dev_split_file on the command line; "
+                "a path stored only in configs.yaml is not accepted."
+            )
+        if str(getattr(args, "dataset_name", "")) != "RGBT-PEDES":
+            raise ValueError(
+                "--eval_split val with --dev_split_file is currently restricted "
+                "to dataset_name='RGBT-PEDES'."
+            )
+        dev_split_file = str(args.dev_split_file)
+        if not op.isfile(dev_split_file):
+            raise FileNotFoundError(
+                f"--dev_split_file does not exist: {dev_split_file}"
+            )
+        dev_split = read_json(dev_split_file)
+        if not isinstance(dev_split, dict) or "dev_ids" not in dev_split:
+            raise ValueError(
+                "--dev_split_file must be a JSON object containing 'dev_ids'."
+            )
+        dev_ids = dev_split["dev_ids"]
+        if not isinstance(dev_ids, list):
+            raise ValueError("--dev_split_file field 'dev_ids' must be a list.")
+        if "n_dev" not in dev_split:
+            raise ValueError("--dev_split_file must contain 'n_dev'.")
+        expected_dev_ids = dev_split["n_dev"]
+        if isinstance(expected_dev_ids, bool) or not isinstance(
+            expected_dev_ids, int
+        ):
+            raise ValueError(
+                "--dev_split_file field 'n_dev' must be an integer."
+            )
+        if expected_dev_ids != len(dev_ids):
+            raise ValueError(
+                "--dev_split_file mismatch: "
+                f"n_dev={expected_dev_ids}, len(dev_ids)={len(dev_ids)}."
+            )
+
+        dev_dataset = RGBTPEDES(
+            root=args.root_dir,
+            verbose=False,
+            dev_split_file=dev_split_file,
+        )
+        if dev_dataset.val_annos is dev_dataset.test_annos:
+            raise RuntimeError(
+                "Unsafe val split: RGBTPEDES.val_annos aliases test_annos."
+            )
+        val_unique_pids = {
+            int(anno["id"]) for anno in dev_dataset.val_annos
+        }
+        if len(val_unique_pids) != expected_dev_ids:
+            raise RuntimeError(
+                "Unsafe val split identity count: "
+                f"expected n_dev={expected_dev_ids}, got {len(val_unique_pids)}."
+            )
+
     if cli_args.use_train_validation_pipeline:
         loader_args = copy.deepcopy(args)
         loader_args.training = True
         loader_args.distributed = False
-        args.eval_dataset = str(getattr(args, "val_dataset", "test"))
+        loader_args.val_dataset = args.eval_dataset
         _, test_img_loader, test_txt_loader, num_classes = build_dataloader(loader_args)
         logger.info(
             "[TEST_PIPELINE] use_train_validation_pipeline=True val_dataset=%s batch_size=%s",
@@ -954,6 +1029,26 @@ if __name__ == "__main__":
         )
     else:
         test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
+
+    image_pids = list(
+        getattr(getattr(test_img_loader, "dataset", None), "image_pids", [])
+    )
+    caption_pids = list(
+        getattr(getattr(test_txt_loader, "dataset", None), "caption_pids", [])
+    )
+    num_eval_ids = len(set(image_pids) | set(caption_pids))
+    if expected_dev_ids is not None and num_eval_ids != expected_dev_ids:
+        raise RuntimeError(
+            "Selected val dataloaders do not match the development split: "
+            f"expected n_dev={expected_dev_ids}, got {num_eval_ids}."
+        )
+    logger.info(
+        "[EVAL_SPLIT] split=%s num_images=%d num_captions=%d num_ids=%d",
+        args.eval_dataset,
+        len(image_pids),
+        len(caption_pids),
+        num_eval_ids,
+    )
     model = build_model(args, num_classes=num_classes)
 
     checkpointer = Checkpointer(model)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the nine locked Stage 1 training configurations."""
+"""Generate the locked formal or development-grid training configurations."""
 
 from __future__ import annotations
 
@@ -27,6 +27,9 @@ from utils.config import (  # noqa: E402
 
 ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
 E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
+DEV_ARM_NAMES = ("devA", "devT010", "devT020", "devT030", "devT050")
+DEV_SPLIT_FILE = "splits/dev_190.json"
+DEV_INHERITED_FIELDS = ("MLM", "img_aug", "sampler", "num_instance")
 
 COMMON_OVERRIDES: dict[str, Any] = {
     "num_epoch": 60,
@@ -64,6 +67,79 @@ GATE_DISABLED_OVERRIDES: dict[str, Any] = {
     "mraf_gate_logit_scale": 1.0,
     "mraf_gate_fp32": False,
 }
+
+DEV_PROTOCOL_OVERRIDES: dict[str, Any] = {
+    "training": True,
+    "val_dataset": "val",
+    "dev_split_file": DEV_SPLIT_FILE,
+}
+
+DEV_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
+    "devA": {
+        "mdrc_enable": False,
+        "mraf_enabled": False,
+        "mraf_rel_lambda": 0.0,
+        "mraf_target_temperature": 0.1,
+        "mraf_equalize_modality_norm": False,
+        "mraf_freeze_gate": False,
+        "mraf_utility_prior": None,
+    },
+    "devT010": {
+        "mdrc_enable": True,
+        "mraf_enabled": True,
+        "mraf_rel_lambda": 1.0,
+        "mraf_target_temperature": 0.1,
+        "mraf_equalize_modality_norm": False,
+        "mraf_freeze_gate": False,
+        "mraf_utility_prior": None,
+    },
+    "devT020": {
+        "mdrc_enable": True,
+        "mraf_enabled": True,
+        "mraf_rel_lambda": 1.0,
+        "mraf_target_temperature": 0.2,
+        "mraf_equalize_modality_norm": False,
+        "mraf_freeze_gate": False,
+        "mraf_utility_prior": None,
+    },
+    "devT030": {
+        "mdrc_enable": True,
+        "mraf_enabled": True,
+        "mraf_rel_lambda": 1.0,
+        "mraf_target_temperature": 0.3,
+        "mraf_equalize_modality_norm": False,
+        "mraf_freeze_gate": False,
+        "mraf_utility_prior": None,
+    },
+    "devT050": {
+        "mdrc_enable": True,
+        "mraf_enabled": True,
+        "mraf_rel_lambda": 1.0,
+        "mraf_target_temperature": 0.5,
+        "mraf_equalize_modality_norm": False,
+        "mraf_freeze_gate": False,
+        "mraf_utility_prior": None,
+    },
+}
+
+DEV_VALIDATION_FIELDS = (
+    "training",
+    "val_dataset",
+    "dev_split_file",
+    "MLM",
+    "img_aug",
+    "sampler",
+    "num_instance",
+    *COMMON_OVERRIDES.keys(),
+    *GATE_ENABLED_OVERRIDES.keys(),
+    "mdrc_enable",
+    "mraf_enabled",
+    "mraf_rel_lambda",
+    "mraf_target_temperature",
+    "mraf_equalize_modality_norm",
+    "mraf_freeze_gate",
+    "mraf_utility_prior",
+)
 
 
 class ProtocolConfigError(ValueError):
@@ -276,6 +352,68 @@ def build_configs(
     return configs
 
 
+def _dev_expected_values(
+    base_config: Mapping[str, Any], arm: str
+) -> dict[str, Any]:
+    if arm not in DEV_VARIANT_OVERRIDES:
+        raise ProtocolConfigError(f"Unknown development-grid arm: {arm!r}.")
+    missing = [field for field in DEV_INHERITED_FIELDS if field not in base_config]
+    if missing:
+        raise ProtocolConfigError(
+            "Base config is missing required inherited development-grid field(s): "
+            + ", ".join(missing)
+        )
+    if base_config["MLM"] is not True:
+        raise ProtocolConfigError(
+            "Base config field MLM must be the boolean true for the development "
+            f"grid, got {base_config['MLM']!r}."
+        )
+
+    expected = {field: base_config[field] for field in DEV_INHERITED_FIELDS}
+    expected.update(COMMON_OVERRIDES)
+    expected.update(DEV_PROTOCOL_OVERRIDES)
+    expected.update(
+        GATE_ENABLED_OVERRIDES
+        if bool(DEV_VARIANT_OVERRIDES[arm]["mraf_enabled"])
+        else GATE_DISABLED_OVERRIDES
+    )
+    expected.update(DEV_VARIANT_OVERRIDES[arm])
+    return expected
+
+
+def build_dev_configs(
+    base_config: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Build the five pre-freeze configurations without reading frozen values."""
+    configs: dict[str, dict[str, Any]] = {}
+    for arm in DEV_ARM_NAMES:
+        config = dict(base_config)
+        config.update(_dev_expected_values(base_config, arm))
+        configs[arm] = config
+    validate_dev_configs(configs, base_config)
+    return configs
+
+
+def validate_dev_configs(
+    configs: Mapping[str, Mapping[str, Any]],
+    base_config: Mapping[str, Any],
+) -> None:
+    if tuple(configs) != DEV_ARM_NAMES:
+        raise ProtocolConfigError(
+            "Generated development-grid order must be "
+            f"{list(DEV_ARM_NAMES)}, got {list(configs)}."
+        )
+    for arm in DEV_ARM_NAMES:
+        config = configs[arm]
+        expected_values = _dev_expected_values(base_config, arm)
+        for key in DEV_VALIDATION_FIELDS:
+            expected = expected_values[key]
+            if key not in config or config[key] != expected:
+                raise ProtocolConfigError(
+                    f"{arm}.{key} must be {expected!r}, got {config.get(key)!r}."
+                )
+
+
 def validate_configs(
     configs: Mapping[str, Mapping[str, Any]],
     e_temperature: float,
@@ -312,9 +450,10 @@ def validate_configs(
 
 def serialize_configs(
     configs: Mapping[str, Mapping[str, Any]],
+    config_names: Sequence[str] = ARM_NAMES,
 ) -> dict[str, str]:
     serialized: dict[str, str] = {}
-    for arm in ARM_NAMES:
+    for arm in config_names:
         try:
             text = yaml.dump(
                 dict(configs[arm]),
@@ -332,17 +471,21 @@ def serialize_configs(
     return serialized
 
 
-def write_configs(out_dir: Path, serialized: Mapping[str, str]) -> None:
+def write_configs(
+    out_dir: Path,
+    serialized: Mapping[str, str],
+    config_names: Sequence[str] = ARM_NAMES,
+) -> None:
     output_dir = out_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     temporary_paths: list[Path] = []
     try:
-        for arm in ARM_NAMES:
+        for arm in config_names:
             temp_path = output_dir / f".{arm}.yaml.tmp"
             with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(serialized[arm])
             temporary_paths.append(temp_path)
-        for arm in ARM_NAMES:
+        for arm in config_names:
             (output_dir / f".{arm}.yaml.tmp").replace(output_dir / f"{arm}.yaml")
     finally:
         for temp_path in temporary_paths:
@@ -350,10 +493,13 @@ def write_configs(out_dir: Path, serialized: Mapping[str, str]) -> None:
                 temp_path.unlink()
 
 
-def read_back_configs(out_dir: Path) -> dict[str, dict[str, Any]]:
+def read_back_configs(
+    out_dir: Path,
+    config_names: Sequence[str] = ARM_NAMES,
+) -> dict[str, dict[str, Any]]:
     output_dir = out_dir.expanduser().resolve()
     configs: dict[str, dict[str, Any]] = {}
-    for arm in ARM_NAMES:
+    for arm in config_names:
         path = output_dir / f"{arm}.yaml"
         try:
             configs[arm] = load_config_mapping(path)
@@ -384,11 +530,34 @@ def print_validation_table(configs: Mapping[str, Mapping[str, Any]]) -> None:
         )
 
 
+def _table_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def print_dev_validation_table(
+    configs: Mapping[str, Mapping[str, Any]],
+    base_config: Mapping[str, Any],
+) -> None:
+    """Print every locked/inherited dev parameter after the YAML read-back."""
+    print("| config | parameter | expected | read_back | status |")
+    print("| --- | --- | --- | --- | --- |")
+    for arm in DEV_ARM_NAMES:
+        expected_values = _dev_expected_values(base_config, arm)
+        for key in DEV_VALIDATION_FIELDS:
+            expected = expected_values[key]
+            actual = configs[arm].get(key)
+            status = "OK" if key in configs[arm] and actual == expected else "MISMATCH"
+            print(
+                f"| {arm} | {key} | {_table_value(expected)} | "
+                f"{_table_value(actual)} | {status} |"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate locked A/B/C/D/E/F/H1/H2/U flat training YAML configs "
-            "from a saved base config and committed frozen dev selections."
+            "Generate either locked A/B/C/D/E/F/H1/H2/U formal configs or the "
+            "five pre-freeze development-grid configs from a saved base config."
         )
     )
     parser.add_argument(
@@ -401,13 +570,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--frozen-hparams",
         type=Path,
         default=Path("FROZEN_HPARAMS.json"),
-        help="committed JSON containing E.mraf_target_temperature and U.mraf_utility_prior",
+        help=(
+            "committed JSON containing E.mraf_target_temperature and "
+            "U.mraf_utility_prior; ignored and never read with --dev-grid"
+        ),
+    )
+    parser.add_argument(
+        "--dev-grid",
+        default=False,
+        action="store_true",
+        help=(
+            "generate devA/devT010/devT020/devT030/devT050 without reading "
+            "FROZEN_HPARAMS.json"
+        ),
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
         required=True,
-        help="output directory for A.yaml through U.yaml",
+        help="output directory for the generated YAML files",
     )
     return parser
 
@@ -417,15 +598,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         base_config = load_base_config(args.base_config)
-        e_temperature, utility_prior = load_frozen_hparams(args.frozen_hparams)
-        configs = build_configs(base_config, e_temperature, utility_prior)
-        serialized = serialize_configs(configs)
-        write_configs(args.out_dir, serialized)
-        read_back = read_back_configs(args.out_dir)
-        validate_configs(read_back, e_temperature, utility_prior)
+        if args.dev_grid:
+            configs = build_dev_configs(base_config)
+            serialized = serialize_configs(configs, DEV_ARM_NAMES)
+            write_configs(args.out_dir, serialized, DEV_ARM_NAMES)
+            read_back = read_back_configs(args.out_dir, DEV_ARM_NAMES)
+            validate_dev_configs(read_back, base_config)
+        else:
+            e_temperature, utility_prior = load_frozen_hparams(args.frozen_hparams)
+            configs = build_configs(base_config, e_temperature, utility_prior)
+            serialized = serialize_configs(configs)
+            write_configs(args.out_dir, serialized)
+            read_back = read_back_configs(args.out_dir)
+            validate_configs(read_back, e_temperature, utility_prior)
     except ProtocolConfigError as exc:
         parser.exit(2, f"error: {exc}\n")
-    print_validation_table(read_back)
+    if args.dev_grid:
+        print_dev_validation_table(read_back, base_config)
+    else:
+        print_validation_table(read_back)
     return 0
 
 
