@@ -29,9 +29,24 @@ ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
 E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
 DEV_ARM_NAMES = ("devA", "devT010", "devT020", "devT030", "devT050")
 DEV_SPLIT_FILE = "splits/dev_190.json"
-DEV_INHERITED_FIELDS = ("MLM", "img_aug", "sampler", "num_instance")
+DEV_REQUIRED_INHERITED_FIELDS = (
+    "MLM",
+    "img_aug",
+    "sampler",
+    "num_instance",
+    "batch_size",
+    "lr",
+    "optimizer",
+    "loss_names",
+    "img_size",
+    "stride_size",
+    "text_length",
+    "pretrain_choice",
+    "cmt_depth",
+    "temperature",
+)
 
-COMMON_OVERRIDES: dict[str, Any] = {
+FORMAL_COMMON_OVERRIDES: dict[str, Any] = {
     "num_epoch": 60,
     "batch_size": 64,
     "lr": 1e-5,
@@ -69,9 +84,30 @@ GATE_DISABLED_OVERRIDES: dict[str, Any] = {
 }
 
 DEV_PROTOCOL_OVERRIDES: dict[str, Any] = {
+    "num_epoch": 60,
+    "eval_period": 1,
+    "degrade_aug_mode": "none",
+    "save_last_checkpoint": True,
+    "save_all_epoch_ckpt": False,
+    "save_metric_best_ckpt": False,
+    "save_model_only": True,
     "training": True,
     "val_dataset": "val",
     "dev_split_file": DEV_SPLIT_FILE,
+}
+
+DEV_FIXED_OVERRIDES: dict[str, Any] = {
+    "mdrc_lambda": 0.05,
+    "mdrc_loss_scale": 100,
+    "mdrc_prob": 0.5,
+    "mdrc_warmup_epoch": 3,
+    "mdrc_temp": 0.07,
+    "mraf_hidden_dim": 128,
+    "mraf_dropout": 0.1,
+    "mraf_gate_temperature": 1.0,
+    "mraf_gate_base_grad_scale": 1.0,
+    "mraf_rel_warmup_epoch": 1,
+    "mraf_balance_lambda": 0.0,
 }
 
 DEV_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -122,23 +158,34 @@ DEV_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
     },
 }
 
-DEV_VALIDATION_FIELDS = (
-    "training",
-    "val_dataset",
-    "dev_split_file",
-    "MLM",
-    "img_aug",
-    "sampler",
-    "num_instance",
-    *COMMON_OVERRIDES.keys(),
-    *GATE_ENABLED_OVERRIDES.keys(),
+DEV_EXPERIMENT_FIELDS = (
     "mdrc_enable",
     "mraf_enabled",
     "mraf_rel_lambda",
     "mraf_target_temperature",
+    "mraf_scorer_lr_multiplier",
+    "mraf_gate_logit_scale",
+    "mraf_gate_fp32",
     "mraf_equalize_modality_norm",
     "mraf_freeze_gate",
     "mraf_utility_prior",
+)
+
+DEV_GENERATOR_OWNED_FIELDS = frozenset(
+    (
+        "name",
+        *DEV_PROTOCOL_OVERRIDES.keys(),
+        *DEV_FIXED_OVERRIDES.keys(),
+        *DEV_EXPERIMENT_FIELDS,
+    )
+)
+
+DEV_VALIDATION_FIELDS = (
+    *DEV_REQUIRED_INHERITED_FIELDS,
+    "name",
+    *DEV_PROTOCOL_OVERRIDES.keys(),
+    *DEV_FIXED_OVERRIDES.keys(),
+    *DEV_EXPERIMENT_FIELDS,
 )
 
 
@@ -340,7 +387,7 @@ def build_configs(
     configs: dict[str, dict[str, Any]] = {}
     for arm in ARM_NAMES:
         config = dict(base_config)
-        config.update(COMMON_OVERRIDES)
+        config.update(FORMAL_COMMON_OVERRIDES)
         config.update(
             GATE_ENABLED_OVERRIDES
             if bool(per_arm[arm]["mraf_enabled"])
@@ -352,12 +399,12 @@ def build_configs(
     return configs
 
 
-def _dev_expected_values(
-    base_config: Mapping[str, Any], arm: str
-) -> dict[str, Any]:
-    if arm not in DEV_VARIANT_OVERRIDES:
-        raise ProtocolConfigError(f"Unknown development-grid arm: {arm!r}.")
-    missing = [field for field in DEV_INHERITED_FIELDS if field not in base_config]
+def _validate_dev_base_config(base_config: Mapping[str, Any]) -> None:
+    missing = [
+        field
+        for field in DEV_REQUIRED_INHERITED_FIELDS
+        if field not in base_config
+    ]
     if missing:
         raise ProtocolConfigError(
             "Base config is missing required inherited development-grid field(s): "
@@ -369,26 +416,93 @@ def _dev_expected_values(
             f"grid, got {base_config['MLM']!r}."
         )
 
-    expected = {field: base_config[field] for field in DEV_INHERITED_FIELDS}
-    expected.update(COMMON_OVERRIDES)
-    expected.update(DEV_PROTOCOL_OVERRIDES)
-    expected.update(
+
+def _dev_generator_values(arm: str) -> dict[str, Any]:
+    if arm not in DEV_VARIANT_OVERRIDES:
+        raise ProtocolConfigError(f"Unknown development-grid arm: {arm!r}.")
+
+    values = dict(DEV_PROTOCOL_OVERRIDES)
+    values["name"] = arm
+    values.update(DEV_FIXED_OVERRIDES)
+    values.update(
         GATE_ENABLED_OVERRIDES
         if bool(DEV_VARIANT_OVERRIDES[arm]["mraf_enabled"])
         else GATE_DISABLED_OVERRIDES
     )
-    expected.update(DEV_VARIANT_OVERRIDES[arm])
+    values.update(DEV_VARIANT_OVERRIDES[arm])
+    actual_owned_fields = frozenset(values)
+    if actual_owned_fields != DEV_GENERATOR_OWNED_FIELDS:
+        missing = sorted(DEV_GENERATOR_OWNED_FIELDS - actual_owned_fields)
+        unexpected = sorted(actual_owned_fields - DEV_GENERATOR_OWNED_FIELDS)
+        raise ProtocolConfigError(
+            "Internal development-grid ownership mismatch: "
+            f"missing={missing}, unexpected={unexpected}."
+        )
+    return values
+
+
+def _dev_expected_values(
+    base_config: Mapping[str, Any], arm: str
+) -> dict[str, Any]:
+    _validate_dev_base_config(base_config)
+    expected = {
+        field: base_config[field]
+        for field in DEV_REQUIRED_INHERITED_FIELDS
+    }
+    expected.update(_dev_generator_values(arm))
     return expected
+
+
+def _assert_dev_inheritance(
+    configs: Mapping[str, Mapping[str, Any]],
+    base_config: Mapping[str, Any],
+) -> None:
+    """Require every non-owned generated value to equal the base value."""
+    missing_marker = object()
+    differences: list[tuple[str, Any, Any, Any]] = []
+    for arm in DEV_ARM_NAMES:
+        config = configs[arm]
+        for key, base_value in base_config.items():
+            if key in DEV_GENERATOR_OWNED_FIELDS:
+                continue
+            generated_value = config.get(key, missing_marker)
+            if (
+                generated_value is missing_marker
+                or generated_value != base_value
+            ):
+                differences.append((arm, key, base_value, generated_value))
+        for key, generated_value in config.items():
+            if key not in base_config and key not in DEV_GENERATOR_OWNED_FIELDS:
+                differences.append((arm, key, missing_marker, generated_value))
+
+    if not differences:
+        return
+
+    difference_keys = sorted({str(item[1]) for item in differences})
+
+    def render(value: Any) -> str:
+        return "<missing>" if value is missing_marker else repr(value)
+
+    details = "; ".join(
+        f"{arm}.{key}: base={render(base_value)}, "
+        f"generated={render(generated_value)}"
+        for arm, key, base_value, generated_value in differences
+    )
+    raise ProtocolConfigError(
+        "Development-grid inheritance mismatch for key(s): "
+        f"{', '.join(difference_keys)}. Details: {details}"
+    )
 
 
 def build_dev_configs(
     base_config: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
     """Build the five pre-freeze configurations without reading frozen values."""
+    _validate_dev_base_config(base_config)
     configs: dict[str, dict[str, Any]] = {}
     for arm in DEV_ARM_NAMES:
         config = dict(base_config)
-        config.update(_dev_expected_values(base_config, arm))
+        config.update(_dev_generator_values(arm))
         configs[arm] = config
     validate_dev_configs(configs, base_config)
     return configs
@@ -403,6 +517,8 @@ def validate_dev_configs(
             "Generated development-grid order must be "
             f"{list(DEV_ARM_NAMES)}, got {list(configs)}."
         )
+    _validate_dev_base_config(base_config)
+    _assert_dev_inheritance(configs, base_config)
     for arm in DEV_ARM_NAMES:
         config = configs[arm]
         expected_values = _dev_expected_values(base_config, arm)
@@ -426,7 +542,7 @@ def validate_configs(
     expected_arm_values = arm_overrides(e_temperature, utility_prior)
     for arm in ARM_NAMES:
         config = configs[arm]
-        for key, expected in COMMON_OVERRIDES.items():
+        for key, expected in FORMAL_COMMON_OVERRIDES.items():
             if config.get(key) != expected:
                 raise ProtocolConfigError(
                     f"{arm}.{key} must be {expected!r}, got {config.get(key)!r}."
@@ -539,16 +655,21 @@ def print_dev_validation_table(
     base_config: Mapping[str, Any],
 ) -> None:
     """Print every locked/inherited dev parameter after the YAML read-back."""
-    print("| config | parameter | expected | read_back | status |")
-    print("| --- | --- | --- | --- | --- |")
+    print("| config | parameter | source | expected | read_back | status |")
+    print("| --- | --- | --- | --- | --- | --- |")
     for arm in DEV_ARM_NAMES:
         expected_values = _dev_expected_values(base_config, arm)
         for key in DEV_VALIDATION_FIELDS:
             expected = expected_values[key]
             actual = configs[arm].get(key)
             status = "OK" if key in configs[arm] and actual == expected else "MISMATCH"
+            source = (
+                "生成器设定"
+                if key in DEV_GENERATOR_OWNED_FIELDS
+                else "继承自 base"
+            )
             print(
-                f"| {arm} | {key} | {_table_value(expected)} | "
+                f"| {arm} | {key} | {source} | {_table_value(expected)} | "
                 f"{_table_value(actual)} | {status} |"
             )
 
