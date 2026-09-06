@@ -1,0 +1,95 @@
+{
+  "E": {
+    "mraf_target_temperature": 0.2
+  },
+  "U": {
+    "mraf_utility_prior": [
+      0.7284522740054223,
+      0.2715477259945776
+    ]
+  },
+  "selection_evidence": {
+    "tr_candidates": {
+      "0.2": {
+        "group": "devT020",
+        "mean_r1": 62.6854,
+        "std_r1": 0.5357,
+        "per_seed_r1": {
+          "1": 63.1296,
+          "2": 62.0905,
+          "3": 62.8362
+        },
+        "n_seeds": 3,
+        "n_degraded_scenarios_per_seed": 10
+      },
+      "0.3": {
+        "group": "devT030",
+        "mean_r1": 62.3839,
+        "std_r1": 0.8989,
+        "per_seed_r1": {
+          "1": 63.0807,
+          "2": 62.7017,
+          "3": 61.3692
+        },
+        "n_seeds": 3,
+        "n_degraded_scenarios_per_seed": 10
+      },
+      "0.5": {
+        "group": "devT050",
+        "mean_r1": 62.3798,
+        "std_r1": 0.8481,
+        "per_seed_r1": {
+          "1": 63.3374,
+          "2": 62.0782,
+          "3": 61.7237
+        },
+        "n_seeds": 3,
+        "n_degraded_scenarios_per_seed": 10
+      }
+    },
+    "tr_reference_0.1": {
+      "group": "devT010",
+      "mean_r1": 61.6463,
+      "std_r1": 1.0093,
+      "per_seed_r1": {
+        "1": 61.6015,
+        "2": 62.6773,
+        "3": 60.6601
+      },
+      "n_seeds": 3,
+      "n_degraded_scenarios_per_seed": 10
+    },
+    "tr_selection": {
+      "top_temperature": 0.2,
+      "top_mean_r1_rounded4": 62.6854,
+      "second_temperature": 0.3,
+      "second_mean_r1_rounded4": 62.3839,
+      "top_minus_second_rounded4": 0.3015,
+      "threshold": 0.3,
+      "strictly_below_threshold": false,
+      "rounding": "ROUND_HALF_UP to 4 decimal places before comparison"
+    },
+    "utility_raw": {
+      "rgb": 64.05867894333333,
+      "ir": 23.87937991,
+      "rgb_per_seed": {
+        "1": 64.79217529,
+        "2": 64.30317688,
+        "3": 63.08068466
+      },
+      "ir_per_seed": {
+        "1": 21.88264084,
+        "2": 25.3056221,
+        "3": 24.44987679
+      }
+    },
+    "utility_normalized": [
+      0.7284522740054223,
+      0.2715477259945776
+    ],
+    "dev_split_md5": "80356d48d3c78cfa2b489c34c322d373",
+    "dev_metrics_md5": "58bdb7e33a924954db33ffa27ac609e8",
+    "n_seeds": 3,
+    "frozen_at": "2026-09-06T13:16:12Z"
+  }
+}
