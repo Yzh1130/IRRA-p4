@@ -104,6 +104,7 @@ CONFIRMED_BASELINES: dict[str, tuple[tuple[str, str, Any], ...]] = {
         ("empty_captions", "空 caption", 3),
         ("train_empty_captions", "train 空 caption", 3),
         ("test_empty_captions", "test 空 caption", 0),
+        ("effective_train_records", "有效训练记录（过滤空 caption 后）", 3948),
     ),
 }
 
@@ -1104,9 +1105,20 @@ def _first_source_match(
     }
 
 
-def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str, Any]:
+def _loader_static_audit(
+    repo: Path, inferred_train_ids: int | None, dataset_name: str = "RGBT-PEDES"
+) -> dict[str, Any]:
     loader_path = repo / "datasets" / "rgbtpedes.py"
     build_path = repo / "datasets" / "build.py"
+    class_name = {
+        "RGBT-PEDES": "RGBTPEDES",
+        "RGBNT201-PEDES": "RGBNT201PEDES",
+    }[dataset_name]
+    annotation_pattern = (
+        r"^\s*annotation_filenames\s*=\s*\(.*captionform0_8B\.json"
+        if dataset_name == "RGBNT201-PEDES"
+        else r"for\s+fname\s+in\s+\(.*Caption\.json"
+    )
     facts = [
         {
             "item": "数据目录解析优先级",
@@ -1114,7 +1126,7 @@ def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str
         },
         {
             "item": "标注文件名解析优先级",
-            **_first_source_match(loader_path, r"for\s+fname\s+in\s+\(.*Caption\.json", repo),
+            **_first_source_match(loader_path, annotation_pattern, repo),
         },
         {
             "item": "val 为空时复用 test",
@@ -1131,6 +1143,18 @@ def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str
         },
     ]
     loader_lines = _read_source_lines(loader_path)
+    scope_start, scope_end = 1, len(loader_lines)
+    try:
+        tree = ast.parse("\n".join(loader_lines), filename=str(loader_path))
+        class_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        scope_start = class_node.lineno
+        scope_end = class_node.end_lineno or len(loader_lines)
+    except (OSError, SyntaxError, StopIteration):
+        pass
     skip_patterns = (
         re.compile(r"\bcontinue\b"),
         re.compile(r"\bfilter\w*\b", re.IGNORECASE),
@@ -1139,11 +1163,13 @@ def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str
     skip_matches = [
         {"line": index, "text": line}
         for index, line in enumerate(loader_lines, start=1)
+        if scope_start <= index <= scope_end
         if any(pattern.search(line) for pattern in skip_patterns)
     ]
     len_zero_matches = [
         {"line": index, "text": line}
         for index, line in enumerate(loader_lines, start=1)
+        if scope_start <= index <= scope_end
         if re.search(r"if.*len\s*\(.*\)\s*==\s*0", line, re.IGNORECASE)
     ]
     len_zero_skip_matches = [
@@ -1167,9 +1193,9 @@ def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str
     ) or "无"
     facts.append(
         {
-            "item": "rgbtpedes.py 全文过滤/跳过逻辑",
+            "item": f"{class_name} 类内过滤/跳过逻辑",
             "source": (
-                f"{_source_label(loader_path, repo)}:1-{len(loader_lines)}；"
+                f"{_source_label(loader_path, repo)}:{scope_start}-{scope_end}；"
                 "正则 continue|filter|skip 及 if.*len(...)==0 下一条语句 continue/return"
             ),
             "line": None,
@@ -1179,7 +1205,20 @@ def _loader_static_audit(repo: Path, inferred_train_ids: int | None) -> dict[str
                 f"其下一条语句 continue/return 命中数={len(len_zero_skip_matches)}"
             ),
             "excerpt": skip_matches,
-            "status": "OK" if not skip_matches and not len_zero_skip_matches else "WARN",
+            "status": (
+                "OK"
+                if (
+                    dataset_name == "RGBNT201-PEDES"
+                    and skip_matches
+                    and not len_zero_skip_matches
+                )
+                or (
+                    dataset_name == "RGBT-PEDES"
+                    and not skip_matches
+                    and not len_zero_skip_matches
+                )
+                else "WARN"
+            ),
         }
     )
     num_classes = _first_source_match(
@@ -1263,22 +1302,19 @@ def _discover_loader_modules(repo: Path) -> list[dict[str, Any]]:
 def _loader_dynamic_probe(repo: Path, data_root: Path, dataset_name: str) -> dict[str, Any]:
     """best-effort 构造 Dataset 对象；不创建 DataLoader，也不访问任何样本。"""
 
-    source = f"import datasets.rgbtpedes.RGBTPEDES(root={data_root}, verbose=False)"
+    class_name = {
+        "RGBT-PEDES": "RGBTPEDES",
+        "RGBNT201-PEDES": "RGBNT201PEDES",
+    }[dataset_name]
+    constructor_root = (
+        data_root.parent
+        if data_root.name.casefold() == dataset_name.casefold()
+        else data_root
+    )
+    source = (
+        f"datasets.rgbtpedes.{class_name}(root={constructor_root}, verbose=False)"
+    )
     discovered_modules = _discover_loader_modules(repo)
-    if dataset_name != "RGBT-PEDES":
-        return {
-            "status": "UNKNOWN",
-            "source": "datasets/build.py::__factory（当前未注册 RGBNT201-PEDES）",
-            "train_length": None,
-            "test_gallery_length": None,
-            "test_query_length": None,
-            "train_unique_labels": None,
-            "test_unique_labels": None,
-            "train_labels_contiguous": None,
-            "test_labels_contiguous": None,
-            "note": "仅完成标注与磁盘静态探测；当前仓库没有 RGBNT201-PEDES Dataset 类可构造。",
-            "discovered_modules": discovered_modules,
-        }
     original_path = list(sys.path)
     original_no_bytecode = sys.dont_write_bytecode
     try:
@@ -1290,8 +1326,8 @@ def _loader_dynamic_probe(repo: Path, data_root: Path, dataset_name: str) -> dic
             module_path.relative_to(repo.resolve(strict=False))
         except ValueError as exc:
             raise ImportError(f"导入到了仓库外同名模块：{module_path}") from exc
-        dataset_class = getattr(module, "RGBTPEDES")
-        dataset = dataset_class(root=str(data_root), verbose=False)
+        dataset_class = getattr(module, class_name)
+        dataset = dataset_class(root=str(constructor_root), verbose=False)
         train_labels = sorted(getattr(dataset, "train_id_container", set()))
         test_labels = sorted(getattr(dataset, "test_id_container", set()))
         test_data = getattr(dataset, "test", {})
@@ -1305,7 +1341,15 @@ def _loader_dynamic_probe(repo: Path, data_root: Path, dataset_name: str) -> dic
             "test_unique_labels": len(test_labels),
             "train_labels_contiguous": train_labels == list(range(len(train_labels))),
             "test_labels_contiguous": test_labels == list(range(len(test_labels))),
-            "note": "仅构造 RGBTPEDES；未构造 DataLoader、未索引 dataset、未执行 forward。",
+            "filtered_empty_captions": getattr(
+                dataset, "filtered_empty_captions", None
+            ),
+            "effective_train_captions": getattr(
+                dataset, "effective_train_captions", len(getattr(dataset, "train", []))
+            ),
+            "note": (
+                f"仅构造 {class_name}；未构造 DataLoader、未索引 dataset、未执行 forward。"
+            ),
             "discovered_modules": discovered_modules,
         }
     except Exception as exc:
@@ -1319,6 +1363,8 @@ def _loader_dynamic_probe(repo: Path, data_root: Path, dataset_name: str) -> dic
             "test_unique_labels": None,
             "train_labels_contiguous": None,
             "test_labels_contiguous": None,
+            "filtered_empty_captions": None,
+            "effective_train_captions": None,
             "note": f"{type(exc).__name__}: {exc}",
             "discovered_modules": discovered_modules,
         }
@@ -1443,6 +1489,13 @@ def _baseline_measurements(stats: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     train = stats.get("splits", {}).get("train", {})
     test = stats.get("splits", {}).get("test", {})
+    train_captions = train.get("captions")
+    train_empty_captions = train.get("empty_captions")
+    effective_train_records = (
+        train_captions - train_empty_captions
+        if isinstance(train_captions, int) and isinstance(train_empty_captions, int)
+        else None
+    )
     return {
         "total_records": stats.get("total_records"),
         "total_identities": stats.get("train_test_identity_union_count"),
@@ -1457,6 +1510,7 @@ def _baseline_measurements(stats: Mapping[str, Any] | None) -> dict[str, Any]:
         "empty_captions": stats.get("total_empty_captions"),
         "train_empty_captions": train.get("empty_captions"),
         "test_empty_captions": test.get("empty_captions"),
+        "effective_train_records": effective_train_records,
     }
 
 
@@ -1742,8 +1796,11 @@ def _render_report(
     num_classes = static_loader["num_classes"]
     loader_rows.append(("ID 分类头 num_classes", f"{num_classes['expression']}；推断值={num_classes['inferred_value']}", num_classes["source"], num_classes["status"]))
     expansion = static_loader["training_expansion"]
-    train_captions = stats.get("splits", {}).get("train", {}).get("captions") if stats else None
-    loader_rows.append(("训练样本按 caption 展开", f"原文={expansion['text']}；推断展开样本数={train_captions}", expansion["source"], "OK" if expansion["line"] and train_captions is not None else "UNKNOWN"))
+    raw_train_captions = stats.get("splits", {}).get("train", {}).get("captions") if stats else None
+    train_samples = dynamic_loader.get("train_length")
+    if train_samples is None:
+        train_samples = raw_train_captions
+    loader_rows.append(("训练样本按 caption 展开", f"原文={expansion['text']}；推断展开样本数={train_samples}", expansion["source"], "OK" if expansion["line"] and train_samples is not None else "UNKNOWN"))
     dynamic_rows = [
         (
             "预先搜索的数据构建候选模块",
@@ -1759,8 +1816,15 @@ def _render_report(
         ("test 实际唯一 label 数", dynamic_loader["test_unique_labels"], dynamic_loader["source"], dynamic_loader["status"]),
         ("train label 连续", dynamic_loader["train_labels_contiguous"], dynamic_loader["source"], dynamic_loader["status"]),
         ("test label 连续", dynamic_loader["test_labels_contiguous"], dynamic_loader["source"], dynamic_loader["status"]),
-        ("内省说明", dynamic_loader["note"], dynamic_loader["source"], dynamic_loader["status"]),
     ]
+    if dataset_name == "RGBNT201-PEDES":
+        dynamic_rows.extend(
+            (
+                ("过滤空 caption 数", dynamic_loader["filtered_empty_captions"], dynamic_loader["source"], dynamic_loader["status"]),
+                ("过滤后有效训练 caption", dynamic_loader["effective_train_captions"], dynamic_loader["source"], dynamic_loader["status"]),
+            )
+        )
+    dynamic_rows.append(("内省说明", dynamic_loader["note"], dynamic_loader["source"], dynamic_loader["status"]))
     filter_rows = [
         (row["source"], row["text"], row["status"]) for row in static_loader["filter_candidates"]
     ] or [("datasets/", "未找到匹配行", "UNKNOWN")]
@@ -1953,7 +2017,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if stats
         else None
     )
-    static_loader = _loader_static_audit(repo, train_ids)
+    static_loader = _loader_static_audit(repo, train_ids, args.dataset_name)
     dynamic_loader = _loader_dynamic_probe(repo, data_root, args.dataset_name)
     mraf_parameters = _static_mraf_parameters(repo)
 

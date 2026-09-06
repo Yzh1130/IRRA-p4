@@ -174,3 +174,76 @@ class RGBTPEDES(BaseDataset):
             raise RuntimeError("'{}' is not available".format(self.t_dir))
         if not op.exists(self.anno_path):
             raise RuntimeError("'{}' is not available".format(self.anno_path))
+
+
+class RGBNT201PEDES(RGBTPEDES):
+    """RGBNT201-PEDES with dataset-specific annotation and caption filtering."""
+
+    dataset_dir = "RGBNT201-PEDES"
+    annotation_filenames = ("captionform0_8B.json",)
+
+    def __init__(self, root="", verbose=True, dev_split_file=None):
+        if dev_split_file not in (None, ""):
+            raise ValueError(
+                "RGBNT201-PEDES does not support --dev_split_file in Stage 5."
+            )
+
+        # Reuse the parent's directory, split, pairing, and pid-relabeling logic,
+        # while suppressing its RGBT-PEDES-specific log banner.
+        super().__init__(root=root, verbose=False, dev_split_file=None)
+
+        seen_annos = set()
+        unique_annos = []
+        for annos in (self.train_annos, self.test_annos, self.val_annos):
+            for anno in annos:
+                marker = id(anno)
+                if marker not in seen_annos:
+                    seen_annos.add(marker)
+                    unique_annos.append(anno)
+
+        self.filtered_empty_captions = sum(
+            1
+            for anno in unique_annos
+            for caption in anno["captions"]
+            if self._is_empty_caption(caption)
+        )
+        self.effective_train_captions = len(self.train)
+
+        if verbose:
+            self.logger.info("=> RGBNT201-PEDES Images and Captions are loaded")
+            self.show_dataset_info()
+            self.logger.info(
+                "[RGBNT201-PEDES] filtered_empty_captions=%d "
+                "effective_train_captions=%d",
+                self.filtered_empty_captions,
+                self.effective_train_captions,
+            )
+
+    @staticmethod
+    def _is_empty_caption(caption):
+        return isinstance(caption, str) and not caption.strip()
+
+    def _resolve_anno_path(self, data_dir: str) -> str:
+        for filename in self.annotation_filenames:
+            path = op.join(data_dir, filename)
+            if op.exists(path):
+                return path
+        # Return the sole supported path for a clear inherited validation error.
+        return op.join(data_dir, self.annotation_filenames[0])
+
+    def _process_anno(self, annos: List[dict], training=False):
+        filtered_annos = []
+        for anno in annos:
+            captions = [
+                caption
+                for caption in anno["captions"]
+                if not self._is_empty_caption(caption)
+            ]
+            if len(captions) == len(anno["captions"]):
+                filtered_annos.append(anno)
+            else:
+                filtered_anno = dict(anno)
+                filtered_anno["captions"] = captions
+                filtered_annos.append(filtered_anno)
+
+        return super()._process_anno(filtered_annos, training=training)
