@@ -214,7 +214,7 @@ if ((rc != 0)); then
     exit "$rc"
 fi
 
-GROUPS=(devA devT010 devT020 devT030 devT050)
+ARM_NAMES=(devA devT010 devT020 devT030 devT050)
 SEEDS=(1 2 3)
 SCENARIOS=(
     'clean|none|1.0|7|2026'
@@ -229,6 +229,29 @@ SCENARIOS=(
     'both_noise_005|both_noise|0.05|7|2026'
     'both_blur_k7|both_blur|1.0|7|2026'
 )
+
+# Bash array-name audit: the script-owned arrays are ARM_NAMES, SEEDS,
+# SCENARIOS, command, train_command, run_configs, and eval_command. None is a
+# Bash special variable. The shell-provided special arrays BASH_SOURCE and
+# PIPESTATUS are intentionally read but never assigned below.
+if ! (( ${#ARM_NAMES[@]} == 5 )); then
+    append_failed "GLOBAL" "-" "startup_assert" "2" \
+        "expected exactly 5 development arms, found ${#ARM_NAMES[@]}"
+    exit 2
+fi
+for ((arm_index = 0; arm_index < ${#ARM_NAMES[@]}; arm_index++)); do
+    arm_name="${ARM_NAMES[$arm_index]}"
+    if [[ ! "$arm_name" =~ ^dev(A|T0[0-9]+)$ ]]; then
+        append_failed "GLOBAL" "-" "startup_assert" "2" \
+            "invalid development arm name at index $arm_index: $arm_name"
+        exit 2
+    fi
+    if [[ ! -f "$CONFIG_DIR/${ARM_NAMES[$arm_index]}.yaml" ]]; then
+        append_failed "GLOBAL" "-" "startup_assert" "2" \
+            "missing development arm config: $CONFIG_DIR/${ARM_NAMES[$arm_index]}.yaml"
+        exit 2
+    fi
+done
 
 assert_val_eval_command() {
     local -a command=("$@")
@@ -526,7 +549,7 @@ run_one() {
     return 0
 }
 
-for group in "${GROUPS[@]}"; do
+for group in "${ARM_NAMES[@]}"; do
     first_seed_failed=0
     for seed in "${SEEDS[@]}"; do
         if ((first_seed_failed)); then
@@ -543,12 +566,12 @@ for group in "${GROUPS[@]}"; do
 done
 
 success_count=0
-for group in "${GROUPS[@]}"; do
+for group in "${ARM_NAMES[@]}"; do
     for seed in "${SEEDS[@]}"; do
         [[ -f "$MARKS_DIR/${group}_seed${seed}.done" ]] && success_count=$((success_count + 1))
     done
 done
-total_runs=$((${#GROUPS[@]} * ${#SEEDS[@]}))
+total_runs=$((${#ARM_NAMES[@]} * ${#SEEDS[@]}))
 failed_count=$((total_runs - success_count))
 total_elapsed="$(($(date +%s) - GLOBAL_START))"
 disk_gb="$(remaining_gb 2>/dev/null || printf 'unknown')"
