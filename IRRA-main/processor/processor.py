@@ -1071,6 +1071,63 @@ def _save_metric_checkpoint(
     return ckpt_path
 
 
+def _metric_best_checkpoint_enabled(args):
+    """Return whether test/validation-R1-selected artifacts may be written."""
+    return bool(getattr(args, "save_metric_best_ckpt", False))
+
+
+def _append_checkpoint_selection_row(args, path, row):
+    """Append checkpoint-selection metadata only when best saving is enabled."""
+    if not _metric_best_checkpoint_enabled(args):
+        return False
+    _append_tsv_row(path, CHECKPOINT_SELECTION_FIELDS, row)
+    return True
+
+
+def _save_best_checkpoint_artifacts(
+    checkpointer,
+    args,
+    epoch,
+    metric_r1,
+    eval_metrics,
+    arguments,
+    last_mraf_epoch_row,
+    checkpoint_selection_path,
+    logger,
+):
+    """Save all R1-selected artifacts behind one explicit protocol switch."""
+    if not _metric_best_checkpoint_enabled(args):
+        return False
+
+    checkpointer.save("best", **arguments)
+    if bool(getattr(args, "save_last_checkpoint", False)):
+        _append_checkpoint_selection_row(
+            args,
+            checkpoint_selection_path,
+            {
+                "checkpoint": "best.pth",
+                "epoch": int(epoch),
+                "clean_R1": metric_r1,
+                "alpha_std": last_mraf_epoch_row.get("alpha_rgb_std"),
+                "Pearson": last_mraf_epoch_row.get("alpha_target_pearson"),
+                "weighted_rel_base_ratio": last_mraf_epoch_row.get(
+                    "weighted_rel_base_ratio"
+                ),
+            },
+        )
+    _save_metric_checkpoint(
+        checkpointer=checkpointer,
+        args=args,
+        epoch=epoch,
+        r1=metric_r1,
+        metrics=eval_metrics,
+        arguments=arguments,
+        reason="best",
+        logger=logger,
+    )
+    return True
+
+
 def _safe_l2_normalize(feats, dim=1, eps=1e-12):
     norm = feats.norm(p=2, dim=dim, keepdim=True).clamp_min(eps)
     return feats / norm
@@ -6581,35 +6638,17 @@ def do_train(
             if best_top1 < top1:
                 best_top1 = top1
                 arguments["epoch"] = epoch
-                checkpointer.save("best", **arguments)
-                if bool(getattr(args, "save_last_checkpoint", False)):
-                    _append_tsv_row(
-                        checkpoint_selection_path,
-                        CHECKPOINT_SELECTION_FIELDS,
-                        {
-                            "checkpoint": "best.pth",
-                            "epoch": int(epoch),
-                            "clean_R1": metric_r1,
-                            "alpha_std": last_mraf_epoch_row.get("alpha_rgb_std"),
-                            "Pearson": last_mraf_epoch_row.get(
-                                "alpha_target_pearson"
-                            ),
-                            "weighted_rel_base_ratio": last_mraf_epoch_row.get(
-                                "weighted_rel_base_ratio"
-                            ),
-                        },
-                    )
-                if bool(getattr(args, "save_metric_best_ckpt", False)):
-                    _save_metric_checkpoint(
-                        checkpointer=checkpointer,
-                        args=args,
-                        epoch=epoch,
-                        r1=metric_r1,
-                        metrics=eval_metrics,
-                        arguments=arguments,
-                        reason="best",
-                        logger=logger,
-                    )
+                _save_best_checkpoint_artifacts(
+                    checkpointer=checkpointer,
+                    args=args,
+                    epoch=epoch,
+                    metric_r1=metric_r1,
+                    eval_metrics=eval_metrics,
+                    arguments=arguments,
+                    last_mraf_epoch_row=last_mraf_epoch_row,
+                    checkpoint_selection_path=checkpoint_selection_path,
+                    logger=logger,
+                )
                 if bool(getattr(args, "save_full_eval_state_ckpt", False)):
                     _save_full_eval_state_checkpoint(
                         model=model,
@@ -6639,9 +6678,9 @@ def do_train(
             num_epoch,
         )
         if last_checkpoint_path is not None:
-            _append_tsv_row(
+            _append_checkpoint_selection_row(
+                args,
                 checkpoint_selection_path,
-                CHECKPOINT_SELECTION_FIELDS,
                 {
                     "checkpoint": "last.pth",
                     "epoch": int(num_epoch),

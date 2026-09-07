@@ -326,11 +326,14 @@ def _temperature_summary(
         for seed in SEEDS
     }
     seed_values = [per_seed_raw[seed] for seed in SEEDS]
+    clean_values = [rows[(group, seed, "clean")].r1 for seed in SEEDS]
     return {
         "group": group,
         "per_seed": {seed: _round4(value) for seed, value in per_seed_raw.items()},
         "mean": _round4(_mean(seed_values, f"{group} seed means")),
         "std": _round4(_sample_std(seed_values, f"{group} seed means")),
+        "clean_mean": _round4(_mean(clean_values, f"{group} clean R1")),
+        "clean_std": _round4(_sample_std(clean_values, f"{group} clean R1")),
         "n_seeds": len(SEEDS),
         "n_degraded_scenarios_per_seed": len(DEGRADED_SCENARIOS),
     }
@@ -503,10 +506,12 @@ def _build_selection_markdown(
         "## MRAF target temperature",
         "",
         "Each seed value is its mean R1 over the ten degraded scenarios (clean excluded).",
-        "The summary is the mean ± sample standard deviation across three seeds.",
+        "The degraded and clean summaries are the mean ± sample standard deviation "
+        "across three seeds.",
         "",
-        "| T_r | role | seed 1 | seed 2 | seed 3 | mean ± SD | selected for E |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | --- |",
+        "| T_r | role | seed 1 | seed 2 | seed 3 | degraded R1 mean ± SD | "
+        "clean R1 mean ± SD | selected for E |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for temperature in TEMPERATURE_GROUPS:
         summary = summaries[temperature]
@@ -517,7 +522,8 @@ def _build_selection_markdown(
             f"| {_temperature_key(temperature)} | {role} | "
             f"{_format4(per_seed[1])} | {_format4(per_seed[2])} | "
             f"{_format4(per_seed[3])} | {_format4(summary['mean'])} ± "
-            f"{_format4(summary['std'])} | {selected} |"
+            f"{_format4(summary['std'])} | {_format4(summary['clean_mean'])} ± "
+            f"{_format4(summary['clean_std'])} | {selected} |"
         )
     lines.extend(
         [

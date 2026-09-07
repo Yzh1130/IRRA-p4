@@ -5,14 +5,14 @@ All results below use only the locked `val` split. R1 values are percentage poin
 ## MRAF target temperature
 
 Each seed value is its mean R1 over the ten degraded scenarios (clean excluded).
-The summary is the mean ± sample standard deviation across three seeds.
+The degraded and clean summaries are the mean ± sample standard deviation across three seeds.
 
-| T_r | role | seed 1 | seed 2 | seed 3 | mean ± SD | selected for E |
-| ---: | --- | ---: | ---: | ---: | ---: | --- |
-| 0.1 | reference | 61.6015 | 62.6773 | 60.6601 | 61.6463 ± 1.0093 | no |
-| 0.2 | candidate | 63.1296 | 62.0905 | 62.8362 | 62.6854 ± 0.5357 | yes |
-| 0.3 | candidate | 63.0807 | 62.7017 | 61.3692 | 62.3839 ± 0.8989 | no |
-| 0.5 | candidate | 63.3374 | 62.0782 | 61.7237 | 62.3798 ± 0.8481 | no |
+| T_r | role | seed 1 | seed 2 | seed 3 | degraded R1 mean ± SD | clean R1 mean ± SD | selected for E |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 0.1 | reference | 61.6015 | 62.6773 | 60.6601 | 61.6463 ± 1.0093 | 69.2339 ± 0.7369 | no |
+| 0.2 | candidate | 63.1296 | 62.0905 | 62.8362 | 62.6854 ± 0.5357 | 69.1524 ± 0.8321 | yes |
+| 0.3 | candidate | 63.0807 | 62.7017 | 61.3692 | 62.3839 ± 0.8989 | 68.5412 ± 1.1359 | no |
+| 0.5 | candidate | 63.3374 | 62.0782 | 61.7237 | 62.3798 ± 0.8481 | 67.9707 ± 1.5608 | no |
 
 Selection compares candidate means after `ROUND_HALF_UP` rounding to four decimal places. If the top-minus-second difference is strictly below 0.3000 percentage points, the smaller of those two temperatures is used.
 
