@@ -447,8 +447,7 @@ def build_dataloader(args, tranforms=None):
     logger = logging.getLogger("IRRA.dataset")
 
     num_workers = args.num_workers
-    # RGBT-PEDES supports a dev split. RGBNT201-PEDES receives the argument only
-    # so its constructor can reject a non-empty dev split explicitly.
+    # Both paired RGBT datasets support an identity-level development split.
     dataset_kwargs = {"root": args.root_dir}
     if args.dataset_name in ("RGBT-PEDES", "RGBNT201-PEDES"):
         dataset_kwargs["dev_split_file"] = (

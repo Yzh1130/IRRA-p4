@@ -183,14 +183,15 @@ class RGBNT201PEDES(RGBTPEDES):
     annotation_filenames = ("captionform0_8B.json",)
 
     def __init__(self, root="", verbose=True, dev_split_file=None):
-        if dev_split_file not in (None, ""):
-            raise ValueError(
-                "RGBNT201-PEDES does not support --dev_split_file in Stage 5."
-            )
-
         # Reuse the parent's directory, split, pairing, and pid-relabeling logic,
         # while suppressing its RGBT-PEDES-specific log banner.
-        super().__init__(root=root, verbose=False, dev_split_file=None)
+        # Normalize the CLI's empty-string default so the no-dev path remains
+        # byte-for-byte equivalent to the pre-dev2 behavior.
+        super().__init__(
+            root=root,
+            verbose=False,
+            dev_split_file=None if dev_split_file == "" else dev_split_file,
+        )
 
         seen_annos = set()
         unique_annos = []

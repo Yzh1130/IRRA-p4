@@ -541,7 +541,14 @@ def get_args():
     parser.add_argument("--sampler", default="random", help="choose sampler from [idtentity, random]")
     parser.add_argument("--num_instance", type=int, default=4)
     parser.add_argument("--root_dir", default="./data")
-    parser.add_argument("--dev_split_file", default="", help="optional RGBT-PEDES identity-level development split JSON")
+    parser.add_argument(
+        "--dev_split_file",
+        default="",
+        help=(
+            "optional identity-level development split JSON for RGBT-PEDES "
+            "or RGBNT201-PEDES"
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=8)

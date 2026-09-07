@@ -1,3 +1,5 @@
+import csv
+import hashlib
 import json
 import logging
 import os.path as op
@@ -8,6 +10,7 @@ import pytest
 
 from datasets.build import __factory, build_dataloader
 from datasets.rgbtpedes import RGBNT201PEDES, RGBTPEDES
+from tools.protocol import make_dev2_split, measure_precondition
 from tools.audit.probe_dataset import (
     _baseline_measurements,
     _loader_dynamic_probe,
@@ -71,6 +74,85 @@ def _write_dataset(root: Path, dataset_name: str, annotation_name: str):
     return data_dir
 
 
+def _write_official_scale_rgbnt_annotation(path: Path):
+    """Write the confirmed 4787-row schema without using the private dataset."""
+    rows = []
+    empty_caption_ids = {31, 82, 108}
+    for pid in range(1, 172):
+        record_count = 24 if pid <= 18 else 23
+        for image_index in range(record_count):
+            caption = f"train identity {pid} image {image_index}"
+            if pid in empty_caption_ids and image_index == 0:
+                caption = " \t "
+            rows.append(
+                {
+                    "split": "train",
+                    "captions": [caption],
+                    "file_path": f"RGBT/train_{pid:03d}_{image_index:02d}.jpg",
+                    "id": pid,
+                    "processed_tokens": [],
+                    "rgb_captions": [],
+                    "tir_captions": [],
+                }
+            )
+    for offset, pid in enumerate(range(172, 202), start=1):
+        record_count = 28 if offset <= 26 else 27
+        for image_index in range(record_count):
+            rows.append(
+                {
+                    "split": "test",
+                    "captions": [f"test identity {pid} image {image_index}"],
+                    "file_path": f"RGBT/test_{pid:03d}_{image_index:02d}.jpg",
+                    "id": pid,
+                    "processed_tokens": [],
+                    "rgb_captions": [],
+                    "tir_captions": [],
+                }
+            )
+    assert len(rows) == 4787
+    path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    return rows
+
+
+def _write_precondition_metrics(path: Path, *, group="A"):
+    scenario_r1 = {
+        "clean": (60, 60, 60),
+        "rgb_missing": (20, 21, 22),
+        "ir_missing": (40, 42, 44),
+        "rgb_noise_005": (57, 57, 57),
+        "rgb_noise_010": (54, 54, 54),
+        "ir_noise_005": (54, 54, 54),
+        "ir_noise_010": (48, 48, 48),
+        "rgb_blur_k7": (50, 50, 50),
+        "ir_blur_k7": (49, 49, 49),
+        "both_noise_005": (47, 47, 47),
+        "both_blur_k7": (46, 46, 46),
+    }
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(measure_precondition.METRICS_HEADER)
+        for seed_index, seed in enumerate(measure_precondition.SEEDS):
+            for scenario, spec in measure_precondition.SCENARIO_SPECS.items():
+                r1 = scenario_r1[scenario][seed_index]
+                writer.writerow(
+                    [
+                        group,
+                        seed,
+                        scenario,
+                        spec.mode,
+                        spec.strength,
+                        spec.kernel,
+                        spec.degradation_seed,
+                        "val",
+                        r1,
+                        min(r1 + 5, 100),
+                        min(r1 + 10, 100),
+                        r1 - 2,
+                        r1 - 3,
+                    ]
+                )
+
+
 def test_rgbnt_annotation_candidate_is_exclusive_and_missing_error_is_clear(tmp_path):
     data_dir = _write_dataset(tmp_path, "RGBNT201-PEDES", "Caption.json")
     (data_dir / "captionform0_merged.json").write_text("[]", encoding="utf-8")
@@ -78,6 +160,97 @@ def test_rgbnt_annotation_candidate_is_exclusive_and_missing_error_is_clear(tmp_
     assert RGBNT201PEDES.annotation_filenames == (RGBNT_ANNOTATION,)
     with pytest.raises(RuntimeError, match="captionform0_8B[.]json"):
         RGBNT201PEDES(root=str(tmp_path), verbose=False)
+
+
+def test_make_dev2_split_official_scale_invariants_and_reproducibility(tmp_path):
+    annotation_path = tmp_path / RGBNT_ANNOTATION
+    rows = _write_official_scale_rgbnt_annotation(annotation_path)
+    output_path = tmp_path / "rgbnt201_dev2_30.json"
+
+    first = make_dev2_split.make_dev2_split(
+        anno_path=annotation_path,
+        out_path=output_path,
+        n_dev=30,
+        seed=20260907,
+    )
+    first_md5 = hashlib.md5(output_path.read_bytes()).hexdigest()
+    second = make_dev2_split.make_dev2_split(
+        anno_path=annotation_path,
+        out_path=output_path,
+        n_dev=30,
+        seed=20260907,
+    )
+    second_md5 = hashlib.md5(output_path.read_bytes()).hexdigest()
+
+    test_ids = {
+        int(row["id"]) for row in rows if row["split"] == "test"
+    }
+    assert first == second
+    assert first_md5 == second_md5
+    assert first["anno_md5"] == hashlib.md5(annotation_path.read_bytes()).hexdigest()
+    assert first["n_dev"] == len(first["dev_ids"]) == 30
+    assert first["n_train_reduced"] == len(first["train_reduced_ids"]) == 141
+    assert first["n_dev"] + first["n_train_reduced"] == 171
+    assert set(first["dev_ids"]).isdisjoint(test_ids)
+    assert set(first["dev_ids"]).isdisjoint(first["train_reduced_ids"])
+    assert first["dev_records"] + first["train_reduced_records"] == 3951
+    assert (
+        first["dev_effective_captions"]
+        + first["train_reduced_effective_captions"]
+        == 3948
+    )
+    assert "141/30/30" in make_dev2_split.__doc__
+
+
+def test_make_dev2_split_rejects_any_train_test_identity_overlap(tmp_path):
+    annotation_path = tmp_path / RGBNT_ANNOTATION
+    rows = _write_official_scale_rgbnt_annotation(annotation_path)
+    first_test_row = next(row for row in rows if row["split"] == "test")
+    first_test_row["id"] = 1
+    annotation_path.write_text(
+        json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        make_dev2_split.SplitValidationError,
+        match="train/test identity sets overlap",
+    ):
+        make_dev2_split.make_dev2_split(
+            anno_path=annotation_path,
+            out_path=tmp_path / "should_not_exist.json",
+            n_dev=30,
+            seed=20260907,
+        )
+
+
+def test_measure_precondition_validates_locked_grid_and_writes_auditable_report(
+    tmp_path,
+):
+    metrics_path = tmp_path / "metrics.tsv"
+    output_path = tmp_path / "EXTERNAL_PRECONDITION.md"
+    _write_precondition_metrics(metrics_path)
+
+    assert measure_precondition.main(
+        ["--metrics", str(metrics_path), "--out", str(output_path)]
+    ) == 0
+
+    report_bytes = output_path.read_bytes()
+    report = report_bytes.decode("utf-8")
+    expected_md5 = hashlib.md5(metrics_path.read_bytes()).hexdigest()
+    assert b"\r" not in report_bytes
+    assert "Measured utility ratio `û_rgb / û_ir`: 2.0000" in report
+    assert "Sensitivity and utility orderings are opposite: **yes**" in report
+    assert "| RGBT-PEDES | test | 3.80 |" in report
+    assert "| RGBT-PEDES | development | 2.68 |" in report
+    assert f"Metrics MD5: `{expected_md5}`" in report
+
+    invalid_path = tmp_path / "wrong_group.tsv"
+    _write_precondition_metrics(invalid_path, group="D")
+    with pytest.raises(
+        measure_precondition.PreconditionValidationError,
+        match="group must be 'A'",
+    ):
+        measure_precondition.load_precondition_metrics(invalid_path)
 
 
 def test_rgbnt_filters_empty_captions_and_preserves_parent_shapes(tmp_path, caplog):
@@ -140,23 +313,57 @@ def test_rgbnt_keeps_gallery_record_when_all_of_its_captions_are_empty(tmp_path)
     assert dataset.test["captions"] == ["test twenty", "test forty"]
 
 
-def test_rgbnt_rejects_dev_split_in_direct_and_factory_paths(tmp_path):
+def test_rgbnt_supports_dev_split_and_preserves_test_in_direct_and_factory_paths(
+    tmp_path,
+):
     _write_dataset(tmp_path, "RGBNT201-PEDES", RGBNT_ANNOTATION)
-    message = "RGBNT201-PEDES does not support --dev_split_file in Stage 5"
+    split_path = tmp_path / "rgbnt_dev.json"
+    split_path.write_text(
+        json.dumps({"dev_ids": [10], "n_dev": 1}), encoding="utf-8"
+    )
 
-    with pytest.raises(ValueError, match=message):
-        RGBNT201PEDES(
-            root=str(tmp_path), verbose=False, dev_split_file="splits/dev.json"
-        )
+    baseline = RGBNT201PEDES(root=str(tmp_path), verbose=False)
+    empty_string_baseline = RGBNT201PEDES(
+        root=str(tmp_path), verbose=False, dev_split_file=""
+    )
+    with_dev = RGBNT201PEDES(
+        root=str(tmp_path),
+        verbose=False,
+        dev_split_file=str(split_path),
+    )
+
+    assert baseline.val_annos is baseline.test_annos
+    assert empty_string_baseline.train == baseline.train
+    assert empty_string_baseline.test == baseline.test
+    assert empty_string_baseline.val == baseline.val
+    assert empty_string_baseline.val_annos is empty_string_baseline.test_annos
+
+    assert with_dev.val_annos is not with_dev.test_annos
+    assert {int(row["id"]) for row in with_dev.val_annos} == {10}
+    assert {int(row["id"]) for row in with_dev.train_annos} == {30}
+    assert with_dev.test_annos == baseline.test_annos
+    assert with_dev.test == baseline.test
+    assert with_dev.val["captions"] == ["train ten"]
+    assert [row[-1] for row in with_dev.train] == ["train thirty"]
+    assert all(len(row) == 5 for row in with_dev.train)
 
     args = SimpleNamespace(
         dataset_name="RGBNT201-PEDES",
         root_dir=str(tmp_path),
-        dev_split_file="splits/dev.json",
+        dev_split_file=str(split_path),
         num_workers=0,
+        training=False,
+        img_size=(32, 16),
+        img_aug=False,
+        test_batch_size=2,
+        text_length=77,
+        eval_dataset="val",
     )
-    with pytest.raises(ValueError, match=message):
-        build_dataloader(args)
+    val_img_loader, val_txt_loader, _ = build_dataloader(args)
+    assert len(val_img_loader.dataset) == 1
+    assert len(val_txt_loader.dataset) == 1
+    assert val_img_loader.dataset.img_paths_rgb == with_dev.val["img_paths"]
+    assert val_txt_loader.dataset.captions == ["train ten"]
 
 
 def test_rgbnt_is_registered_and_dynamic_audit_uses_loader(tmp_path):
@@ -207,6 +414,7 @@ def test_static_audit_scopes_filter_detection_to_the_selected_class():
 def test_rgbtpedes_regression_preserves_empty_captions_and_exact_outputs(tmp_path):
     _write_dataset(tmp_path, "RGBT-PEDES", "Caption.json")
 
+    assert __factory["RGBT-PEDES"] is RGBTPEDES
     dataset = RGBTPEDES(root=str(tmp_path), verbose=False)
     rgb_dir = op.join(str(tmp_path), "RGBT-PEDES", "RGB")
     thermal_dir = op.join(str(tmp_path), "RGBT-PEDES", "T")

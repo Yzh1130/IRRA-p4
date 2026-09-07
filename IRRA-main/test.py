@@ -6,7 +6,7 @@ import os.path as op
 import torch
 
 from datasets import build_dataloader
-from datasets.rgbtpedes import RGBTPEDES
+from datasets.build import __factory as DATASET_FACTORY
 from model import build_model
 from processor.processor import (
     apply_img_local_filter_stage,
@@ -965,10 +965,11 @@ if __name__ == "__main__":
                 "--eval_split val requires --dev_split_file on the command line; "
                 "a path stored only in configs.yaml is not accepted."
             )
-        if str(getattr(args, "dataset_name", "")) != "RGBT-PEDES":
+        dataset_name = str(getattr(args, "dataset_name", ""))
+        if dataset_name not in ("RGBT-PEDES", "RGBNT201-PEDES"):
             raise ValueError(
                 "--eval_split val with --dev_split_file is currently restricted "
-                "to dataset_name='RGBT-PEDES'."
+                "to dataset_name='RGBT-PEDES' or 'RGBNT201-PEDES'."
             )
         dev_split_file = str(args.dev_split_file)
         if not op.isfile(dev_split_file):
@@ -998,14 +999,14 @@ if __name__ == "__main__":
                 f"n_dev={expected_dev_ids}, len(dev_ids)={len(dev_ids)}."
             )
 
-        dev_dataset = RGBTPEDES(
+        dev_dataset = DATASET_FACTORY[dataset_name](
             root=args.root_dir,
             verbose=False,
             dev_split_file=dev_split_file,
         )
         if dev_dataset.val_annos is dev_dataset.test_annos:
             raise RuntimeError(
-                "Unsafe val split: RGBTPEDES.val_annos aliases test_annos."
+                f"Unsafe val split: {dataset_name}.val_annos aliases test_annos."
             )
         val_unique_pids = {
             int(anno["id"]) for anno in dev_dataset.val_annos
