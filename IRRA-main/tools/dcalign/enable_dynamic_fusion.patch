@@ -1,0 +1,15 @@
+diff --git a/model/build.py b/model/build.py
+--- a/model/build.py
++++ b/model/build.py
+@@ -108,2 +108,4 @@ class DCAlign(nn.Module):
+     def fuse(self, rgb, t):   # Stage I Fuse
++       if getattr(self.args, 'dcalign_dynamic_fusion', False):
++           return self._modules['fuse'](rgb, t)
+        fuser_image_feats = rgb + t # 
+diff --git a/utils/options.py b/utils/options.py
+--- a/utils/options.py
++++ b/utils/options.py
+@@ -19,2 +19,3 @@ def get_args():
+     parser.add_argument("--temperature", type=float, default=0.02, help="initial temperature value, if 0, don't use temperature")
++    parser.add_argument("--dcalign_dynamic_fusion", default=False, action="store_true", help="use the registered FusionModule instead of Stage I additive fusion")
+     parser.add_argument("--img_aug", default=True, action='store_true')
