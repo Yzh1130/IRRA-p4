@@ -1,0 +1,26 @@
+{
+  "E": {
+    "mraf_target_temperature": 0.2
+  },
+  "U": {
+    "mraf_utility_prior": [
+      0.7013639232690249,
+      0.29863607673097503
+    ]
+  },
+  "selection_evidence": {
+    "dataset": "RGBNT201-PEDES",
+    "temperature_source": "transferred from RGBT-PEDES development split (not re-selected)",
+    "temperature_rationale": "T_r is a frozen design choice; external validation asks whether the same setting reproduces the conclusion, not whether re-tuning helps.",
+    "utility_source": "re-estimated on RGBNT201-PEDES dev2 (30 identities, config A, seeds 1/2/3)",
+    "utility_raw": {
+      "u_rgb_ir_missing_R1": 51.114,
+      "u_ir_rgb_missing_R1": 21.764,
+      "ratio": 2.3485572505054217
+    },
+    "dev2_split": "splits/rgbnt201_dev2_30.json",
+    "phase1_metrics_md5": "51a7c4a91c6efa46052f3fcbd6eecbc4",
+    "n_seeds": 3,
+    "frozen_at": "2026-09-10T09:17:22+08:00"
+  }
+}
