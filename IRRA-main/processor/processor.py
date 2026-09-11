@@ -36,6 +36,7 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.mdrc import (
     ALLOWED_DEGRADE_MODES,
+    DEFAULT_DEGRADE_MODES,
     degrade_rgbt_batch,
     mdrc_feature_consistency,
 )
@@ -5051,7 +5052,7 @@ def _apply_degrade_aug_to_batch(args, batch):
     ir_imgs = batch.get("thermal_images", None)
 
     if mode == "mdrc_style":
-        chosen = random.choice(list(ALLOWED_DEGRADE_MODES))
+        chosen = random.choice(list(DEFAULT_DEGRADE_MODES))
         applied_name = chosen
     elif mode == "moddrop":
         chosen = random.choice(["rgb_drop", "ir_drop"])

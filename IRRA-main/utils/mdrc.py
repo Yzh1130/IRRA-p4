@@ -1,8 +1,10 @@
 import torch
 import torch.nn.functional as F
 
+from utils.blur_ops import blur_tensor
 
-ALLOWED_DEGRADE_MODES = (
+
+DEFAULT_DEGRADE_MODES = (
     "rgb_drop",
     "ir_drop",
     "rgb_noise",
@@ -10,11 +12,15 @@ ALLOWED_DEGRADE_MODES = (
     "rgb_attenuate",
     "ir_attenuate",
 )
+ALLOWED_DEGRADE_MODES = DEFAULT_DEGRADE_MODES + (
+    "rgb_blur",
+    "ir_blur",
+)
 
 
 def _normalize_modes(modes):
     if modes is None:
-        return list(ALLOWED_DEGRADE_MODES)
+        return list(DEFAULT_DEGRADE_MODES)
     if isinstance(modes, str):
         modes = [item.strip() for item in modes.split(",")]
     normalized = []
@@ -63,11 +69,24 @@ def _apply_attenuate(target, sample_mask, min_factor=0.2, max_factor=0.6):
     return (target * (1.0 - mask + mask * factor)).to(dtype=target.dtype)
 
 
+def _apply_blur(target, sample_mask, kernel_size=7):
+    mask = _batch_mask(sample_mask, target)
+    work = target if target.is_floating_point() else target.float()
+    work_mask = mask if target.is_floating_point() else mask.float()
+    blurred = blur_tensor(work, kernel_size)
+    mixed = (work * (1.0 - work_mask) + blurred * work_mask).to(
+        dtype=target.dtype
+    )
+    return torch.where(mask.bool(), mixed, target)
+
+
 def _apply_mode(target, sample_mask, mode):
     if mode.endswith("_drop"):
         return _apply_drop(target, sample_mask)
     if mode.endswith("_noise"):
         return _apply_noise(target, sample_mask)
+    if mode.endswith("_blur"):
+        return _apply_blur(target, sample_mask)
     if mode.endswith("_attenuate"):
         return _apply_attenuate(target, sample_mask)
     raise ValueError(f"Unsupported MDRC degrade mode: {mode}.")

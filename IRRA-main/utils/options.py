@@ -2,6 +2,7 @@ import argparse
 import math
 
 from utils.config import load_config_mapping
+from utils.mdrc import ALLOWED_DEGRADE_MODES, DEFAULT_DEGRADE_MODES
 
 
 MRAF_PRECISION_FUSION_ERROR = (
@@ -121,14 +122,6 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
-    mdrc_degrade_modes = (
-        "rgb_drop",
-        "ir_drop",
-        "rgb_noise",
-        "ir_noise",
-        "rgb_attenuate",
-        "ir_attenuate",
-    )
     mdrc_group = parser.add_argument_group("MDRC")
     mdrc_group.add_argument("--mdrc_enable", default=False, action='store_true', help="enable MDRC clean-degraded consistency training")
     mdrc_group.add_argument("--mdrc_lambda", type=float, default=0.05, help="maximum MDRC consistency loss weight")
@@ -136,7 +129,7 @@ def get_args():
     mdrc_group.add_argument("--mdrc_prob", type=float, default=0.5, help="per-sample probability of applying one MDRC degradation")
     mdrc_group.add_argument("--mdrc_warmup_epoch", type=int, default=3, help="1-based epoch at which MDRC starts; weight then linearly ramps")
     mdrc_group.add_argument("--mdrc_temp", type=float, default=0.07, help="temperature for MDRC image-text similarity distribution consistency")
-    mdrc_group.add_argument("--mdrc_degrade_modes", type=str, nargs='+', default=list(mdrc_degrade_modes), help="MDRC degradation modes; supports space or comma separated values")
+    mdrc_group.add_argument("--mdrc_degrade_modes", type=str, nargs='+', default=list(DEFAULT_DEGRADE_MODES), help="MDRC degradation modes; supports space or comma separated values")
     mraf_group = parser.add_argument_group("MRAF")
     mraf_group.add_argument("--mraf_enabled", default=False, action='store_true', help="enable modality reliability-adaptive RGB-T fusion")
     mraf_group.add_argument("--mraf_hidden_dim", type=int, default=128, help="hidden dimension of the shared MRAF reliability scorer")
@@ -588,12 +581,12 @@ def get_args():
             if mode:
                 normalized_mdrc_modes.append(mode)
     invalid_mdrc_modes = [
-        mode for mode in normalized_mdrc_modes if mode not in mdrc_degrade_modes
+        mode for mode in normalized_mdrc_modes if mode not in ALLOWED_DEGRADE_MODES
     ]
     if invalid_mdrc_modes:
         parser.error(
             "--mdrc_degrade_modes contains unsupported mode(s): "
-            f"{invalid_mdrc_modes}. Expected one of {list(mdrc_degrade_modes)}."
+            f"{invalid_mdrc_modes}. Expected one of {list(ALLOWED_DEGRADE_MODES)}."
         )
     if not normalized_mdrc_modes:
         parser.error("--mdrc_degrade_modes must include at least one mode.")

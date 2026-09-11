@@ -28,6 +28,7 @@ from utils.config import (  # noqa: E402
 ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
 E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
 DEV_ARM_NAMES = ("devA", "devT010", "devT020", "devT030", "devT050")
+SUPPLEMENTARY_ARM_NAMES = ("Dblur",)
 DEV_SPLIT_FILE = "splits/dev_190.json"
 DEV_REQUIRED_INHERITED_FIELDS = (
     "MLM",
@@ -378,6 +379,25 @@ def arm_overrides(
     }
 
 
+def supplementary_arm_overrides(
+    e_temperature: float,
+    utility_prior: list[float],
+) -> dict[str, dict[str, Any]]:
+    return {
+        "Dblur": dict(
+            arm_overrides(e_temperature, utility_prior)["D"],
+            mdrc_degrade_modes=[
+                "rgb_drop",
+                "ir_drop",
+                "rgb_blur",
+                "ir_blur",
+                "rgb_attenuate",
+                "ir_attenuate",
+            ],
+        )
+    }
+
+
 def build_configs(
     base_config: Mapping[str, Any],
     e_temperature: float,
@@ -396,6 +416,32 @@ def build_configs(
         config.update(per_arm[arm])
         configs[arm] = config
     validate_configs(configs, e_temperature, utility_prior)
+    return configs
+
+
+def generate_supplementary_configs(
+    base_config: Mapping[str, Any],
+    e_temperature: float,
+    utility_prior: list[float],
+) -> dict[str, dict[str, Any]]:
+    per_arm = supplementary_arm_overrides(e_temperature, utility_prior)
+    configs: dict[str, dict[str, Any]] = {}
+    for arm in SUPPLEMENTARY_ARM_NAMES:
+        config = dict(base_config)
+        config.update(FORMAL_COMMON_OVERRIDES)
+        config.update(
+            GATE_ENABLED_OVERRIDES
+            if bool(per_arm[arm]["mraf_enabled"])
+            else GATE_DISABLED_OVERRIDES
+        )
+        config.update(per_arm[arm])
+        configs[arm] = config
+    validate_supplementary_configs(
+        configs,
+        base_config,
+        e_temperature,
+        utility_prior,
+    )
     return configs
 
 
@@ -564,6 +610,50 @@ def validate_configs(
                 )
 
 
+def validate_supplementary_configs(
+    configs: Mapping[str, Mapping[str, Any]],
+    base_config: Mapping[str, Any],
+    e_temperature: float,
+    utility_prior: list[float],
+) -> None:
+    if tuple(configs) != SUPPLEMENTARY_ARM_NAMES:
+        raise ProtocolConfigError(
+            "Generated supplementary arm order must be "
+            f"{list(SUPPLEMENTARY_ARM_NAMES)}, got {list(configs)}."
+        )
+
+    expected_modes = [
+        "rgb_drop",
+        "ir_drop",
+        "rgb_blur",
+        "ir_blur",
+        "rgb_attenuate",
+        "ir_attenuate",
+    ]
+    dblur_config = dict(configs["Dblur"])
+    if dblur_config.get("mdrc_degrade_modes") != expected_modes:
+        raise ProtocolConfigError(
+            "Dblur.mdrc_degrade_modes must be "
+            f"{expected_modes!r}, got {dblur_config.get('mdrc_degrade_modes')!r}."
+        )
+
+    expected_d_config = dict(
+        build_configs(base_config, e_temperature, utility_prior)["D"]
+    )
+    dblur_config.pop("mdrc_degrade_modes")
+    expected_d_config.pop("mdrc_degrade_modes", None)
+    if dblur_config != expected_d_config:
+        differing_keys = sorted(
+            key
+            for key in dblur_config.keys() | expected_d_config.keys()
+            if dblur_config.get(key) != expected_d_config.get(key)
+        )
+        raise ProtocolConfigError(
+            "Dblur must equal formal D except for mdrc_degrade_modes; "
+            f"differing keys: {differing_keys}."
+        )
+
+
 def serialize_configs(
     configs: Mapping[str, Mapping[str, Any]],
     config_names: Sequence[str] = ARM_NAMES,
@@ -646,6 +736,30 @@ def print_validation_table(configs: Mapping[str, Mapping[str, Any]]) -> None:
         )
 
 
+def print_supplementary_validation_table(
+    configs: Mapping[str, Mapping[str, Any]],
+) -> None:
+    print(
+        "| arm | mdrc | mraf | rel_lambda | T_r | equalize | freeze | "
+        "utility_prior | scorer_lr_multiplier | gate_logit_scale | gate_fp32 |"
+    )
+    print(
+        "| --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | --- |"
+    )
+    for arm in SUPPLEMENTARY_ARM_NAMES:
+        config = configs[arm]
+        utility = config["mraf_utility_prior"]
+        utility_text = "None" if utility is None else json.dumps(utility)
+        print(
+            f"| {arm} | {config['mdrc_enable']} | {config['mraf_enabled']} | "
+            f"{config['mraf_rel_lambda']} | {config['mraf_target_temperature']} | "
+            f"{config['mraf_equalize_modality_norm']} | "
+            f"{config['mraf_freeze_gate']} | {utility_text} | "
+            f"{config['mraf_scorer_lr_multiplier']} | "
+            f"{config['mraf_gate_logit_scale']} | {config['mraf_gate_fp32']} |"
+        )
+
+
 def _table_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -706,6 +820,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--supplementary",
+        default=False,
+        action="store_true",
+        help="generate only the supplementary Dblur configuration",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         required=True,
@@ -717,6 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.dev_grid and args.supplementary:
+        parser.error("--dev-grid and --supplementary cannot be used together")
     try:
         base_config = load_base_config(args.base_config)
         if args.dev_grid:
@@ -725,6 +847,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_configs(args.out_dir, serialized, DEV_ARM_NAMES)
             read_back = read_back_configs(args.out_dir, DEV_ARM_NAMES)
             validate_dev_configs(read_back, base_config)
+        elif args.supplementary:
+            e_temperature, utility_prior = load_frozen_hparams(args.frozen_hparams)
+            configs = generate_supplementary_configs(
+                base_config,
+                e_temperature,
+                utility_prior,
+            )
+            serialized = serialize_configs(configs, SUPPLEMENTARY_ARM_NAMES)
+            write_configs(args.out_dir, serialized, SUPPLEMENTARY_ARM_NAMES)
+            read_back = read_back_configs(args.out_dir, SUPPLEMENTARY_ARM_NAMES)
+            validate_supplementary_configs(
+                read_back,
+                base_config,
+                e_temperature,
+                utility_prior,
+            )
         else:
             e_temperature, utility_prior = load_frozen_hparams(args.frozen_hparams)
             configs = build_configs(base_config, e_temperature, utility_prior)
@@ -736,6 +874,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.exit(2, f"error: {exc}\n")
     if args.dev_grid:
         print_dev_validation_table(read_back, base_config)
+    elif args.supplementary:
+        print_supplementary_validation_table(read_back)
     else:
         print_validation_table(read_back)
     return 0
