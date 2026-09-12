@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the frozen Dblur supplementary control on the complete RGBT-PEDES train set.
+# Run a frozen supplementary control on the complete RGBT-PEDES train set.
 #
 # Checkpoint protocol: every evaluation uses last.pth. 本文声明“统一采用训练结束时的
 # 最终 checkpoint，不依据测试指标在多个 checkpoint 之间选择”。
@@ -19,15 +19,18 @@ AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-1}"
 MIN_FREE_GB="${MIN_FREE_GB:-25}"
 ARMS_SPEC=""
 ARMS_SPEC_SET=0
+OUT_SPEC_SET=0
 SEEDS_SPEC="101-110"
 VALIDATE_ONLY=0
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --base-config PATH [--arms Dblur] [--seeds 101-105] [--out PATH]" \
+        "Usage: $0 --base-config PATH [--arms Dblur|DnoNoise] [--seeds 101-105] [--out PATH]" \
         "          [--frozen-hparams PATH] [--python PATH] [--validate-only]" \
         "" \
-        "The only canonical arm is Dblur; --seeds defaults to 101-110." \
+        "Select exactly one of Dblur or DnoNoise; the default is Dblur." \
+        "DnoNoise requires an explicit --out outside the default DBLUR_GRID tree." \
+        "--seeds defaults to 101-110." \
         "--validate-only generates and validates configs, prints the run plan," \
         "and exits without training, evaluation, mechanism diagnostics, or shutdown." \
         "" \
@@ -56,6 +59,7 @@ while (($#)); do
         --out)
             (($# >= 2)) || { printf 'error: --out requires a value\n' >&2; exit 2; }
             OUT="$2"
+            OUT_SPEC_SET=1
             shift 2
             ;;
         --frozen-hparams)
@@ -84,6 +88,10 @@ while (($#)); do
     esac
 done
 
+if [[ "$ARMS_SPEC" == "DnoNoise" && "$OUT_SPEC_SET" != "1" ]]; then
+    printf 'error: --arms DnoNoise requires an explicit independent --out\n' >&2
+    exit 2
+fi
 if [[ -z "$OUT" ]]; then
     printf 'error: --out/OUT must not be empty\n' >&2
     exit 2
@@ -95,14 +103,21 @@ if [[ -n "$BASE_CONFIG" ]]; then
     BASE_CONFIG="$(realpath -m "$BASE_CONFIG")"
 fi
 
+DEFAULT_DBLUR_GRID="$(realpath -m "/root/autodl-tmp/DBLUR_GRID")"
+if [[ "$ARMS_SPEC" == "DnoNoise" \
+    && ("$OUT" == "$DEFAULT_DBLUR_GRID" || "$OUT" == "$DEFAULT_DBLUR_GRID/"*) ]]; then
+    printf 'error: DnoNoise --out must be independent of DBLUR_GRID: %s\n' "$OUT" >&2
+    exit 2
+fi
+
 PROTECTED_MAIN_GRID="$(realpath -m "/root/autodl-tmp/MAIN_GRID")"
 if [[ "$OUT" == "$PROTECTED_MAIN_GRID" || "$OUT" == "$PROTECTED_MAIN_GRID/"* ]]; then
-    printf 'error: Dblur runner refuses to write into MAIN_GRID: %s\n' "$OUT" >&2
+    printf 'error: supplementary runner refuses to write into MAIN_GRID: %s\n' "$OUT" >&2
     exit 2
 fi
 
 if ! mkdir -p "$OUT"/{configs,runs,sim,mech,marks,logs}; then
-    printf 'error: could not create Dblur output directories under %s\n' "$OUT" >&2
+    printf 'error: could not create supplementary output directories under %s\n' "$OUT" >&2
     exit 2
 fi
 CONFIG_DIR="$OUT/configs"
@@ -186,7 +201,7 @@ trap on_signal INT TERM
 
 GLOBAL_START="$(date +%s)"
 
-ALL_ARM_NAMES=(Dblur)
+ALL_ARM_NAMES=(Dblur DnoNoise)
 ARM_NAMES=()
 REQUESTED_ARM_NAMES=()
 SEEDS=()
@@ -264,9 +279,9 @@ if ((ARMS_SPEC_SET)); then
         append_failed "GLOBAL" "-" "arms_assert" "2" "--arms must not be empty"
         exit 2
     fi
-    if [[ ! "$ARMS_SPEC" =~ ^Dblur$ ]]; then
+    if [[ ! "$ARMS_SPEC" =~ ^(Dblur|DnoNoise)$ ]]; then
         append_failed "GLOBAL" "-" "arms_assert" "2" \
-            "--arms only accepts Dblur: $ARMS_SPEC"
+            "--arms accepts exactly one of Dblur or DnoNoise: $ARMS_SPEC"
         exit 2
     fi
     IFS=',' read -r -a REQUESTED_ARM_NAMES <<< "$ARMS_SPEC"
@@ -275,9 +290,9 @@ if ((ARMS_SPEC_SET)); then
         exit 2
     fi
     for requested_arm in "${REQUESTED_ARM_NAMES[@]}"; do
-        if [[ ! "$requested_arm" =~ ^Dblur$ ]]; then
+        if [[ ! "$requested_arm" =~ ^(Dblur|DnoNoise)$ ]]; then
             append_failed "GLOBAL" "-" "arms_assert" "2" \
-                "invalid Dblur arm: $requested_arm"
+                "invalid supplementary arm: $requested_arm"
             exit 2
         fi
         duplicate_count=0
@@ -287,7 +302,7 @@ if ((ARMS_SPEC_SET)); then
         done
         if ((duplicate_count != 1)); then
             append_failed "GLOBAL" "-" "arms_assert" "2" \
-                "duplicate Dblur arm: $requested_arm"
+                "duplicate supplementary arm: $requested_arm"
             exit 2
         fi
     done
@@ -300,12 +315,12 @@ if ((ARMS_SPEC_SET)); then
         done
     done
 else
-    ARM_NAMES=("${ALL_ARM_NAMES[@]}")
+    ARM_NAMES=(Dblur)
 fi
 
-if ((${#ALL_ARM_NAMES[@]} != 1 || ${#ARM_NAMES[@]} != 1)); then
+if ((${#ALL_ARM_NAMES[@]} != 2 || ${#ARM_NAMES[@]} != 1)); then
     append_failed "GLOBAL" "-" "arms_assert" "2" \
-        "expected the single canonical Dblur arm"
+        "expected two canonical supplementary arms and exactly one selected arm"
     exit 2
 fi
 if ((${#SEEDS[@]} < 1 || ${#SEEDS[@]} > 10)); then
@@ -321,7 +336,7 @@ fi
 
 ARMS_CSV="$(IFS=,; printf '%s' "${ARM_NAMES[*]}")"
 SEEDS_CSV="$(IFS=,; printf '%s' "${SEEDS[*]}")"
-log "[ARMS] selected=$ARMS_CSV canonical_order=Dblur"
+log "[ARMS] selected=$ARMS_CSV canonical_order=Dblur,DnoNoise"
 log "[SEEDS] specification=$SEEDS_SPEC selected=$SEEDS_CSV"
 
 if [[ ! "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || ((MIN_FREE_GB < 1)); then
@@ -402,7 +417,7 @@ if ((rc != 0)); then
     exit "$rc"
 fi
 
-log "Generating the Dblur supplementary config from $BASE_CONFIG"
+log "Generating the Dblur/DnoNoise supplementary configs from $BASE_CONFIG"
 "$PYTHON_BIN" -m tools.protocol.gen_configs \
     --base-config "$BASE_CONFIG" \
     --frozen-hparams "$FROZEN_HPARAMS" \
@@ -411,7 +426,7 @@ log "Generating the Dblur supplementary config from $BASE_CONFIG"
 rc=$?
 if ((rc != 0)); then
     append_failed "GLOBAL" "-" "config_generation" "$rc" \
-        "Dblur supplementary config generation failed"
+        "Dblur/DnoNoise supplementary config generation failed"
     exit "$rc"
 fi
 
@@ -422,20 +437,28 @@ from pathlib import Path
 from utils.config import load_config_mapping
 
 config_dir = Path(sys.argv[1])
-expected_arms = ("Dblur",)
-mraf_arms = {"Dblur"}
-expected_modes = [
-    "rgb_drop",
-    "ir_drop",
-    "rgb_blur",
-    "ir_blur",
-    "rgb_attenuate",
-    "ir_attenuate",
-]
+expected_arms = ("Dblur", "DnoNoise")
+mraf_arms = {"Dblur", "DnoNoise"}
+expected_modes_by_arm = {
+    "Dblur": [
+        "rgb_drop",
+        "ir_drop",
+        "rgb_blur",
+        "ir_blur",
+        "rgb_attenuate",
+        "ir_attenuate",
+    ],
+    "DnoNoise": [
+        "rgb_drop",
+        "ir_drop",
+        "rgb_attenuate",
+        "ir_attenuate",
+    ],
+}
 for arm in expected_arms:
     path = config_dir / f"{arm}.yaml"
     if not path.is_file():
-        raise SystemExit(f"missing generated Dblur config: {path}")
+        raise SystemExit(f"missing generated supplementary config: {path}")
     config = load_config_mapping(path)
     dev_split_file = config.get("dev_split_file", "")
     if dev_split_file is not None and str(dev_split_file).strip():
@@ -479,33 +502,34 @@ for arm in expected_arms:
             f"{arm}.mraf_enabled must be {expected_mraf!r}, "
             f"got {config.get('mraf_enabled')!r}"
         )
+    expected_modes = expected_modes_by_arm[arm]
     modes = config.get("mdrc_degrade_modes")
     if not isinstance(modes, (list, tuple)) or list(modes) != expected_modes:
         raise SystemExit(
             f"{arm}.mdrc_degrade_modes must be {expected_modes!r}, got {modes!r}"
         )
 print(
-    "[CONFIG_ASSERT] Dblur supplementary config is present; full-train/test "
+    "[CONFIG_ASSERT] Dblur/DnoNoise supplementary configs are present; full-train/test "
     "split, checkpoint policy, MRAF enablement, and MDRC modes are valid"
 )
 PY
 rc=$?
 if ((rc != 0)); then
     append_failed "GLOBAL" "-" "config_assert" "$rc" \
-        "generated config safety assertion failed"
+        "generated supplementary config safety assertion failed"
     exit "$rc"
 fi
 
 for arm_index in "${!ALL_ARM_NAMES[@]}"; do
     arm_name="${ALL_ARM_NAMES[$arm_index]}"
-    if [[ ! "$arm_name" =~ ^Dblur$ ]]; then
+    if [[ ! "$arm_name" =~ ^(Dblur|DnoNoise)$ ]]; then
         append_failed "GLOBAL" "-" "config_assert" "2" \
             "invalid canonical arm at index $arm_index: $arm_name"
         exit 2
     fi
     if [[ ! -f "$CONFIG_DIR/${ALL_ARM_NAMES[$arm_index]}.yaml" ]]; then
         append_failed "GLOBAL" "-" "config_assert" "2" \
-            "missing Dblur config: $CONFIG_DIR/${ALL_ARM_NAMES[$arm_index]}.yaml"
+            "missing supplementary config: $CONFIG_DIR/${ALL_ARM_NAMES[$arm_index]}.yaml"
         exit 2
     fi
 done
@@ -718,7 +742,7 @@ PY
 
 arm_has_mraf() {
     case "$1" in
-        Dblur) return 0 ;;
+        Dblur|DnoNoise) return 0 ;;
         *) return 2 ;;
     esac
 }
@@ -730,7 +754,8 @@ run_one() {
     local mark="$MARKS_DIR/${run_key}.done"
     local config="$CONFIG_DIR/${group}.yaml"
     local run_start elapsed disk_gb timestamp attempt_root train_log train_rc
-    local mdrc_modes degraded_counts_lines
+    local mdrc_modes degraded_counts_lines mdrc_startup_lines
+    local required_rgb_mode required_ir_mode forbidden_mode_pattern
     local run_config actual_run_dir checkpoint sim_run_dir unit_metrics_tmp
     local actual_real allowed_real checkpoint_real runs_root_real
     local sim_root_real sim_run_real metrics_parent_real out_real
@@ -739,6 +764,24 @@ run_one() {
     local -a scenario_specs=("${CORE_SCENARIOS[@]}")
     local -a pending_sim_sources=()
     local -a pending_sim_targets=()
+
+    case "$group" in
+        Dblur)
+            required_rgb_mode="rgb_blur"
+            required_ir_mode="ir_blur"
+            forbidden_mode_pattern="rgb_noise|ir_noise"
+            ;;
+        DnoNoise)
+            required_rgb_mode="rgb_attenuate"
+            required_ir_mode="ir_attenuate"
+            forbidden_mode_pattern="rgb_noise|ir_noise|rgb_blur|ir_blur"
+            ;;
+        *)
+            append_failed "$group" "$seed" "mode_assert_setup" "2" \
+                "unsupported supplementary arm: $group"
+            return 1
+            ;;
+    esac
 
     if [[ -f "$mark" ]]; then
         log "[SKIP] $run_key already complete: $mark"
@@ -798,24 +841,25 @@ run_one() {
             "training process failed"
         return 1
     fi
-    local mdrc_startup_lines
     mdrc_startup_lines="$(grep -F '[MDRC] enable=' "$train_log" || true)"
     if [[ -z "$mdrc_startup_lines" ]]; then
         append_failed "$group" "$seed" "mdrc_startup_assert" "1" \
             "training log has no [MDRC] enable=... modes=... startup entry"
         return 1
     fi
-    if ! grep -Eq 'modes=.*rgb_blur.*ir_blur' <<< "$mdrc_startup_lines"; then
+    if ! grep -Eq "modes=.*${required_rgb_mode}.*${required_ir_mode}" \
+        <<< "$mdrc_startup_lines"; then
         append_failed "$group" "$seed" "mdrc_startup_assert" "1" \
-            "[MDRC] startup entry does not include rgb_blur and ir_blur"
+            "[MDRC] startup entry does not include $required_rgb_mode and $required_ir_mode"
         return 1
     fi
-    if grep -Eq 'modes=.*(rgb_noise|ir_noise)' <<< "$mdrc_startup_lines"; then
+    if grep -Eq "modes=.*(${forbidden_mode_pattern})" \
+        <<< "$mdrc_startup_lines"; then
         append_failed "$group" "$seed" "mdrc_startup_assert" "1" \
-            "[MDRC] startup entry unexpectedly includes rgb_noise or ir_noise"
+            "[MDRC] startup entry includes a forbidden mode: $forbidden_mode_pattern"
         return 1
     fi
-    log "[MDRC_STARTUP_ASSERT] group=$group seed=$seed blur_present=true noise_absent=true"
+    log "[MDRC_STARTUP_ASSERT] group=$group seed=$seed required_modes=$required_rgb_mode,$required_ir_mode forbidden_modes=$forbidden_mode_pattern"
     if grep -Eiq 'nan' "$train_log"; then
         append_failed "$group" "$seed" "train_nan_assert" "1" \
             "training log contains a case-insensitive nan token"
@@ -827,25 +871,25 @@ run_one() {
             "training log has no [DEGRADED_MODE_COUNTS] entries"
         return 1
     fi
-    if ! grep -Eq '"rgb_blur"[[:space:]]*:[[:space:]]*[1-9][0-9]*' \
+    if ! grep -Eq "\"${required_rgb_mode}\"[[:space:]]*:[[:space:]]*[1-9][0-9]*" \
         <<< "$degraded_counts_lines"; then
         append_failed "$group" "$seed" "degraded_mode_counts_assert" "1" \
-            "[DEGRADED_MODE_COUNTS] does not show a positive rgb_blur count"
+            "[DEGRADED_MODE_COUNTS] does not show a positive $required_rgb_mode count"
         return 1
     fi
-    if ! grep -Eq '"ir_blur"[[:space:]]*:[[:space:]]*[1-9][0-9]*' \
+    if ! grep -Eq "\"${required_ir_mode}\"[[:space:]]*:[[:space:]]*[1-9][0-9]*" \
         <<< "$degraded_counts_lines"; then
         append_failed "$group" "$seed" "degraded_mode_counts_assert" "1" \
-            "[DEGRADED_MODE_COUNTS] does not show a positive ir_blur count"
+            "[DEGRADED_MODE_COUNTS] does not show a positive $required_ir_mode count"
         return 1
     fi
-    if grep -Eq '"(rgb_noise|ir_noise)"[[:space:]]*:' \
+    if grep -Eq "\"(${forbidden_mode_pattern})\"[[:space:]]*:" \
         <<< "$degraded_counts_lines"; then
         append_failed "$group" "$seed" "degraded_mode_counts_assert" "1" \
-            "[DEGRADED_MODE_COUNTS] unexpectedly contains rgb_noise or ir_noise"
+            "[DEGRADED_MODE_COUNTS] contains a forbidden mode: $forbidden_mode_pattern"
         return 1
     fi
-    log "[DEGRADED_MODE_COUNTS_ASSERT] group=$group seed=$seed blur_present=true noise_absent=true"
+    log "[DEGRADED_MODE_COUNTS_ASSERT] group=$group seed=$seed required_modes=$required_rgb_mode,$required_ir_mode forbidden_modes=$forbidden_mode_pattern"
     if ! grep -Eq '^\|[[:space:]]*train[[:space:]]*\|[[:space:]]*1266[[:space:]]*\|[[:space:]]*3250[[:space:]]*\|[[:space:]]*5497[[:space:]]*\|' "$train_log"; then
         append_failed "$group" "$seed" "train_identity_assert" "1" \
             "training log does not report train 1266/3250/5497"
@@ -1199,7 +1243,7 @@ engineering_gate_failed=0
 for group in "${ARM_NAMES[@]}"; do
     first_seed_failed=0
     for seed in "${SEEDS[@]}"; do
-        if ((seed >= 106)); then
+        if ((seed >= 106 && (seed_first != 101 || seed_last != 110))); then
             missing_pilot_marks=()
             for pilot_seed in 101 102 103 104 105; do
                 pilot_mark="$MARKS_DIR/${group}_seed${pilot_seed}.done"

@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -31,7 +35,23 @@ DBLUR_MODES = [
     "rgb_attenuate",
     "ir_attenuate",
 ]
+DNONOISE_MODES = [
+    "rgb_drop",
+    "ir_drop",
+    "rgb_attenuate",
+    "ir_attenuate",
+]
 TENSOR_SHAPE = (4, 3, 32, 16)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _as_shell_path(path):
+    resolved = str(Path(path).resolve())
+    if os.name != "nt":
+        return resolved
+    drive, tail = os.path.splitdrive(resolved)
+    tail = tail.lstrip("\\/").replace("\\", "/")
+    return f"/mnt/{drive[0].lower()}/{tail}"
 
 
 def _random_tensor(dtype):
@@ -205,7 +225,7 @@ def test_dblur_config_equals_d_except_for_degradation_modes():
         e_temperature,
         utility_prior,
     )
-    assert tuple(supplementary) == ("Dblur",)
+    assert tuple(supplementary) == ("Dblur", "DnoNoise")
     dblur = supplementary["Dblur"]
     assert formal_d["mdrc_degrade_modes"] == list(DEFAULT_MODES)
     assert dblur["mdrc_degrade_modes"] == DBLUR_MODES
@@ -220,3 +240,130 @@ def test_dblur_config_equals_d_except_for_degradation_modes():
     formal_without_modes.pop("mdrc_degrade_modes")
     dblur_without_modes.pop("mdrc_degrade_modes")
     assert dblur_without_modes == formal_without_modes
+
+
+def test_dno_noise_config_equals_d_except_for_degradation_modes():
+    base_config = {"mdrc_degrade_modes": list(DEFAULT_MODES)}
+    e_temperature = 0.2
+    utility_prior = [0.7284522740054223, 0.2715477259945776]
+
+    formal_d = build_configs(
+        base_config,
+        e_temperature,
+        utility_prior,
+    )["D"]
+    dno_noise = generate_supplementary_configs(
+        base_config,
+        e_temperature,
+        utility_prior,
+    )["DnoNoise"]
+
+    assert dno_noise["mdrc_degrade_modes"] == DNONOISE_MODES
+    assert set(formal_d) == set(dno_noise)
+    differing_keys = {
+        key for key in formal_d if formal_d[key] != dno_noise[key]
+    }
+    assert differing_keys == {"mdrc_degrade_modes"}
+
+    formal_without_modes = dict(formal_d)
+    dno_noise_without_modes = dict(dno_noise)
+    formal_without_modes.pop("mdrc_degrade_modes")
+    dno_noise_without_modes.pop("mdrc_degrade_modes")
+    assert dno_noise_without_modes == formal_without_modes
+
+
+def test_dno_noise_runner_validate_only_plans_ten_runs(tmp_path):
+    base_config = tmp_path / "base_config.yaml"
+    frozen_hparams = tmp_path / "FROZEN_HPARAMS.json"
+    output_dir = tmp_path / "dno_noise_validate"
+    base_config.write_text(
+        "dataset_name: RGBT-PEDES\n"
+        "root_dir: datasets/TextReID\n"
+        "training: true\n"
+        "val_dataset: test\n"
+        "dev_split_file: null\n"
+        "MLM: true\n"
+        "img_aug: true\n"
+        "sampler: random\n"
+        "num_instance: 4\n"
+        "img_size: [384, 128]\n"
+        "stride_size: 16\n"
+        "text_length: 77\n"
+        "pretrain_choice: ViT-B/16\n"
+        "cmt_depth: 4\n"
+        "temperature: 0.02\n"
+        "save_full_eval_state_ckpt: false\n",
+        encoding="utf-8",
+    )
+    frozen_hparams.write_text(
+        json.dumps(
+            {
+                "E": {"mraf_target_temperature": 0.2},
+                "U": {"mraf_utility_prior": [0.7, 0.3]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["AUTO_SHUTDOWN"] = "0"
+
+    missing_out = subprocess.run(
+        [
+            "bash",
+            "tools/protocol/run_dblur_grid.sh",
+            "--arms",
+            "DnoNoise",
+            "--validate-only",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert missing_out.returncode == 2
+    assert "requires an explicit independent --out" in missing_out.stderr
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "tools/protocol/run_dblur_grid.sh",
+            "--base-config",
+            _as_shell_path(base_config),
+            "--frozen-hparams",
+            _as_shell_path(frozen_hparams),
+            "--out",
+            _as_shell_path(output_dir),
+            "--arms",
+            "DnoNoise",
+            "--validate-only",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    expected_plan = [
+        f"[RUN_PLAN] DnoNoise_seed{seed}" for seed in range(101, 111)
+    ]
+    actual_plan = [
+        line for line in completed.stdout.splitlines() if line.startswith("[RUN_PLAN]")
+    ]
+    assert actual_plan == expected_plan
+    assert "selected_arms=DnoNoise planned_runs=10" in completed.stdout
+    assert "[VALIDATE_ONLY_DONE]" in completed.stdout
+    assert "[RUN_START]" not in completed.stdout
+    assert "[TRAIN_START]" not in completed.stdout
+    assert "[SHUTDOWN]" not in completed.stdout
+    assert (output_dir / "configs" / "Dblur.yaml").is_file()
+    assert (output_dir / "configs" / "DnoNoise.yaml").is_file()
+    assert not any((output_dir / "runs").iterdir())
+    assert not any((output_dir / "marks").iterdir())

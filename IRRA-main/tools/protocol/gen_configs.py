@@ -28,7 +28,7 @@ from utils.config import (  # noqa: E402
 ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
 E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
 DEV_ARM_NAMES = ("devA", "devT010", "devT020", "devT030", "devT050")
-SUPPLEMENTARY_ARM_NAMES = ("Dblur",)
+SUPPLEMENTARY_ARM_NAMES = ("Dblur", "DnoNoise")
 DEV_SPLIT_FILE = "splits/dev_190.json"
 DEV_REQUIRED_INHERITED_FIELDS = (
     "MLM",
@@ -394,7 +394,16 @@ def supplementary_arm_overrides(
                 "rgb_attenuate",
                 "ir_attenuate",
             ],
-        )
+        ),
+        "DnoNoise": dict(
+            arm_overrides(e_temperature, utility_prior)["D"],
+            mdrc_degrade_modes=[
+                "rgb_drop",
+                "ir_drop",
+                "rgb_attenuate",
+                "ir_attenuate",
+            ],
+        ),
     }
 
 
@@ -622,36 +631,47 @@ def validate_supplementary_configs(
             f"{list(SUPPLEMENTARY_ARM_NAMES)}, got {list(configs)}."
         )
 
-    expected_modes = [
-        "rgb_drop",
-        "ir_drop",
-        "rgb_blur",
-        "ir_blur",
-        "rgb_attenuate",
-        "ir_attenuate",
-    ]
-    dblur_config = dict(configs["Dblur"])
-    if dblur_config.get("mdrc_degrade_modes") != expected_modes:
-        raise ProtocolConfigError(
-            "Dblur.mdrc_degrade_modes must be "
-            f"{expected_modes!r}, got {dblur_config.get('mdrc_degrade_modes')!r}."
-        )
-
-    expected_d_config = dict(
+    expected_modes_by_arm = {
+        "Dblur": [
+            "rgb_drop",
+            "ir_drop",
+            "rgb_blur",
+            "ir_blur",
+            "rgb_attenuate",
+            "ir_attenuate",
+        ],
+        "DnoNoise": [
+            "rgb_drop",
+            "ir_drop",
+            "rgb_attenuate",
+            "ir_attenuate",
+        ],
+    }
+    expected_d_without_modes = dict(
         build_configs(base_config, e_temperature, utility_prior)["D"]
     )
-    dblur_config.pop("mdrc_degrade_modes")
-    expected_d_config.pop("mdrc_degrade_modes", None)
-    if dblur_config != expected_d_config:
-        differing_keys = sorted(
-            key
-            for key in dblur_config.keys() | expected_d_config.keys()
-            if dblur_config.get(key) != expected_d_config.get(key)
-        )
-        raise ProtocolConfigError(
-            "Dblur must equal formal D except for mdrc_degrade_modes; "
-            f"differing keys: {differing_keys}."
-        )
+    expected_d_without_modes.pop("mdrc_degrade_modes", None)
+    for arm in SUPPLEMENTARY_ARM_NAMES:
+        expected_modes = expected_modes_by_arm[arm]
+        supplementary_config = dict(configs[arm])
+        if supplementary_config.get("mdrc_degrade_modes") != expected_modes:
+            raise ProtocolConfigError(
+                f"{arm}.mdrc_degrade_modes must be {expected_modes!r}, "
+                f"got {supplementary_config.get('mdrc_degrade_modes')!r}."
+            )
+
+        supplementary_config.pop("mdrc_degrade_modes")
+        if supplementary_config != expected_d_without_modes:
+            differing_keys = sorted(
+                key
+                for key in supplementary_config.keys()
+                | expected_d_without_modes.keys()
+                if supplementary_config.get(key) != expected_d_without_modes.get(key)
+            )
+            raise ProtocolConfigError(
+                f"{arm} must equal formal D except for mdrc_degrade_modes; "
+                f"differing keys: {differing_keys}."
+            )
 
 
 def serialize_configs(
@@ -823,7 +843,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--supplementary",
         default=False,
         action="store_true",
-        help="generate only the supplementary Dblur configuration",
+        help="generate only the supplementary Dblur/DnoNoise configurations",
     )
     parser.add_argument(
         "--out-dir",
