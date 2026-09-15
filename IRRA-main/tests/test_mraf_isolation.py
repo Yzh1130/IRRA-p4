@@ -14,6 +14,7 @@ from model.mraf import (
     ModalityReliabilityAdaptiveFusion,
     compute_mraf_reliability_loss,
 )
+from processor.processor import _build_degraded_branch_context
 from tools.protocol.gen_configs import (
     ProtocolConfigError,
     build_configs,
@@ -74,6 +75,109 @@ def _baseline_class():
 
 def _assert_zero_or_none(gradient):
     assert gradient is None or torch.equal(gradient, torch.zeros_like(gradient))
+
+
+class _MiniDegradedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mraf_enabled = True
+        self.input_dropout = torch.nn.Dropout(p=0.2)
+        self.rgb_encoder = torch.nn.Linear(48, 512)
+        self.ir_encoder = torch.nn.Linear(48, 512)
+        self.mraf_fusion = _module(isolated=True)
+
+    def _log_mraf_mem_callsite(self, *_args, **_kwargs):
+        return None
+
+    def _use_diag_gaussian_global(self):
+        return False
+
+    def encode_rgbt_global(self, images, thermal_images):
+        rgb = self.input_dropout(images.flatten(1))
+        ir = self.input_dropout(thermal_images.flatten(1))
+        return (
+            self.rgb_encoder(rgb),
+            self.ir_encoder(ir),
+            None,
+            None,
+            None,
+            None,
+        )
+
+    def _encode_visual_global_gaussian(
+        self,
+        v_rgb_c_raw,
+        v_t_c_raw,
+        thermal_available=True,
+    ):
+        return (
+            v_rgb_c_raw,
+            torch.zeros_like(v_rgb_c_raw),
+            v_t_c_raw,
+            torch.zeros_like(v_t_c_raw),
+        )
+
+    def _fuse_rgbt_global(
+        self,
+        rgb_mu,
+        rgb_logvar,
+        thermal_mu,
+        thermal_logvar,
+        thermal_available,
+        return_mraf_aux=False,
+        mem_debug_entry="global",
+    ):
+        fused_mu, mraf_aux = self.mraf_fusion(
+            rgb_mu,
+            thermal_mu,
+            return_aux=True,
+        )
+        fused_logvar = torch.zeros_like(fused_mu)
+        if return_mraf_aux:
+            return fused_mu, fused_logvar, mraf_aux
+        return fused_mu, fused_logvar
+
+    def forward(self, batch, mdrc_feature_only=False):
+        if not mdrc_feature_only:
+            raise AssertionError("test model only implements mdrc_feature_only")
+        (
+            v_rgb_c_raw,
+            v_t_c_raw,
+            _,
+            _,
+            img_local_stats,
+            _,
+        ) = self.encode_rgbt_global(batch["images"], batch["thermal_images"])
+        rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = (
+            self._encode_visual_global_gaussian(v_rgb_c_raw, v_t_c_raw)
+        )
+        fused_mu, fused_logvar, mraf_aux = self._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=True,
+            return_mraf_aux=True,
+            mem_debug_entry="degraded_feature_only",
+        )
+        ret = {
+            "v_rgb_c": rgb_mu,
+            "v_t_c": thermal_mu,
+            "fused_mu": fused_mu,
+            "fused_logvar": fused_logvar,
+            "fused_det_feat": fused_mu,
+            "fused_prob_feat": fused_mu,
+            "mdrc_feature_only": True,
+            "mraf_alpha": mraf_aux["alpha"],
+            "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
+            "mraf_alpha_ir": mraf_aux["alpha_ir"],
+            "mraf_logits": mraf_aux["logits"],
+            "raw_mraf_logits": mraf_aux["raw_logits"],
+            "scaled_mraf_logits": mraf_aux["scaled_logits"],
+        }
+        if img_local_stats is not None:
+            ret.update(img_local_stats)
+        return ret
 
 
 def _shell_path(path):
@@ -254,6 +358,88 @@ def test_eval_alpha_aux_matches_main_without_dropout_mask_sampling():
     assert torch.equal(aux["alpha"], aux["alpha_aux"])
     assert torch.equal(before, after)
     assert bool(torch.isfinite(fused).all().item())
+
+
+def test_warmup_no_grad_degraded_encoder_keeps_mraf_gradients_and_rng():
+    batch = {
+        "images": torch.randn(4, 3, 4, 4),
+        "thermal_images": torch.randn(4, 3, 4, 4),
+    }
+    args_base = {
+        "mdrc_enable": True,
+        "mdrc_lambda": 0.05,
+        "mdrc_warmup_epoch": 3,
+        "mdrc_prob": 1.0,
+        "mdrc_degrade_modes": ["rgb_noise"],
+        "mraf_enabled": True,
+        "mraf_rel_lambda": 0.01,
+        "mraf_rel_warmup_epoch": 1,
+    }
+    old_args = types.SimpleNamespace(**args_base, mraf_rel_isolate_input=False)
+    new_args = types.SimpleNamespace(**args_base, mraf_rel_isolate_input=True)
+    old_model = _MiniDegradedModel().train()
+    new_model = _MiniDegradedModel().train()
+    new_model.load_state_dict(old_model.state_dict())
+
+    def run(args, model):
+        model.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(20260923)
+        torch.manual_seed(20260923)
+        context = _build_degraded_branch_context(args, model, batch, epoch=1)
+        ret = context["degraded_ret"]
+        target = ret["mraf_alpha"].new_tensor([0.7, 0.3]).expand_as(
+            ret["mraf_alpha"]
+        )
+        loss = compute_mraf_reliability_loss(ret["mraf_alpha"], target)
+        loss.backward()
+        cpu_after = torch.get_rng_state().clone()
+        cuda_after = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        return context, loss.detach(), cpu_after, cuda_after
+
+    old_context, old_loss, old_cpu_rng, old_cuda_rng = run(old_args, old_model)
+    new_context, new_loss, new_cpu_rng, new_cuda_rng = run(new_args, new_model)
+    assert old_context["degraded_encoder_no_grad"] is False
+    assert new_context["degraded_encoder_no_grad"] is True
+
+    old_ret = old_context["degraded_ret"]
+    new_ret = new_context["degraded_ret"]
+    for key in ("mraf_alpha", "mraf_alpha_rgb", "mraf_alpha_ir", "fused_mu"):
+        assert torch.equal(old_ret[key], new_ret[key]), key
+    assert torch.equal(old_loss, new_loss)
+
+    for old_layer, new_layer in zip(
+        (old_model.mraf_fusion.scorer[0], old_model.mraf_fusion.scorer[3]),
+        (new_model.mraf_fusion.scorer[0], new_model.mraf_fusion.scorer[3]),
+    ):
+        assert old_layer.weight.grad is not None
+        assert new_layer.weight.grad is not None
+        assert bool((old_layer.weight.grad != 0).any().item())
+        assert torch.equal(old_layer.weight.grad, new_layer.weight.grad)
+        assert torch.equal(old_layer.bias.grad, new_layer.bias.grad)
+
+    _assert_zero_or_none(old_model.rgb_encoder.weight.grad)
+    _assert_zero_or_none(old_model.ir_encoder.weight.grad)
+    assert new_model.rgb_encoder.weight.grad is None
+    assert new_model.ir_encoder.weight.grad is None
+    assert torch.equal(old_cpu_rng, new_cpu_rng)
+    if old_cuda_rng is not None:
+        assert new_cuda_rng is not None
+        assert all(
+            torch.equal(old_state, new_state)
+            for old_state, new_state in zip(old_cuda_rng, new_cuda_rng)
+        )
+
+    torch.manual_seed(20260923)
+    active_context = _build_degraded_branch_context(
+        new_args,
+        new_model,
+        batch,
+        epoch=3,
+    )
+    assert active_context["degraded_encoder_no_grad"] is False
 
 
 def test_d_iso_config_differs_from_formal_d_by_only_isolation_flag():

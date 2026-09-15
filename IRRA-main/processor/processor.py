@@ -4676,7 +4676,100 @@ def _empty_mdrc_terms(reference, lambda_effective=0.0, loss_scale=1.0):
     }
 
 
-def _build_degraded_branch_context(args, model, batch):
+def _should_use_no_grad_degraded_encoder(args, epoch):
+    return bool(getattr(args, "mraf_rel_isolate_input", False)) and (
+        _resolve_mdrc_lambda(args, epoch) <= 0.0
+    )
+
+
+def _unwrap_model_for_degraded_encoder(model):
+    return getattr(model, "module", model)
+
+
+def _forward_degraded_feature_only_encoder_no_grad(model, degraded_batch):
+    module = _unwrap_model_for_degraded_encoder(model)
+    images = degraded_batch["images"]
+    thermal_images = degraded_batch.get("thermal_images", None)
+    thermal_available = thermal_images is not None
+
+    with torch.no_grad():
+        (
+            v_rgb_c_raw,
+            v_t_c_raw,
+            _,
+            _,
+            img_local_stats,
+            _,
+        ) = module.encode_rgbt_global(images, thermal_images)
+
+    rgb_mu, rgb_logvar, thermal_mu, thermal_logvar = (
+        module._encode_visual_global_gaussian(
+            v_rgb_c_raw.detach(),
+            v_t_c_raw.detach(),
+            thermal_available=thermal_available,
+        )
+    )
+    if module.mraf_enabled:
+        module._log_mraf_mem_callsite(
+            "before", "degraded_feature_only", rgb_mu, thermal_available
+        )
+        fused_mu, fused_logvar, mraf_aux = module._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=thermal_available,
+            return_mraf_aux=True,
+            mem_debug_entry="degraded_feature_only",
+        )
+        module._log_mraf_mem_callsite(
+            "after", "degraded_feature_only", rgb_mu, thermal_available
+        )
+    else:
+        fused_mu, fused_logvar = module._fuse_rgbt_global(
+            rgb_mu=rgb_mu,
+            rgb_logvar=rgb_logvar,
+            thermal_mu=thermal_mu,
+            thermal_logvar=thermal_logvar,
+            thermal_available=thermal_available,
+        )
+        mraf_aux = None
+
+    ret = {
+        "v_rgb_c": rgb_mu,
+        "v_t_c": thermal_mu,
+        "fused_mu": fused_mu,
+        "fused_logvar": fused_logvar,
+        "fused_det_feat": fused_mu,
+        "fused_prob_feat": fused_mu,
+        "mdrc_feature_only": True,
+    }
+    if img_local_stats is not None:
+        ret.update(img_local_stats)
+    if mraf_aux is not None:
+        ret.update(
+            {
+                "mraf_alpha": mraf_aux["alpha"],
+                "mraf_alpha_rgb": mraf_aux["alpha_rgb"],
+                "mraf_alpha_ir": mraf_aux["alpha_ir"],
+                "mraf_logits": mraf_aux["logits"],
+                "raw_mraf_logits": mraf_aux["raw_logits"],
+                "scaled_mraf_logits": mraf_aux["scaled_logits"],
+            }
+        )
+    if module._use_diag_gaussian_global():
+        ret.update(
+            {
+                "rgb_mu": rgb_mu,
+                "rgb_logvar": rgb_logvar,
+                "thermal_mu": thermal_mu,
+                "thermal_logvar": thermal_logvar,
+            }
+        )
+    return ret
+
+
+def _build_degraded_branch_context(args, model, batch, epoch=None):
     """Sample exactly one shared degraded RGB-T view and encode it once."""
     degraded_rgb, degraded_ir, degrade_info = degrade_rgbt_batch(
         batch["images"],
@@ -4707,7 +4800,16 @@ def _build_degraded_branch_context(args, model, batch):
             degraded_rgb.device,
             include_reserved=True,
         )
-    degraded_ret = model(degraded_batch, mdrc_feature_only=True)
+    no_grad_degraded_encoder = (
+        epoch is not None and _should_use_no_grad_degraded_encoder(args, epoch)
+    )
+    if no_grad_degraded_encoder:
+        degraded_ret = _forward_degraded_feature_only_encoder_no_grad(
+            model,
+            degraded_batch,
+        )
+    else:
+        degraded_ret = model(degraded_batch, mdrc_feature_only=True)
     if mraf_mem_debug_active(degraded_rgb.device):
         mraf_mem_debug_log(
             logging.getLogger("IRRA.train"),
@@ -4722,6 +4824,7 @@ def _build_degraded_branch_context(args, model, batch):
         "delta_rgb": delta_rgb,
         "delta_ir": delta_ir,
         "degrade_info": degrade_info,
+        "degraded_encoder_no_grad": no_grad_degraded_encoder,
     }
 
 
@@ -4760,6 +4863,7 @@ def _compute_mdrc_terms(
             args,
             model,
             batch,
+            epoch=epoch,
         )
     degraded_ret = degraded_context["degraded_ret"]
     degraded_img_feat, degraded_image_feature_key = _extract_mdrc_feature(
@@ -5346,6 +5450,7 @@ def do_train(
         uspc_debug_logged_this_epoch = False
         dcalign_debug_logged_this_epoch = False
         mdrc_debug_logged_this_epoch = False
+        mdrc_iso_logged_this_epoch = False
         degrade_aug_logged_this_epoch = False
         degraded_mode_counts = {}
         mraf_gate_logits_dtype = None
@@ -5666,7 +5771,19 @@ def do_train(
                     args,
                     model,
                     batch,
+                    epoch=epoch,
                 )
+                if not mdrc_iso_logged_this_epoch:
+                    logger.info(
+                        "[MDRC_ISO] epoch=%d degraded_encoder_no_grad=%s",
+                        epoch,
+                        bool(
+                            degraded_context.get(
+                                "degraded_encoder_no_grad", False
+                            )
+                        ),
+                    )
+                    mdrc_iso_logged_this_epoch = True
                 for mode_name, mode_count in degraded_context[
                     "degrade_info"
                 ]["mode_counts"].items():
