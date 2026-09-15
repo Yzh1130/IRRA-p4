@@ -25,11 +25,11 @@ VALIDATE_ONLY=0
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --base-config PATH [--arms Dblur|DnoNoise] [--seeds 101-105] [--out PATH]" \
+        "Usage: $0 --base-config PATH [--arms Dblur|DnoNoise|D-iso] [--seeds 101-105] [--out PATH]" \
         "          [--frozen-hparams PATH] [--python PATH] [--validate-only]" \
         "" \
-        "Select exactly one of Dblur or DnoNoise; the default is Dblur." \
-        "DnoNoise requires an explicit --out outside the default DBLUR_GRID tree." \
+        "Select exactly one of Dblur, DnoNoise, or D-iso; the default is Dblur." \
+        "DnoNoise and D-iso require an explicit --out outside the default DBLUR_GRID tree." \
         "--seeds defaults to 101-110." \
         "--validate-only generates and validates configs, prints the run plan," \
         "and exits without training, evaluation, mechanism diagnostics, or shutdown." \
@@ -88,8 +88,9 @@ while (($#)); do
     esac
 done
 
-if [[ "$ARMS_SPEC" == "DnoNoise" && "$OUT_SPEC_SET" != "1" ]]; then
-    printf 'error: --arms DnoNoise requires an explicit independent --out\n' >&2
+if [[ ("$ARMS_SPEC" == "DnoNoise" || "$ARMS_SPEC" == "D-iso") \
+    && "$OUT_SPEC_SET" != "1" ]]; then
+    printf 'error: --arms %s requires an explicit independent --out\n' "$ARMS_SPEC" >&2
     exit 2
 fi
 if [[ -z "$OUT" ]]; then
@@ -104,9 +105,9 @@ if [[ -n "$BASE_CONFIG" ]]; then
 fi
 
 DEFAULT_DBLUR_GRID="$(realpath -m "/root/autodl-tmp/DBLUR_GRID")"
-if [[ "$ARMS_SPEC" == "DnoNoise" \
+if [[ ("$ARMS_SPEC" == "DnoNoise" || "$ARMS_SPEC" == "D-iso") \
     && ("$OUT" == "$DEFAULT_DBLUR_GRID" || "$OUT" == "$DEFAULT_DBLUR_GRID/"*) ]]; then
-    printf 'error: DnoNoise --out must be independent of DBLUR_GRID: %s\n' "$OUT" >&2
+    printf 'error: %s --out must be independent of DBLUR_GRID: %s\n' "$ARMS_SPEC" "$OUT" >&2
     exit 2
 fi
 
@@ -201,7 +202,7 @@ trap on_signal INT TERM
 
 GLOBAL_START="$(date +%s)"
 
-ALL_ARM_NAMES=(Dblur DnoNoise)
+ALL_ARM_NAMES=(Dblur DnoNoise D-iso)
 ARM_NAMES=()
 REQUESTED_ARM_NAMES=()
 SEEDS=()
@@ -279,9 +280,9 @@ if ((ARMS_SPEC_SET)); then
         append_failed "GLOBAL" "-" "arms_assert" "2" "--arms must not be empty"
         exit 2
     fi
-    if [[ ! "$ARMS_SPEC" =~ ^(Dblur|DnoNoise)$ ]]; then
+    if [[ ! "$ARMS_SPEC" =~ ^(Dblur|DnoNoise|D-iso)$ ]]; then
         append_failed "GLOBAL" "-" "arms_assert" "2" \
-            "--arms accepts exactly one of Dblur or DnoNoise: $ARMS_SPEC"
+            "--arms accepts exactly one of Dblur, DnoNoise, or D-iso: $ARMS_SPEC"
         exit 2
     fi
     IFS=',' read -r -a REQUESTED_ARM_NAMES <<< "$ARMS_SPEC"
@@ -290,7 +291,7 @@ if ((ARMS_SPEC_SET)); then
         exit 2
     fi
     for requested_arm in "${REQUESTED_ARM_NAMES[@]}"; do
-        if [[ ! "$requested_arm" =~ ^(Dblur|DnoNoise)$ ]]; then
+        if [[ ! "$requested_arm" =~ ^(Dblur|DnoNoise|D-iso)$ ]]; then
             append_failed "GLOBAL" "-" "arms_assert" "2" \
                 "invalid supplementary arm: $requested_arm"
             exit 2
@@ -318,9 +319,9 @@ else
     ARM_NAMES=(Dblur)
 fi
 
-if ((${#ALL_ARM_NAMES[@]} != 2 || ${#ARM_NAMES[@]} != 1)); then
+if ((${#ALL_ARM_NAMES[@]} != 3 || ${#ARM_NAMES[@]} != 1)); then
     append_failed "GLOBAL" "-" "arms_assert" "2" \
-        "expected two canonical supplementary arms and exactly one selected arm"
+        "expected three canonical supplementary arms and exactly one selected arm"
     exit 2
 fi
 if ((${#SEEDS[@]} < 1 || ${#SEEDS[@]} > 10)); then
@@ -336,7 +337,7 @@ fi
 
 ARMS_CSV="$(IFS=,; printf '%s' "${ARM_NAMES[*]}")"
 SEEDS_CSV="$(IFS=,; printf '%s' "${SEEDS[*]}")"
-log "[ARMS] selected=$ARMS_CSV canonical_order=Dblur,DnoNoise"
+log "[ARMS] selected=$ARMS_CSV canonical_order=Dblur,DnoNoise,D-iso"
 log "[SEEDS] specification=$SEEDS_SPEC selected=$SEEDS_CSV"
 
 if [[ ! "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || ((MIN_FREE_GB < 1)); then
@@ -417,7 +418,7 @@ if ((rc != 0)); then
     exit "$rc"
 fi
 
-log "Generating the Dblur/DnoNoise supplementary configs from $BASE_CONFIG"
+log "Generating the Dblur/DnoNoise/D-iso supplementary configs from $BASE_CONFIG"
 "$PYTHON_BIN" -m tools.protocol.gen_configs \
     --base-config "$BASE_CONFIG" \
     --frozen-hparams "$FROZEN_HPARAMS" \
@@ -426,7 +427,7 @@ log "Generating the Dblur/DnoNoise supplementary configs from $BASE_CONFIG"
 rc=$?
 if ((rc != 0)); then
     append_failed "GLOBAL" "-" "config_generation" "$rc" \
-        "Dblur/DnoNoise supplementary config generation failed"
+        "Dblur/DnoNoise/D-iso supplementary config generation failed"
     exit "$rc"
 fi
 
@@ -435,10 +436,14 @@ import sys
 from pathlib import Path
 
 from utils.config import load_config_mapping
+DEFAULT_D_MODES = (
+    "rgb_drop", "ir_drop", "rgb_noise", "ir_noise",
+    "rgb_attenuate", "ir_attenuate",
+)
 
 config_dir = Path(sys.argv[1])
-expected_arms = ("Dblur", "DnoNoise")
-mraf_arms = {"Dblur", "DnoNoise"}
+expected_arms = ("Dblur", "DnoNoise", "D-iso")
+mraf_arms = {"Dblur", "DnoNoise", "D-iso"}
 expected_modes_by_arm = {
     "Dblur": [
         "rgb_drop",
@@ -454,6 +459,7 @@ expected_modes_by_arm = {
         "rgb_attenuate",
         "ir_attenuate",
     ],
+    "D-iso": list(DEFAULT_D_MODES),
 }
 for arm in expected_arms:
     path = config_dir / f"{arm}.yaml"
@@ -502,14 +508,22 @@ for arm in expected_arms:
             f"{arm}.mraf_enabled must be {expected_mraf!r}, "
             f"got {config.get('mraf_enabled')!r}"
         )
+    expected_isolation = arm == "D-iso"
+    if bool(config.get("mraf_rel_isolate_input", False)) is not expected_isolation:
+        raise SystemExit(
+            f"{arm}.mraf_rel_isolate_input must be {expected_isolation!r}, "
+            f"got {config.get('mraf_rel_isolate_input')!r}"
+        )
     expected_modes = expected_modes_by_arm[arm]
     modes = config.get("mdrc_degrade_modes")
+    if arm == "D-iso" and "mdrc_degrade_modes" not in config:
+        modes = list(DEFAULT_D_MODES)
     if not isinstance(modes, (list, tuple)) or list(modes) != expected_modes:
         raise SystemExit(
             f"{arm}.mdrc_degrade_modes must be {expected_modes!r}, got {modes!r}"
         )
 print(
-    "[CONFIG_ASSERT] Dblur/DnoNoise supplementary configs are present; full-train/test "
+    "[CONFIG_ASSERT] Dblur/DnoNoise/D-iso supplementary configs are present; full-train/test "
     "split, checkpoint policy, MRAF enablement, and MDRC modes are valid"
 )
 PY
@@ -522,7 +536,7 @@ fi
 
 for arm_index in "${!ALL_ARM_NAMES[@]}"; do
     arm_name="${ALL_ARM_NAMES[$arm_index]}"
-    if [[ ! "$arm_name" =~ ^(Dblur|DnoNoise)$ ]]; then
+    if [[ ! "$arm_name" =~ ^(Dblur|DnoNoise|D-iso)$ ]]; then
         append_failed "GLOBAL" "-" "config_assert" "2" \
             "invalid canonical arm at index $arm_index: $arm_name"
         exit 2
@@ -731,9 +745,15 @@ import sys
 from pathlib import Path
 
 from utils.config import load_config_mapping
+DEFAULT_D_MODES = (
+    "rgb_drop", "ir_drop", "rgb_noise", "ir_noise",
+    "rgb_attenuate", "ir_attenuate",
+)
 
 config = load_config_mapping(Path(sys.argv[1]))
 modes = config.get("mdrc_degrade_modes")
+if "mdrc_degrade_modes" not in config:
+    modes = list(DEFAULT_D_MODES)
 if not isinstance(modes, (list, tuple)):
     raise SystemExit("mdrc_degrade_modes must be a list or tuple")
 print(json.dumps(list(modes), separators=(",", ":")))
@@ -742,7 +762,7 @@ PY
 
 arm_has_mraf() {
     case "$1" in
-        Dblur|DnoNoise) return 0 ;;
+        Dblur|DnoNoise|D-iso) return 0 ;;
         *) return 2 ;;
     esac
 }
@@ -775,6 +795,11 @@ run_one() {
             required_rgb_mode="rgb_attenuate"
             required_ir_mode="ir_attenuate"
             forbidden_mode_pattern="rgb_noise|ir_noise|rgb_blur|ir_blur"
+            ;;
+        D-iso)
+            required_rgb_mode="rgb_noise"
+            required_ir_mode="ir_noise"
+            forbidden_mode_pattern="rgb_blur|ir_blur"
             ;;
         *)
             append_failed "$group" "$seed" "mode_assert_setup" "2" \

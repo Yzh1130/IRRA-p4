@@ -225,7 +225,7 @@ def test_dblur_config_equals_d_except_for_degradation_modes():
         e_temperature,
         utility_prior,
     )
-    assert tuple(supplementary) == ("Dblur", "DnoNoise")
+    assert tuple(supplementary) == ("Dblur", "DnoNoise", "D-iso")
     dblur = supplementary["Dblur"]
     assert formal_d["mdrc_degrade_modes"] == list(DEFAULT_MODES)
     assert dblur["mdrc_degrade_modes"] == DBLUR_MODES

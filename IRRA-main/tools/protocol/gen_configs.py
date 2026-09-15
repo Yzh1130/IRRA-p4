@@ -28,7 +28,7 @@ from utils.config import (  # noqa: E402
 ARM_NAMES = ("A", "B", "C", "D", "E", "F", "H1", "H2", "U")
 E_TEMPERATURE_CANDIDATES = (0.2, 0.3, 0.5)
 DEV_ARM_NAMES = ("devA", "devT010", "devT020", "devT030", "devT050")
-SUPPLEMENTARY_ARM_NAMES = ("Dblur", "DnoNoise")
+SUPPLEMENTARY_ARM_NAMES = ("Dblur", "DnoNoise", "D-iso")
 DEV_SPLIT_FILE = "splits/dev_190.json"
 DEV_REQUIRED_INHERITED_FIELDS = (
     "MLM",
@@ -404,6 +404,10 @@ def supplementary_arm_overrides(
                 "ir_attenuate",
             ],
         ),
+        "D-iso": dict(
+            arm_overrides(e_temperature, utility_prior)["D"],
+            mraf_rel_isolate_input=True,
+        ),
     }
 
 
@@ -647,11 +651,36 @@ def validate_supplementary_configs(
             "ir_attenuate",
         ],
     }
-    expected_d_without_modes = dict(
-        build_configs(base_config, e_temperature, utility_prior)["D"]
-    )
+    expected_d = dict(build_configs(base_config, e_temperature, utility_prior)["D"])
+    if bool(expected_d.get("mraf_rel_isolate_input", False)):
+        raise ProtocolConfigError(
+            "Formal D.mraf_rel_isolate_input must be false for the D-iso control."
+        )
+    expected_d_without_modes = dict(expected_d)
     expected_d_without_modes.pop("mdrc_degrade_modes", None)
     for arm in SUPPLEMENTARY_ARM_NAMES:
+        if arm == "D-iso":
+            supplementary_config = dict(configs[arm])
+            if supplementary_config.get("mraf_rel_isolate_input") is not True:
+                raise ProtocolConfigError(
+                    "D-iso.mraf_rel_isolate_input must be true."
+                )
+            expected_d_without_isolation = dict(expected_d)
+            expected_d_without_isolation.pop("mraf_rel_isolate_input", None)
+            supplementary_config.pop("mraf_rel_isolate_input")
+            if supplementary_config != expected_d_without_isolation:
+                differing_keys = sorted(
+                    key
+                    for key in supplementary_config.keys()
+                    | expected_d_without_isolation.keys()
+                    if supplementary_config.get(key)
+                    != expected_d_without_isolation.get(key)
+                )
+                raise ProtocolConfigError(
+                    "D-iso must equal formal D except for mraf_rel_isolate_input; "
+                    f"differing keys: {differing_keys}."
+                )
+            continue
         expected_modes = expected_modes_by_arm[arm]
         supplementary_config = dict(configs[arm])
         if supplementary_config.get("mdrc_degrade_modes") != expected_modes:
@@ -843,7 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--supplementary",
         default=False,
         action="store_true",
-        help="generate only the supplementary Dblur/DnoNoise configurations",
+        help="generate only the supplementary Dblur/DnoNoise/D-iso configurations",
     )
     parser.add_argument(
         "--out-dir",

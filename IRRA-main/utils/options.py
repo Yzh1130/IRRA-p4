@@ -142,6 +142,7 @@ def get_args():
     mraf_group.add_argument("--mraf_freeze_gate", default=False, action='store_true', help="freeze MRAF gate weights at 0.5/0.5 for ablation; the scorer is still constructed but produces no effect on fusion")
     mraf_group.add_argument("--mraf_scorer_lr_multiplier", type=float, default=1.0, help="positive learning-rate multiplier applied only to MRAF scorer parameters")
     mraf_group.add_argument("--mraf_rel_lambda", type=float, default=0.01, help="maximum MRAF reliability supervision weight")
+    mraf_group.add_argument("--mraf_rel_isolate_input", default=False, action='store_true', help="isolate reliability-loss scorer input gradients while preserving the main MRAF fusion gate")
     mraf_group.add_argument("--mraf_target_temperature", type=float, default=0.1, help="temperature for drift-derived MRAF reliability targets")
     mraf_group.add_argument("--mraf_utility_prior", type=float, nargs=2, default=None, metavar=("U_RGB", "U_IR"), help="optional positive RGB/IR utility prior for MRAF reliability targets")
     mraf_group.add_argument("--mraf_rel_warmup_epoch", type=int, default=3, help="number of epochs used to linearly warm up MRAF reliability supervision")

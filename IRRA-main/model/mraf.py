@@ -70,6 +70,7 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         gate_base_grad_scale: float = 1.0,
         equalize_modality_norm: bool = False,
         freeze_gate: bool = False,
+        rel_isolate_input: bool = False,
     ) -> None:
         super().__init__()
         if int(feature_dim) <= 0:
@@ -104,6 +105,7 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         self.gate_base_grad_scale = float(gate_base_grad_scale)
         self.equalize_modality_norm = bool(equalize_modality_norm)
         self.freeze_gate = bool(freeze_gate)
+        self.rel_isolate_input = bool(rel_isolate_input)
         self.scorer = nn.Sequential(
             nn.Linear(self.feature_dim, self.hidden_dim),
             nn.GELU(),
@@ -142,6 +144,42 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             self.scorer.float()
         return self
 
+    def _recompute_isolated_alpha(
+        self,
+        rgb_normalized: torch.Tensor,
+        ir_normalized: torch.Tensor,
+        dropout_outputs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Reuse each main-branch Dropout mask without its encoder input graph."""
+        if len(dropout_outputs) != 2:
+            raise RuntimeError(
+                "MRAF isolation expected separate RGB and IR Dropout outputs, "
+                f"got {len(dropout_outputs)}."
+            )
+
+        def isolated_logit(
+            normalized: torch.Tensor,
+            dropped: torch.Tensor,
+        ) -> torch.Tensor:
+            hidden = self.scorer[1](self.scorer[0](normalized.detach()))
+            if self.training and self.dropout > 0.0:
+                mask = (dropped != 0).to(dtype=dropped.dtype)
+                # nn.Dropout scales the mask first, then multiplies hidden;
+                # preserve that float32 rounding order for bitwise equality.
+                hidden = hidden * (mask / (1.0 - self.dropout))
+            # In eval mode or with p=0, the effective mask is all ones.
+            return self.scorer[3](hidden)
+
+        raw_logits = torch.cat(
+            [
+                isolated_logit(rgb_normalized, dropout_outputs[0]),
+                isolated_logit(ir_normalized, dropout_outputs[1]),
+            ],
+            dim=-1,
+        )
+        scaled_logits = raw_logits * self.gate_logit_scale
+        return F.softmax(scaled_logits / self.gate_temperature, dim=-1)
+
     def forward(
         self,
         f_rgb: torch.Tensor,
@@ -164,6 +202,14 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             )
 
         scorer_dtype = self.output_layer.weight.dtype
+        dropout_outputs: list[torch.Tensor] = []
+        dropout_hook = None
+        if self.rel_isolate_input and not self.freeze_gate:
+            # The original scorer/nn.Dropout calls below remain untouched.
+            # Capture their two separate modality masks without drawing RNG.
+            dropout_hook = self.scorer[2].register_forward_hook(
+                lambda _module, _inputs, output: dropout_outputs.append(output)
+            )
         if self.gate_fp32:
             # Disable the surrounding AMP context for the complete gate and
             # fusion path.  Merely storing FP32 parameters is insufficient:
@@ -251,6 +297,20 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 )
             else:
                 fused = 2.0 * (alpha_rgb * f_rgb + alpha_ir * f_ir)
+        if dropout_hook is not None:
+            dropout_hook.remove()
+            alpha_main_aux = alpha_aux
+            if self.gate_fp32:
+                with torch.autocast(device_type=f_rgb.device.type, enabled=False):
+                    alpha_aux = self._recompute_isolated_alpha(
+                        rgb_normalized, ir_normalized, dropout_outputs
+                    )
+            else:
+                alpha_aux = self._recompute_isolated_alpha(
+                    rgb_normalized, ir_normalized, dropout_outputs
+                ).to(dtype=f_rgb.dtype)
+        else:
+            alpha_main_aux = alpha_aux
         if not bool(torch.isfinite(alpha).all().item()):
             raise ValueError("MRAF reliability weights contain NaN or Inf values.")
         if not bool(torch.isfinite(fused).all().item()):
@@ -258,10 +318,12 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
 
         if not return_aux:
             return fused
-        return fused, {
+        aux = {
             "fused": fused,
-            "alpha_rgb": alpha_aux[:, 0:1],
-            "alpha_ir": alpha_aux[:, 1:2],
+            # The RGB/IR aliases also weight fused variance in model/build.py;
+            # only the reliability-supervision "alpha" uses the isolated graph.
+            "alpha_rgb": alpha_main_aux[:, 0:1],
+            "alpha_ir": alpha_main_aux[:, 1:2],
             "alpha": alpha_aux,
             # Keep the legacy alias on raw logits; new code should use the
             # explicit raw/scaled names.
@@ -270,6 +332,10 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             "scaled_logits": scaled_logits,
             "gate_logit_scale": self.gate_logit_scale,
         }
+        if self.rel_isolate_input:
+            aux["alpha_main"] = alpha_main_aux
+            aux["alpha_aux"] = alpha_aux
+        return fused, aux
 
 
 def compute_mraf_reliability_targets(

@@ -129,6 +129,9 @@ class IRRA(nn.Module):
                 freeze_gate=bool(
                     getattr(args, "mraf_freeze_gate", False)
                 ),
+                rel_isolate_input=bool(
+                    getattr(args, "mraf_rel_isolate_input", False)
+                ),
             )
 
         # Temperature scalar used by global alignment losses.
