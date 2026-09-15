@@ -23,6 +23,11 @@ from model.objectives import (
 from model.mraf import (
     compute_mraf_reliability_loss,
     compute_mraf_reliability_targets,
+    mraf_mem_debug_active,
+    mraf_mem_debug_call_count,
+    mraf_mem_debug_clear_iteration,
+    mraf_mem_debug_log,
+    mraf_mem_debug_start_iteration,
     resolve_mraf_rel_lambda,
 )
 from solver.build import append_optimizer_param_groups_tsv
@@ -4695,7 +4700,21 @@ def _build_degraded_branch_context(args, model, batch):
     degraded_batch["images"] = degraded_rgb
     if "thermal_images" in batch:
         degraded_batch["thermal_images"] = degraded_ir
+    if mraf_mem_debug_active(degraded_rgb.device):
+        mraf_mem_debug_log(
+            logging.getLogger("IRRA.train"),
+            "degraded_feature_only_forward_before",
+            degraded_rgb.device,
+            include_reserved=True,
+        )
     degraded_ret = model(degraded_batch, mdrc_feature_only=True)
+    if mraf_mem_debug_active(degraded_rgb.device):
+        mraf_mem_debug_log(
+            logging.getLogger("IRRA.train"),
+            "degraded_feature_only_forward_after",
+            degraded_rgb.device,
+            include_reserved=True,
+        )
     return {
         "degraded_rgb": degraded_rgb,
         "degraded_ir": degraded_ir,
@@ -5087,6 +5106,7 @@ def do_train(
     arguments = {"num_epoch": num_epoch, "iteration": 0, "epoch": 0}
 
     logger = logging.getLogger("IRRA.train")
+    mem_debug_requested = os.environ.get("MRAF_MEM_DEBUG") == "1"
     logger.info("start training")
     log_img_local_filter_v1_train_config(logger, args)
     log_img_local_filter_train_config(logger, args)
@@ -5361,6 +5381,42 @@ def do_train(
                 k: v.to(device) if torch.is_tensor(v) else v
                 for k, v in batch.items()
             }
+            if mem_debug_requested:
+                mraf_mem_debug_start_iteration(
+                    epoch,
+                    n_iter + 1,
+                    enabled=epoch == start_epoch and n_iter < 2,
+                )
+            mem_debug_this_iter = mem_debug_requested and mraf_mem_debug_active(
+                batch["images"].device
+            )
+            if mem_debug_this_iter:
+                thermal_available = batch.get("thermal_images") is not None
+                mraf_expected = _mraf_enabled(args) and thermal_available
+                degraded_expected = mraf_expected and _should_execute_degraded_branch(
+                    args, epoch
+                )
+                hardneg_expected = (
+                    mraf_expected
+                    and batch.get("hn_rgb_images") is not None
+                    and batch.get("hn_t_images") is not None
+                )
+                expected_standard_calls = int(mraf_expected) * (
+                    1 + int(degraded_expected)
+                )
+                logger.info(
+                    "[MRAF_MEM] epoch=%d iteration=%d "
+                    "expected_standard_calls=%d expected_standard_sequence=%s "
+                    "hardneg_optional=%s",
+                    epoch,
+                    n_iter + 1,
+                    expected_standard_calls,
+                    (
+                        "clean,degraded_feature_only"
+                        if degraded_expected else "clean" if mraf_expected else "none"
+                    ),
+                    hardneg_expected,
+                )
             if use_modality_text_prompt and (not mtp_text_example_logged):
                 full_clean_example = _decode_caption_token_ids_for_log(
                     batch.get("caption_ids_full_clean", batch["caption_ids"])[0],
@@ -5414,7 +5470,17 @@ def do_train(
                     )
                     degrade_aug_logged_this_epoch = True
 
+            if mem_debug_this_iter:
+                mraf_mem_debug_log(
+                    logger, "clean_forward_before", batch["images"].device,
+                    epoch=epoch, iteration=n_iter + 1,
+                )
             ret = model(batch)
+            if mem_debug_this_iter:
+                mraf_mem_debug_log(
+                    logger, "clean_forward_after", batch["images"].device,
+                    epoch=epoch, iteration=n_iter + 1,
+                )
             uspc_debug_should_log = (
                 use_uspc
                 and bool(getattr(args, "debug_uspc", False))
@@ -5623,12 +5689,30 @@ def do_train(
 
             mraf_terms = None
             if _mraf_enabled(args):
+                if mem_debug_this_iter:
+                    mraf_mem_debug_log(
+                        logger,
+                        "mraf_reliability_terms_before",
+                        batch["images"].device,
+                        include_reserved=True,
+                        epoch=epoch,
+                        iteration=n_iter + 1,
+                    )
                 mraf_terms = _compute_mraf_reliability_terms(
                     args,
                     ret,
                     degraded_context,
                     epoch,
                 )
+                if mem_debug_this_iter:
+                    mraf_mem_debug_log(
+                        logger,
+                        "mraf_reliability_terms_after",
+                        batch["images"].device,
+                        include_reserved=True,
+                        epoch=epoch,
+                        iteration=n_iter + 1,
+                    )
                 if mraf_terms:
                     ret.update(mraf_terms)
                     total_loss = _add_mraf_to_total_loss(
@@ -6265,7 +6349,17 @@ def do_train(
             meters["mlm_acc"].update(_to_scalar(ret.get("mlm_acc", 0)), 1)
 
             optimizer.zero_grad()
+            if mem_debug_this_iter:
+                mraf_mem_debug_log(
+                    logger, "loss_backward_before", batch["images"].device,
+                    epoch=epoch, iteration=n_iter + 1,
+                )
             total_loss.backward()
+            if mem_debug_this_iter:
+                mraf_mem_debug_log(
+                    logger, "loss_backward_after", batch["images"].device,
+                    include_peak=True, epoch=epoch, iteration=n_iter + 1,
+                )
             if _mraf_enabled(args):
                 for grad_name, grad_value in _mraf_scorer_gradient_stats(
                     model
@@ -6385,6 +6479,16 @@ def do_train(
                         info_str += ", [SYNTH_WEIGHT][BATCH] missing"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
+
+            if mem_debug_this_iter:
+                logger.info(
+                    "[MRAF_MEM] epoch=%d iteration=%d actual_mraf_calls=%d",
+                    epoch,
+                    n_iter + 1,
+                    mraf_mem_debug_call_count(),
+                )
+            if mem_debug_requested:
+                mraf_mem_debug_clear_iteration()
 
             debug_max_train_batches = int(
                 getattr(args, "debug_max_train_batches", 0)

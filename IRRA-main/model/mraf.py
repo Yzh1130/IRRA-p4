@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+import logging
+import os
+from contextvars import ContextVar
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
@@ -11,6 +14,85 @@ import torch.nn.functional as F
 
 
 TensorOrTuple = Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]
+
+
+_MRAF_MEM_DISABLED = object()
+_MRAF_MEM_SCOPE: ContextVar[object] = ContextVar(
+    "mraf_mem_scope", default=None
+)
+
+
+def mraf_mem_debug_start_iteration(epoch: int, iteration: int, enabled: bool) -> None:
+    """Enable snapshots only for the first two requested CUDA iterations."""
+    if (
+        enabled
+        and int(iteration) <= 2
+        and os.environ.get("MRAF_MEM_DEBUG") == "1"
+    ):
+        _MRAF_MEM_SCOPE.set(
+            {"epoch": int(epoch), "iteration": int(iteration), "call_count": 0}
+        )
+    else:
+        # Distinguish a later training iteration from a standalone eval call.
+        _MRAF_MEM_SCOPE.set(_MRAF_MEM_DISABLED)
+
+
+def mraf_mem_debug_clear_iteration() -> None:
+    _MRAF_MEM_SCOPE.set(None)
+
+
+def mraf_mem_debug_active(device=None) -> bool:
+    """Return whether the active iteration permits CUDA memory logging."""
+    if os.environ.get("MRAF_MEM_DEBUG") != "1":
+        return False
+    if _MRAF_MEM_SCOPE.get() is _MRAF_MEM_DISABLED:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if device is None:
+        return True
+    return torch.device(device).type == "cuda"
+
+
+def mraf_mem_debug_call_count() -> int:
+    scope = _MRAF_MEM_SCOPE.get()
+    return scope["call_count"] if isinstance(scope, dict) else 0
+
+
+def _mraf_mem_debug_next_call(module: nn.Module) -> int:
+    scope = _MRAF_MEM_SCOPE.get()
+    if scope is None:
+        call_count = getattr(module, "_mem_debug_standalone_calls", 0) + 1
+        module._mem_debug_standalone_calls = call_count
+        return call_count
+    scope["call_count"] += 1
+    return scope["call_count"]
+
+
+def mraf_mem_debug_log(
+    logger,
+    stage: str,
+    device,
+    include_reserved: bool = False,
+    include_peak: bool = True,
+    **fields,
+) -> None:
+    """Log allocator counters without retaining tensors or changing the graph."""
+    if not mraf_mem_debug_active(device):
+        return
+    scope = _MRAF_MEM_SCOPE.get()
+    snapshot = {
+        "stage": stage,
+        "epoch": scope["epoch"] if isinstance(scope, dict) else "standalone",
+        "iteration": scope["iteration"] if isinstance(scope, dict) else "-",
+        **fields,
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+    }
+    if include_reserved:
+        snapshot["reserved_bytes"] = torch.cuda.memory_reserved(device)
+    if include_peak:
+        snapshot["max_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
+    logger.info("[MRAF_MEM] %s", " ".join(f"{key}={value}" for key, value in snapshot.items()))
 
 
 def _validate_feature_tensor(name: str, feature: torch.Tensor) -> None:
@@ -185,6 +267,7 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         f_rgb: torch.Tensor,
         f_ir: torch.Tensor,
         return_aux: bool = False,
+        mem_debug_entry: str = "direct",
     ) -> TensorOrTuple:
         """Return baseline-preserving reliability-weighted RGB/IR fusion."""
         _validate_feature_pair("f_rgb", f_rgb, "f_ir", f_ir)
@@ -201,14 +284,46 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 f"{f_rgb.device} and {scorer_device}."
             )
 
+        mem_debug_on = mraf_mem_debug_active(f_rgb.device)
+        mem_call_seq = _mraf_mem_debug_next_call(self) if mem_debug_on else 0
+        mem_logger = logging.getLogger("IRRA.train") if mem_debug_on else None
         scorer_dtype = self.output_layer.weight.dtype
         dropout_outputs: list[torch.Tensor] = []
         dropout_hook = None
         if self.rel_isolate_input and not self.freeze_gate:
             # The original scorer/nn.Dropout calls below remain untouched.
             # Capture their two separate modality masks without drawing RNG.
-            dropout_hook = self.scorer[2].register_forward_hook(
-                lambda _module, _inputs, output: dropout_outputs.append(output)
+            if mem_debug_on:
+                def capture_dropout(_module, _inputs, output):
+                    dropout_outputs.append(output)
+                    mraf_mem_debug_log(
+                        mem_logger,
+                        "dropout_hook",
+                        f_rgb.device,
+                        call_seq=mem_call_seq,
+                        entry=mem_debug_entry,
+                        trigger_count=len(dropout_outputs),
+                        output_shape=tuple(output.shape),
+                    )
+
+                dropout_hook = self.scorer[2].register_forward_hook(capture_dropout)
+            else:
+                dropout_hook = self.scorer[2].register_forward_hook(
+                    lambda _module, _inputs, output: dropout_outputs.append(output)
+                )
+        if mem_debug_on:
+            mraf_mem_debug_log(
+                mem_logger,
+                "forward_entry",
+                f_rgb.device,
+                call_seq=mem_call_seq,
+                entry=mem_debug_entry,
+                f_rgb_shape=tuple(f_rgb.shape),
+                f_ir_shape=tuple(f_ir.shape),
+                f_rgb_dtype=f_rgb.dtype,
+                f_ir_dtype=f_ir.dtype,
+                training=self.training,
+                hook_registered=dropout_hook is not None,
             )
         if self.gate_fp32:
             # Disable the surrounding AMP context for the complete gate and
@@ -300,6 +415,11 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         if dropout_hook is not None:
             dropout_hook.remove()
             alpha_main_aux = alpha_aux
+            if mem_debug_on:
+                mraf_mem_debug_log(
+                    mem_logger, "isolated_alpha_before", f_rgb.device,
+                    call_seq=mem_call_seq, entry=mem_debug_entry,
+                )
             if self.gate_fp32:
                 with torch.autocast(device_type=f_rgb.device.type, enabled=False):
                     alpha_aux = self._recompute_isolated_alpha(
@@ -309,6 +429,11 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
                 alpha_aux = self._recompute_isolated_alpha(
                     rgb_normalized, ir_normalized, dropout_outputs
                 ).to(dtype=f_rgb.dtype)
+            if mem_debug_on:
+                mraf_mem_debug_log(
+                    mem_logger, "isolated_alpha_after", f_rgb.device,
+                    call_seq=mem_call_seq, entry=mem_debug_entry,
+                )
         else:
             alpha_main_aux = alpha_aux
         if not bool(torch.isfinite(alpha).all().item()):
@@ -317,6 +442,15 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
             raise ValueError("MRAF fused features contain NaN or Inf values.")
 
         if not return_aux:
+            if mem_debug_on:
+                mraf_mem_debug_log(
+                    mem_logger, "forward_exit", f_rgb.device,
+                    call_seq=mem_call_seq, entry=mem_debug_entry,
+                    f_rgb_shape=tuple(f_rgb.shape), f_ir_shape=tuple(f_ir.shape),
+                    f_rgb_dtype=f_rgb.dtype, f_ir_dtype=f_ir.dtype,
+                    training=self.training, hook_registered=dropout_hook is not None,
+                    hook_trigger_count=len(dropout_outputs), return_aux=False,
+                )
             return fused
         aux = {
             "fused": fused,
@@ -335,6 +469,15 @@ class ModalityReliabilityAdaptiveFusion(nn.Module):
         if self.rel_isolate_input:
             aux["alpha_main"] = alpha_main_aux
             aux["alpha_aux"] = alpha_aux
+        if mem_debug_on:
+            mraf_mem_debug_log(
+                mem_logger, "forward_exit", f_rgb.device,
+                call_seq=mem_call_seq, entry=mem_debug_entry,
+                f_rgb_shape=tuple(f_rgb.shape), f_ir_shape=tuple(f_ir.shape),
+                f_rgb_dtype=f_rgb.dtype, f_ir_dtype=f_ir.dtype,
+                training=self.training, hook_registered=dropout_hook is not None,
+                hook_trigger_count=len(dropout_outputs), return_aux=True,
+            )
         return fused, aux
 
 

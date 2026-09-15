@@ -15,7 +15,11 @@ from .clip_model import (
     convert_weights,
 )
 from .prototype_bank import DualIdentityPrototypeBank, IdentityPrototypeBank
-from .mraf import ModalityReliabilityAdaptiveFusion
+from .mraf import (
+    ModalityReliabilityAdaptiveFusion,
+    mraf_mem_debug_active,
+    mraf_mem_debug_log,
+)
 from .text_guided_masking import (
     apply_guided_mask_to_input_ids,
     build_guided_mlm_inputs_and_labels,
@@ -1049,6 +1053,15 @@ class IRRA(nn.Module):
         thermal_weight = torch.where(valid_mask, thermal_weight, default_half)
         return rgb_weight, thermal_weight, valid_mask
 
+    def _log_mraf_mem_callsite(self, phase, entry, tensor, thermal_available):
+        if self.mraf_enabled and thermal_available and mraf_mem_debug_active(tensor.device):
+            mraf_mem_debug_log(
+                logging.getLogger("IRRA.train"),
+                f"build.callsite.{phase}",
+                tensor.device,
+                entry=entry,
+            )
+
     def _fuse_rgbt_global(
         self,
         rgb_mu,
@@ -1057,6 +1070,7 @@ class IRRA(nn.Module):
         thermal_logvar,
         thermal_available,
         return_mraf_aux=False,
+        mem_debug_entry="global",
     ):
         """
         Fuse RGB/T thermal global features.
@@ -1076,11 +1090,32 @@ class IRRA(nn.Module):
         """
         mraf_aux = None
         if self.mraf_enabled and thermal_available:
-            fused_mu, mraf_aux = self.mraf_fusion(
-                rgb_mu,
-                thermal_mu,
-                return_aux=True,
-            )
+            mem_debug = mraf_mem_debug_active(rgb_mu.device)
+            if mem_debug:
+                mraf_mem_debug_log(
+                    logging.getLogger("IRRA.train"),
+                    "build.mraf.before",
+                    rgb_mu.device,
+                    entry=mem_debug_entry,
+                )
+                fused_mu, mraf_aux = self.mraf_fusion(
+                    rgb_mu,
+                    thermal_mu,
+                    return_aux=True,
+                    mem_debug_entry=mem_debug_entry,
+                )
+                mraf_mem_debug_log(
+                    logging.getLogger("IRRA.train"),
+                    "build.mraf.after",
+                    rgb_mu.device,
+                    entry=mem_debug_entry,
+                )
+            else:
+                fused_mu, mraf_aux = self.mraf_fusion(
+                    rgb_mu,
+                    thermal_mu,
+                    return_aux=True,
+                )
             if self._use_diag_gaussian_global():
                 rgb_var = self._safe_var_from_logvar(rgb_logvar)
                 thermal_var = self._safe_var_from_logvar(thermal_logvar)
@@ -1566,12 +1601,19 @@ class IRRA(nn.Module):
             thermal_global_feat,
             thermal_available=thermal_image is not None,
         )
+        self._log_mraf_mem_callsite(
+            "before", "eval", rgb_mu, thermal_image is not None
+        )
         f_c, _ = self._fuse_rgbt_global(
             rgb_mu=rgb_mu,
             rgb_logvar=rgb_logvar,
             thermal_mu=thermal_mu,
             thermal_logvar=thermal_logvar,
             thermal_available=thermal_image is not None,
+            mem_debug_entry="eval",
+        )
+        self._log_mraf_mem_callsite(
+            "after", "eval", rgb_mu, thermal_image is not None
         )
         if self.mraf_enabled:
             return f_c
@@ -1691,6 +1733,9 @@ class IRRA(nn.Module):
             )
         )
         if self.mraf_enabled:
+            self._log_mraf_mem_callsite(
+                "before", "eval", rgb_mu, thermal_image is not None
+            )
             fused_feat, _, mraf_aux = self._fuse_rgbt_global(
                 rgb_mu=rgb_mu,
                 rgb_logvar=rgb_logvar,
@@ -1698,6 +1743,10 @@ class IRRA(nn.Module):
                 thermal_logvar=thermal_logvar,
                 thermal_available=thermal_image is not None,
                 return_mraf_aux=True,
+                mem_debug_entry="eval",
+            )
+            self._log_mraf_mem_callsite(
+                "after", "eval", rgb_mu, thermal_image is not None
             )
         else:
             fused_feat, _ = self._fuse_rgbt_global(
@@ -2053,6 +2102,10 @@ class IRRA(nn.Module):
                 thermal_available=thermal_images is not None,
             )
             if self.mraf_enabled:
+                self._log_mraf_mem_callsite(
+                    "before", "degraded_feature_only", rgb_mu,
+                    thermal_images is not None,
+                )
                 fused_mu, fused_logvar, mraf_aux = self._fuse_rgbt_global(
                     rgb_mu=rgb_mu,
                     rgb_logvar=rgb_logvar,
@@ -2060,6 +2113,11 @@ class IRRA(nn.Module):
                     thermal_logvar=thermal_logvar,
                     thermal_available=thermal_images is not None,
                     return_mraf_aux=True,
+                    mem_debug_entry="degraded_feature_only",
+                )
+                self._log_mraf_mem_callsite(
+                    "after", "degraded_feature_only", rgb_mu,
+                    thermal_images is not None,
                 )
             else:
                 fused_mu, fused_logvar = self._fuse_rgbt_global(
@@ -2192,6 +2250,9 @@ class IRRA(nn.Module):
             thermal_available=thermal_images is not None,
         )
         if self.mraf_enabled:
+            self._log_mraf_mem_callsite(
+                "before", "clean", rgb_mu, thermal_images is not None
+            )
             fused_mu, fused_logvar, mraf_aux = self._fuse_rgbt_global(
                 rgb_mu=rgb_mu,
                 rgb_logvar=rgb_logvar,
@@ -2199,6 +2260,10 @@ class IRRA(nn.Module):
                 thermal_logvar=thermal_logvar,
                 thermal_available=thermal_images is not None,
                 return_mraf_aux=True,
+                mem_debug_entry="clean",
+            )
+            self._log_mraf_mem_callsite(
+                "after", "clean", rgb_mu, thermal_images is not None
             )
         else:
             fused_mu, fused_logvar = self._fuse_rgbt_global(
@@ -2263,12 +2328,19 @@ class IRRA(nn.Module):
                 hn_v_t_raw,
                 thermal_available=hn_t_images_flat is not None,
             )
+            self._log_mraf_mem_callsite(
+                "before", "hardneg", hn_rgb_mu, hn_t_images_flat is not None
+            )
             hn_fused_mu, _ = self._fuse_rgbt_global(
                 rgb_mu=hn_rgb_mu,
                 rgb_logvar=hn_rgb_logvar,
                 thermal_mu=hn_thermal_mu,
                 thermal_logvar=hn_thermal_logvar,
                 thermal_available=hn_t_images_flat is not None,
+                mem_debug_entry="hardneg",
+            )
+            self._log_mraf_mem_callsite(
+                "after", "hardneg", hn_rgb_mu, hn_t_images_flat is not None
             )
             hn_fused_det_feat = hn_fused_mu.reshape(
                 hn_batch_size, hn_num_neg, -1
