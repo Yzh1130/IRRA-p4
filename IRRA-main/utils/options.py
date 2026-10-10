@@ -122,6 +122,12 @@ def get_args():
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
+    p4_group = parser.add_argument_group("P4 degraded retrieval")
+    p4_group.add_argument("--deg_retrieval_loss", choices=["none", "sdm", "ce"], default="none")
+    p4_group.add_argument("--deg_lambda", type=float, default=1.0)
+    p4_group.add_argument("--deg_rng_seed", type=int, default=None)
+    p4_group.add_argument("--deg_branch_prob", type=float, default=1.0)
+    p4_group.add_argument("--smoke_steps", type=int, default=0, help="stop after N optimizer steps without validation or checkpoint saving")
     mdrc_group = parser.add_argument_group("MDRC")
     mdrc_group.add_argument("--mdrc_enable", default=False, action='store_true', help="enable MDRC clean-degraded consistency training")
     mdrc_group.add_argument("--mdrc_lambda", type=float, default=0.05, help="maximum MDRC consistency loss weight")
@@ -575,6 +581,14 @@ def get_args():
 
     # Parse CLI args into namespace.
     args = parser.parse_args()
+    if args.deg_retrieval_loss not in ("none", "sdm", "ce"):
+        parser.error("--deg_retrieval_loss must be none, sdm or ce.")
+    if not 0.0 <= float(args.deg_branch_prob) <= 1.0:
+        parser.error("--deg_branch_prob must be in [0, 1].")
+    if not math.isfinite(float(args.deg_lambda)) or float(args.deg_lambda) < 0.0:
+        parser.error("--deg_lambda must be finite and >= 0.")
+    if int(args.smoke_steps) < 0:
+        parser.error("--smoke_steps must be >= 0.")
     normalized_mdrc_modes = []
     for item in args.mdrc_degrade_modes:
         for mode in str(item).split(","):

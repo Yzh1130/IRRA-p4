@@ -48,6 +48,8 @@ from utils.mdrc import (
 from utils.mtp_text import build_rgb_text, build_thermal_text
 from utils.simple_tokenizer import SimpleTokenizer
 from utils.uspc_text_views import build_uspc_text_views
+from tools.p4.deg_retrieval import DegRetrievalSampler, EpochCounters, compute_deg_loss, resolve_deg_rng_seed
+from tools.p4.run_record import RunRecord
 
 
 EVAL_STATE_KEYWORDS = (
@@ -5212,6 +5214,18 @@ def do_train(
     logger = logging.getLogger("IRRA.train")
     mem_debug_requested = os.environ.get("MRAF_MEM_DEBUG") == "1"
     logger.info("start training")
+    p4_loss_name = str(getattr(args, "deg_retrieval_loss", "none"))
+    # None does not even instantiate the sampler; all legacy forwards/losses
+    # below retain their original order and global random-state behavior.
+    p4_sampler = (DegRetrievalSampler(
+        p4_loss_name,
+        resolve_deg_rng_seed(getattr(args, "train_seed", int(os.environ.get("TRAIN_SEED", "1"))),
+                             getattr(args, "deg_rng_seed", None)),
+        getattr(args, "deg_branch_prob", 1.0),
+    ) if p4_loss_name != "none" else None)
+    p4_smoke_steps = int(getattr(args, "smoke_steps", 0))
+    p4_steps_done = 0
+    p4_record = RunRecord(args) if get_rank() == 0 else None
     log_img_local_filter_v1_train_config(logger, args)
     log_img_local_filter_train_config(logger, args)
     log_rgbt_moe_adapter_config(logger, args, model)
@@ -5221,6 +5235,8 @@ def do_train(
 
     meters = {
         "loss": AverageMeter(),
+        "L_clean": AverageMeter(),
+        "L_deg": AverageMeter(),
         "loss_total": AverageMeter(),
         "loss_baseline": AverageMeter(),
         "loss_base": AverageMeter(),
@@ -5447,6 +5463,9 @@ def do_train(
 
     for epoch in range(start_epoch, num_epoch + 1):
         start_time = time.time()
+        p4_epoch_counters = EpochCounters()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         uspc_debug_logged_this_epoch = False
         dcalign_debug_logged_this_epoch = False
         mdrc_debug_logged_this_epoch = False
@@ -5482,6 +5501,7 @@ def do_train(
         log_mtp_schedule_state(logger, args, epoch)
 
         for n_iter, batch in enumerate(train_loader):
+            p4_step_started = time.perf_counter()
             batch = {
                 k: v.to(device) if torch.is_tensor(v) else v
                 for k, v in batch.items()
@@ -5580,7 +5600,11 @@ def do_train(
                     logger, "clean_forward_before", batch["images"].device,
                     epoch=epoch, iteration=n_iter + 1,
                 )
+            p4_base_model = model.module if hasattr(model, "module") else model
+            p4_base_model._p4_encoder_call_counts = {"rgb": 0, "ir": 0}
             ret = model(batch)
+            p4_clean_encoder_calls = dict(p4_base_model._p4_encoder_call_counts)
+            p4_base_model._p4_encoder_call_counts = None
             if mem_debug_this_iter:
                 mraf_mem_debug_log(
                     logger, "clean_forward_after", batch["images"].device,
@@ -5889,6 +5913,33 @@ def do_train(
                 dcalign_debug_logged_this_epoch = True
 
             batch_size = batch["images"].shape[0]
+            p4_clean_loss = total_loss
+            p4_deg_loss = total_loss.new_zeros(())
+            p4_meta = None
+            p4_encoder_calls = None
+            if p4_sampler is not None:
+                if "image_ids" not in batch:
+                    raise KeyError("P4 degraded retrieval requires batch['image_ids']")
+                rgb_deg, ir_deg, p4_meta = p4_sampler.sample(
+                    batch["images"], batch.get("thermal_images"), batch["image_ids"]
+                )
+                if p4_meta["enabled"]:
+                    deg_batch = dict(batch, images=rgb_deg, thermal_images=ir_deg)
+                    deg_ret = model(deg_batch, mdrc_feature_only=True,
+                                    p4_clean_features=ret, p4_mode_meta=p4_meta)
+                    p4_encoder_calls = deg_ret["p4_encoder_calls"]
+                    base_model = model.module if hasattr(model, "module") else model
+                    caption_weight = base_model._get_caption_weight_for_loss(
+                        batch, "synth_weight_apply_to_sdm", default=True)
+                    p4_deg_loss = compute_deg_loss(
+                        deg_ret["fused_det_feat"], ret["text_det_feat"], batch["pids"],
+                        base_model.logit_scale, p4_loss_name, sample_weight=caption_weight)
+                    total_loss = total_loss + float(getattr(args, "deg_lambda", 1.0)) * p4_deg_loss
+            if "image_ids" in batch:
+                p4_epoch_counters.add_batch(batch["pids"], batch["image_ids"],
+                                           p4_meta, p4_encoder_calls, p4_clean_encoder_calls)
+            meters["L_clean"].update(_to_scalar(p4_clean_loss), batch_size)
+            meters["L_deg"].update(_to_scalar(p4_deg_loss), batch_size)
             meters["loss"].update(_to_scalar(total_loss), batch_size)
             if _mraf_enabled(args):
                 meters["loss_base"].update(
@@ -6482,6 +6533,26 @@ def do_train(
                     model
                 ).items():
                     meters[grad_name].update(grad_value, 1)
+            p4_finite = bool(torch.isfinite(total_loss.detach()).all().item())
+            if p4_smoke_steps > 0:
+                p4_finite = p4_finite and all(
+                    bool(torch.isfinite(param.grad).all().item())
+                    for param in model.parameters() if param.grad is not None)
+                if not p4_finite:
+                    failure_row = {"step": p4_steps_done + 1, "epoch": int(epoch),
+                                   "iteration": n_iter + 1,
+                                   "L_clean": _to_scalar(p4_clean_loss),
+                                   "L_deg": _to_scalar(p4_deg_loss),
+                                   "L_total": _to_scalar(total_loss), "finite": False,
+                                   "seconds": time.perf_counter() - p4_step_started,
+                                   "peak_memory_bytes": int(torch.cuda.max_memory_allocated())
+                                   if torch.cuda.is_available() else 0}
+                    logger.error("[P4_STEP] %s", json.dumps(failure_row, sort_keys=True))
+                    if p4_record is not None:
+                        p4_record.add_step(failure_row)
+                        p4_record.finish("smoke_failed_nonfinite")
+                    tb_writer.close()
+                    raise FloatingPointError("smoke encountered a nonfinite loss/gradient before optimizer.step")
             optimizer.step()
             proto_update_info = update_model_proto_bank_after_step(model, ret, batch)
             meters["proto_num_updated_pids"].update(
@@ -6494,6 +6565,34 @@ def do_train(
                 float(proto_update_info.get("num_initialized_pids", 0)), 1
             )
             synchronize()
+
+            if p4_smoke_steps > 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            p4_steps_done += 1
+            p4_step_row = {
+                "step": p4_steps_done, "epoch": int(epoch), "iteration": n_iter + 1,
+                "L_clean": _to_scalar(p4_clean_loss), "L_deg": _to_scalar(p4_deg_loss),
+                "L_total": _to_scalar(total_loss), "finite": p4_finite,
+                "seconds": time.perf_counter() - p4_step_started,
+                "peak_memory_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+                "clean_components": {key: _to_scalar(value) for key, value in ret.items()
+                                     if "loss" in key and torch.is_tensor(value) and value.numel() == 1},
+                "deg_components": {p4_loss_name: _to_scalar(p4_deg_loss)} if p4_meta and p4_meta["enabled"] else {},
+            }
+            if p4_record is not None:
+                p4_record.add_step(p4_step_row)
+            if p4_smoke_steps > 0 or p4_sampler is not None:
+                logger.info("[P4_STEP] %s", json.dumps(p4_step_row, sort_keys=True))
+            if p4_smoke_steps > 0 and p4_steps_done >= p4_smoke_steps:
+                p4_epoch_row = p4_epoch_counters.summary(
+                    epoch, time.time() - start_time,
+                    torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0, partial=True)
+                logger.info("[P4_EPOCH] %s", json.dumps(p4_epoch_row, sort_keys=True))
+                if p4_record is not None:
+                    p4_record.add_epoch(p4_epoch_row)
+                    p4_record.finish("smoke_completed")
+                tb_writer.close()
+                return
 
             if (n_iter + 1) % log_period == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
@@ -6775,6 +6874,14 @@ def do_train(
                 json.dumps(mraf_epoch_stats, sort_keys=True),
             )
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        p4_epoch_row = p4_epoch_counters.summary(
+            epoch, time.time() - start_time,
+            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0)
+        logger.info("[P4_EPOCH] %s", json.dumps(p4_epoch_row, sort_keys=True))
+        if p4_record is not None:
+            p4_record.add_epoch(p4_epoch_row)
         tb_writer.add_scalar("lr", scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar("temperature", _to_scalar(ret["temperature"]), epoch)
         for k, v in meters.items():
@@ -6791,7 +6898,7 @@ def do_train(
                 )
             )
 
-        if epoch % eval_period == 0 and get_rank() == 0:
+        if p4_smoke_steps == 0 and epoch % eval_period == 0 and get_rank() == 0:
             img_local_filter_active = apply_img_local_filter_stage(
                 model,
                 args,
@@ -6892,6 +6999,14 @@ def do_train(
                     logger=logger,
                 )
 
+    if p4_smoke_steps > 0:
+        if p4_record is not None:
+            p4_record.finish("smoke_incomplete")
+        tb_writer.close()
+        return
+    if p4_record is not None:
+        p4_record.finish()
+    tb_writer.close()
     if get_rank() == 0:
         last_checkpoint_path = _save_last_checkpoint(
             checkpointer,

@@ -54,7 +54,10 @@ def _build_train_or_test_dataloaders(args):
 
 if __name__ == "__main__":
     args = get_args()
-    set_seed(int(os.environ.get("TRAIN_SEED", "1")) + get_rank())
+    args.train_seed = int(os.environ.get("TRAIN_SEED", "1")) + get_rank()
+    from tools.p4.deg_retrieval import resolve_deg_rng_seed
+    args.deg_rng_seed = resolve_deg_rng_seed(args.train_seed, args.deg_rng_seed)
+    set_seed(args.train_seed)
     name = args.name
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1

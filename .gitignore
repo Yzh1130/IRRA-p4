@@ -39,3 +39,14 @@ IRRA日志/
 *.docx
 audit_out/
 _stage0_leftover_backup/
+
+# P4 generated configurations, diagnostics, smoke and training artifacts.
+p4_outputs/
+p4_preexp/
+outputs/
+runs/
+smoke_outputs/
+IRRA-main/tools/p4/generated/
+run_record.json
+smoke_summary.md
+smoke_steps.jsonl

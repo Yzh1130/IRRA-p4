@@ -74,6 +74,27 @@ def compute_sdm(
     return loss
 
 
+def compute_multipos_ce(image_feats, text_feats, pid, logit_scale, eps=1e-8):
+    """Uniform PID-positive cross entropy, row means summed in both directions.
+
+    The square paired-batch targets are exactly SDM's default PID distribution.
+    ``eps`` is retained in the public signature; every row contains itself as a
+    positive, so no epsilon smoothing is applied to this target distribution.
+    """
+    batch_size = image_feats.shape[0]
+    if text_feats.shape[0] != batch_size or pid.numel() != batch_size:
+        raise ValueError("multipos CE expects paired B-image/B-text features and B PIDs")
+    pid = pid.reshape((batch_size, 1))
+    labels = (pid - pid.t() == 0).float()
+    q = labels / labels.sum(dim=1)
+    image_norm = image_feats / image_feats.norm(dim=1, keepdim=True)
+    text_norm = text_feats / text_feats.norm(dim=1, keepdim=True)
+    t2i_logits = logit_scale * (text_norm @ image_norm.t())
+    t2i = -(q * F.log_softmax(t2i_logits, dim=1)).sum(dim=1).mean()
+    i2t = -(q * F.log_softmax(t2i_logits.t(), dim=1)).sum(dim=1).mean()
+    return t2i + i2t
+
+
 def _empty_inbatch_hard_negative_output(reference):
     zero = reference.new_zeros(())
     return {

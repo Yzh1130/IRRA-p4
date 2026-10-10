@@ -47,23 +47,31 @@ def _apply_drop(target, sample_mask):
     return (target * (1.0 - mask)).to(dtype=target.dtype)
 
 
-def _apply_noise(target, sample_mask, noise_std=0.1):
+def _apply_noise(target, sample_mask, noise_std=0.1, generator=None):
     mask = _batch_mask(sample_mask, target)
     if target.is_floating_point():
-        noise = torch.randn_like(target) * float(noise_std)
+        noise = (torch.randn_like(target) if generator is None else torch.randn(
+            target.shape, device=target.device, dtype=target.dtype, generator=generator
+        )) * float(noise_std)
         return target + mask * noise
     work = target.float()
-    noise = torch.randn_like(work) * float(noise_std)
+    noise = (torch.randn_like(work) if generator is None else torch.randn(
+        work.shape, device=work.device, dtype=work.dtype, generator=generator
+    )) * float(noise_std)
     return (work + mask.float() * noise).to(dtype=target.dtype)
 
 
-def _apply_attenuate(target, sample_mask, min_factor=0.2, max_factor=0.6):
+def _apply_attenuate(target, sample_mask, min_factor=0.2, max_factor=0.6,
+                     generator=None, factors=None):
     mask = _batch_mask(sample_mask, target)
-    factor = torch.empty(
-        target.shape[0],
-        device=target.device,
-        dtype=torch.float32,
-    ).uniform_(float(min_factor), float(max_factor))
+    if factors is None:
+        factor = torch.empty(
+            target.shape[0],
+            device=target.device,
+            dtype=torch.float32,
+        ).uniform_(float(min_factor), float(max_factor), generator=generator)
+    else:
+        factor = factors.to(device=target.device, dtype=torch.float32)
     factor = factor.reshape([target.shape[0]] + [1] * (target.dim() - 1))
     factor = factor.to(dtype=target.dtype)
     return (target * (1.0 - mask + mask * factor)).to(dtype=target.dtype)
@@ -80,15 +88,15 @@ def _apply_blur(target, sample_mask, kernel_size=7):
     return torch.where(mask.bool(), mixed, target)
 
 
-def _apply_mode(target, sample_mask, mode):
+def _apply_mode(target, sample_mask, mode, generator=None, factors=None):
     if mode.endswith("_drop"):
         return _apply_drop(target, sample_mask)
     if mode.endswith("_noise"):
-        return _apply_noise(target, sample_mask)
+        return _apply_noise(target, sample_mask, generator=generator)
     if mode.endswith("_blur"):
         return _apply_blur(target, sample_mask)
     if mode.endswith("_attenuate"):
-        return _apply_attenuate(target, sample_mask)
+        return _apply_attenuate(target, sample_mask, generator=generator, factors=factors)
     raise ValueError(f"Unsupported MDRC degrade mode: {mode}.")
 
 

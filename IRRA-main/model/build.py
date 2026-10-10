@@ -1405,6 +1405,10 @@ class IRRA(nn.Module):
     def _encode_visual_tokens(
         self, image, modality, return_adapter_aux=False
     ):
+        call_counts = getattr(self, "_p4_encoder_call_counts", None)
+        if call_counts is not None:
+            count_key = "ir" if modality == "thermal" else "rgb"
+            call_counts[count_key] = call_counts.get(count_key, 0) + 1
         if return_adapter_aux and self.use_rgbt_moe_adapter:
             return self.base_model.encode_image(
                 image,
@@ -2076,7 +2080,38 @@ class IRRA(nn.Module):
             "region_feats": region_feats,
         }
 
-    def forward(self, batch, mdrc_feature_only=False):
+    def _encode_p4_degraded(self, batch, clean_features, mode_meta):
+        """Re-encode only affected modality subbatches; reuse attached clean features."""
+        if self.mraf_enabled or self._use_diag_gaussian_global() or self.use_mum:
+            raise ValueError("P4 C0 requires A's deterministic additive fusion without MRAF/MUM/Gaussian heads")
+        if not self.use_rgbt_add_fusion:
+            raise ValueError("P4 C0 requires use_rgbt_add_fusion=True")
+        features = {"rgb": clean_features["v_rgb_c"], "ir": clean_features["v_t_c"]}
+        calls = {"rgb": 0, "ir": 0}
+        for modality, image_key, encoder_modality in (
+            ("rgb", "images", "rgb"), ("ir", "thermal_images", "thermal")
+        ):
+            selected = mode_meta[modality + "_mask"].nonzero(as_tuple=False).flatten()
+            if selected.numel() == 0:
+                continue
+            image_tokens, _ = self._encode_visual_tokens(
+                batch[image_key].index_select(0, selected), modality=encoder_modality,
+                return_adapter_aux=self.use_rgbt_moe_adapter,
+            )
+            changed, _ = self._apply_image_local_filter(image_tokens)
+            patch_tokens = self._extract_patch_tokens(image_tokens, reference_feat=changed)
+            changed = self._maybe_apply_img_local_filter_v1(changed, patch_tokens)
+            # Out-of-place index_copy keeps gradients for the reused clean rows.
+            features[modality] = features[modality].index_copy(0, selected, changed)
+            calls[modality] += 1
+        fused = features["rgb"] + features["ir"]
+        return {"v_rgb_c": features["rgb"], "v_t_c": features["ir"],
+                "fused_det_feat": fused, "fused_mu": fused,
+                "fused_prob_feat": fused, "mdrc_feature_only": True,
+                "p4_encoder_calls": calls}
+
+    def forward(self, batch, mdrc_feature_only=False,
+                p4_clean_features=None, p4_mode_meta=None):
         ret = {}
 
         # Input tensors:
@@ -2086,6 +2121,10 @@ class IRRA(nn.Module):
         images = batch["images"]
         thermal_images = batch.get("thermal_images", None)
         if mdrc_feature_only:
+            if p4_clean_features is not None:
+                if p4_mode_meta is None or not p4_mode_meta.get("enabled"):
+                    raise ValueError("P4 feature-only branch requires active mode metadata")
+                return self._encode_p4_degraded(batch, p4_clean_features, p4_mode_meta)
             # MDRC degraded branch: image-only feature extraction for
             # clean-degraded consistency. No text encoding and no baseline losses.
             (
