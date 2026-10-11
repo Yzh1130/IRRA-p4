@@ -30,6 +30,15 @@ CORE_SCENARIOS = (
     ("both_blur_k7", "both_blur", 1.0, 7),
 )
 SCENARIO_NAMES = tuple(item[0] for item in CORE_SCENARIOS)
+TRAIN_STATE_SCENARIOS = (
+    ("rgb_drop_train", "rgb_drop"),
+    ("ir_drop_train", "ir_drop"),
+    ("rgb_noise_train", "rgb_noise"),
+    ("ir_noise_train", "ir_noise"),
+    ("rgb_attenuate_train", "rgb_attenuate"),
+    ("ir_attenuate_train", "ir_attenuate"),
+)
+TRAIN_STATE_SCENARIO_NAMES = tuple(item[0] for item in TRAIN_STATE_SCENARIOS)
 QUERY_FIELDS = (
     "query_id", "pid", "caption", "scenario", "best_pos_rank", "AP",
     "n_pos", "n_tokens", "n_color", "rho",
@@ -204,9 +213,11 @@ def per_query_records(score_payload, dev_data, scenario, color_words=None, stopw
 
 def build_summary(metric_rows, provenance=None):
     by_name = {row["scenario"]: row for row in metric_rows}
-    if len(by_name) != len(metric_rows) or set(by_name) != set(SCENARIO_NAMES):
-        raise ValueError("Summary requires exactly clean and all ten P3 core degradation scenarios")
-    return {
+    core_names = set(SCENARIO_NAMES)
+    all_names = core_names | set(TRAIN_STATE_SCENARIO_NAMES)
+    if len(by_name) != len(metric_rows) or set(by_name) not in (core_names, all_names):
+        raise ValueError("Summary requires all eleven P3 core scenarios, optionally plus all six training states")
+    summary = {
         "metric_units": "percent", "per_query_AP_units": "fraction",
         "degraded_R1_mean": sum(float(by_name[name]["R1"]) for name in SCENARIO_NAMES[1:]) / 10,
         "clean_R1": float(by_name["clean"]["R1"]),
@@ -214,6 +225,79 @@ def build_summary(metric_rows, provenance=None):
         "degraded_scenarios": list(SCENARIO_NAMES[1:]),
         "provenance": provenance or {},
     }
+    if set(by_name) == all_names:
+        summary["train_state_scenarios"] = list(TRAIN_STATE_SCENARIO_NAMES)
+        summary["train_state_metrics"] = {
+            name: {key: float(by_name[name][key]) for key in METRIC_FIELDS[1:]}
+            for name in TRAIN_STATE_SCENARIO_NAMES
+        }
+    return summary
+
+
+def make_train_state_evaluator(img_loader, txt_loader, mode, seed=2026,
+                               expected_gallery_size=None):
+    """Reuse Evaluator with only its gallery-degradation hook replaced.
+
+    Each gallery row calls the training _apply_mode once. Single-row draws make
+    the resulting tensors independent of evaluation batch size. A fresh local
+    device generator is seeded once per scenario; global RNGs are not consumed.
+    Text encoding, image encoding, ranking and score export remain Evaluator's.
+    """
+    import torch
+    from utils.mdrc import _apply_mode
+    from utils.metrics import Evaluator
+
+    if mode not in dict(TRAIN_STATE_SCENARIOS).values():
+        raise ValueError(f"Unsupported training-state mode: {mode}")
+
+    class TrainStateEvaluator(Evaluator):
+        def __init__(self):
+            super().__init__(img_loader, txt_loader, source="p4_dev_train_state_export")
+            self.train_state_images_seen = 0
+            self.train_state_attenuation_factors = []
+
+        def _apply_eval_degradation(self, model, img, thermal_img):
+            if not torch.is_tensor(thermal_img) or img.shape != thermal_img.shape:
+                raise ValueError("Training-state evaluation requires aligned RGB/T gallery tensors")
+            n_images = int(img.shape[0])
+            if (expected_gallery_size is not None and
+                    self.train_state_images_seen + n_images > int(expected_gallery_size)):
+                raise ValueError("Training-state gallery images must be degraded exactly once")
+            target = img if mode.startswith("rgb_") else thermal_img
+            generator = self._get_eval_degrade_generator(target.device, seed)
+            rows = []
+            for index in range(n_images):
+                row = target[index:index + 1]
+                sample_mask = torch.ones(1, device=row.device, dtype=torch.bool)
+                factors = None
+                if mode.endswith("_attenuate"):
+                    factors = torch.empty(1, device=row.device, dtype=torch.float32).uniform_(
+                        0.2, 0.6, generator=generator
+                    )
+                    self.train_state_attenuation_factors.append(float(factors.item()))
+                rows.append(_apply_mode(row, sample_mask, mode, generator=generator, factors=factors))
+            degraded = torch.cat(rows, dim=0)
+            self.train_state_images_seen += n_images
+            if mode.startswith("rgb_"):
+                return degraded, thermal_img
+            return img, degraded
+
+        def training_state_record(self):
+            if (expected_gallery_size is not None and
+                    self.train_state_images_seen != int(expected_gallery_size)):
+                raise ValueError("Training-state evaluation did not visit every gallery image exactly once")
+            return {
+                "mode": mode, "eval_degrade_seed": int(seed),
+                "implementation": "utils.mdrc._apply_mode",
+                "position": "normalized gallery tensor before visual encoding",
+                "noise_std": 0.1 if mode.endswith("_noise") else None,
+                "attenuation_range": [0.2, 0.6] if mode.endswith("_attenuate") else None,
+                "attenuation_factors_gallery_order": list(self.train_state_attenuation_factors),
+                "gallery_images_degraded_once": self.train_state_images_seen,
+                "rng_order": "one row at a time in gallery dataset order; fresh generator per scenario",
+            }
+
+    return TrainStateEvaluator()
 
 
 def _resolve_annotation(root_dir):
@@ -248,7 +332,7 @@ def export(cli):
         raise NotImplementedError("Optional feat/zero probe is not implemented in this first P4 export tool")
     if set(cli.scenarios) != set(SCENARIO_NAMES) or len(cli.scenarios) != len(SCENARIO_NAMES):
         raise ValueError("--scenarios must contain exactly the eleven P3 core scenario names")
-    if int(cli.eval_degrade_seed) != 2026:
+    if int(cli.eval_degrade_seed) != 2026 and not bool(getattr(cli, "train_state_scenarios", False)):
         raise ValueError("P4 main development export fixes --eval_degrade_seed=2026")
     if str(CODE_ROOT) not in sys.path:
         sys.path.insert(0, str(CODE_ROOT))
@@ -316,7 +400,7 @@ def export(cli):
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger("IRRA", str(output_dir), if_train=False)
     color_words, stopwords = load_word_list(cli.color_lexicon), load_word_list(cli.stopwords)
-    metric_rows, query_rows = [], []
+    metric_rows, query_rows, train_state_records = [], [], {}
     for scenario, mode, strength, kernel in CORE_SCENARIOS:
         args.eval_degrade_mode = mode
         args.eval_degrade_strength = strength
@@ -335,6 +419,31 @@ def export(cli):
             raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
         query_rows.extend(records)
         logger.info("[P4_EXPORT] scenario=%s R1=%.6f mAP=%.6f", scenario, metrics["R1"], metrics["mAP"])
+    if bool(getattr(cli, "train_state_scenarios", False)):
+        for scenario, mode in TRAIN_STATE_SCENARIOS:
+            # This mode is recorded in score metadata. Only this new evaluator's
+            # hook interprets it; the eleven original evaluations above are intact.
+            args.eval_degrade_mode = mode
+            args.eval_degrade_strength = 0.1 if mode.endswith("_noise") else 1.0
+            args.eval_degrade_blur_kernel = 7
+            args.eval_degrade_seed = int(cli.eval_degrade_seed)
+            args.eval_scores_file = str(output_dir / "scores" / f"{scenario}.pt")
+            evaluator = make_train_state_evaluator(
+                img_loader, txt_loader, mode, seed=int(cli.eval_degrade_seed),
+                expected_gallery_size=len(dev_data["gallery_pids"]),
+            )
+            evaluator.eval(model)
+            train_state_records[scenario] = evaluator.training_state_record()
+            metrics = dict(evaluator.last_eval_result)
+            if not all(math.isfinite(float(metrics[key])) for key in METRIC_FIELDS[1:]):
+                raise ValueError(f"Nonfinite metrics for {scenario}")
+            metric_rows.append({"scenario": scenario, **metrics})
+            payload = torch.load(args.eval_scores_file, map_location="cpu", weights_only=False)
+            records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
+            if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
+                raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
+            query_rows.extend(records)
+            logger.info("[P4_EXPORT] scenario=%s R1=%.6f mAP=%.6f", scenario, metrics["R1"], metrics["mAP"])
     provenance = {
         "checkpoint": str(checkpoint_path), "checkpoint_sha256": _file_hashes(checkpoint_path)["sha256"],
         "config": _file_hashes(config_path), "training_split_recorded": saved_training_split,
@@ -348,6 +457,9 @@ def export(cli):
         "pid_semantics": "original annotation identity; evaluator labels are contiguous",
         "token_semantics": "casefolded English regex word occurrences after fixed stopword removal",
     }
+    if train_state_records:
+        provenance["train_state_eval_degrade_seed"] = int(cli.eval_degrade_seed)
+        provenance["training_state_degradation"] = train_state_records
     with (output_dir / "metrics.tsv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDS, delimiter="\t")
         writer.writeheader()
@@ -370,7 +482,10 @@ def build_parser():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--root_dir", default=None, help="Explicit relocated dataset root")
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIO_NAMES, default=list(SCENARIO_NAMES))
-    parser.add_argument("--eval_degrade_seed", type=int, default=2026)
+    parser.add_argument("--eval_degrade_seed", type=int, default=2026,
+                        help="P3 core scenarios stay at 2026; with --train_state_scenarios this seed controls only the six appended states")
+    parser.add_argument("--train_state_scenarios", action="store_true",
+                        help="Append six gallery degradations using the training _apply_mode definition")
     parser.add_argument("--batch_size", type=int, default=None, help="Evaluation loader batch size")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", default=None)
