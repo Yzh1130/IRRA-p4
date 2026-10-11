@@ -1,7 +1,10 @@
 """Validate A provenance requirements and the three single-switch variants."""
+import copy
+from pathlib import Path
 import unittest
 
 from tools.p4.prepare_configs import derive_configs
+from utils.config import load_config_mapping
 
 
 def a_config():
@@ -16,6 +19,36 @@ def a_config():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_real_historical_devA_passes_and_preserves_uncertainty_flags(self):
+        fixture = Path(__file__).with_name("fixtures") / "devA_hist.yaml"
+        original = load_config_mapping(fixture)
+        snapshot = copy.deepcopy(original)
+        for flag in ("use_batch_uncertainty", "use_id_uncertainty"):
+            self.assertIs(original[flag], True)
+        variants = derive_configs(original)
+        self.assertEqual(original, snapshot)
+        reference = variants["base_clean"]
+        for name, loss in (("base_clean", "none"), ("c0_sdm", "sdm"), ("c0_ce", "ce")):
+            config = variants[name]
+            self.assertEqual(config["deg_retrieval_loss"], loss)
+            self.assertEqual(set(config), set(reference))
+            differences = {key for key in reference if config[key] != reference[key]}
+            self.assertEqual(differences, set() if name == "base_clean" else {"deg_retrieval_loss"})
+            for flag in ("use_batch_uncertainty", "use_id_uncertainty"):
+                self.assertIs(config[flag], original[flag])
+            self.assertEqual(config["warmup_epochs"], original["warmup_epochs"])
+            self.assertIsNone(config["use_precision_fusion"])
+
+    def test_uncertainty_whitelist_preserves_true_and_false_source_values(self):
+        for batch_flag in (False, True):
+            for id_flag in (False, True):
+                with self.subTest(batch=batch_flag, identity=id_flag):
+                    original = dict(a_config(), use_batch_uncertainty=batch_flag,
+                                    use_id_uncertainty=id_flag)
+                    for config in derive_configs(original).values():
+                        self.assertIs(config["use_batch_uncertainty"], batch_flag)
+                        self.assertIs(config["use_id_uncertainty"], id_flag)
+
     def test_three_variants_only_retrieval_loss_differs(self):
         original = a_config()
         variants = derive_configs(original)
@@ -42,7 +75,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_auxiliary_or_identity_source_is_rejected(self):
         for flag in ("use_image_local_filter", "use_attr_aux", "use_synth_caption_bank",
-                     "use_hard_negative_loss", "use_mum", "mdrc_enable", "mraf_enabled"):
+                     "use_hard_negative_loss", "use_mum", "use_prob_sampling",
+                     "use_future_auxiliary", "mdrc_enable", "mraf_enabled"):
             with self.subTest(flag=flag):
                 with self.assertRaisesRegex(ValueError, flag):
                     derive_configs(dict(a_config(), **{flag: True}))

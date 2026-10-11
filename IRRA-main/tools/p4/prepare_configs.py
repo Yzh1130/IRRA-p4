@@ -46,11 +46,13 @@ def derive_configs(source, dev_split_file="splits/dev_190.json", deg_lambda=1.0,
                          "identity is incompatible. Verify historical A before proceeding.")
     # Require the vanilla, separable additive A path rather than silently
     # disabling inherited auxiliary training methods.
-    # A has exactly its three clean objectives and additive fusion. Reject every
-    # enabled optional `use_*` feature, including future parser additions, rather
-    # than silently inheriting an auxiliary branch from an unrelated saved run.
+    # Historical A retains these two variance switches even with use_mum=False;
+    # preserve their source values. Reject all other enabled optional `use_*`
+    # features, including future parser additions.
     required_false = {"mdrc_enable", "mraf_enabled"} | {
-        key for key in source if key.startswith("use_") and key != "use_rgbt_add_fusion"
+        key for key in source if key.startswith("use_") and key not in (
+            "use_rgbt_add_fusion", "use_batch_uncertainty", "use_id_uncertainty"
+        )
     }
     bad = [key for key in required_false if bool(source.get(key, False))]
     if bad:
