@@ -300,6 +300,146 @@ def make_train_state_evaluator(img_loader, txt_loader, mode, seed=2026,
     return TrainStateEvaluator()
 
 
+class ModalityFeatureRecorder:
+    """Observe the original eval calls without requesting a different forward path.
+
+    The temporary Gaussian-method wrapper sees the exact two tensors subsequently
+    added by encode_rgbt_deterministic. No image or text is encoded a second time.
+    The evaluator and model methods are restored even when encoding fails.
+    """
+
+    def __init__(self, evaluator, model):
+        args = getattr(model, "args", None)
+        if (not bool(getattr(model, "use_rgbt_add_fusion", getattr(args, "use_rgbt_add_fusion", True)))
+                or any(bool(getattr(model, key, getattr(args, key, False))) for key in
+                       ("mraf_enabled", "use_mum", "use_global_uncertainty", "eval_use_mu_only",
+                        "use_modality_text_prompt"))):
+            raise ValueError("Modality features require verified additive A/base/c0 global retrieval")
+        if model.training:
+            raise ValueError("Modality feature observation requires deterministic evaluation mode")
+        if not hasattr(model, "_encode_visual_global_gaussian"):
+            raise ValueError("Model has no exact pre-addition modality observation point")
+        self.evaluator, self.model = evaluator, model
+        self.rgb, self.ir, self.fused, self.text = [], [], [], []
+        self._originals = {}
+
+    @staticmethod
+    def _tensor(output):
+        return output["global_feat"] if isinstance(output, dict) else output
+
+    @staticmethod
+    def _restore(owner, name, previous):
+        existed, value = previous
+        if existed:
+            setattr(owner, name, value)
+        else:
+            delattr(owner, name)
+
+    def __enter__(self):
+        import torch
+
+        evaluator, model = self.evaluator, self.model
+        gallery_original, text_original = evaluator._encode_gallery_feature, evaluator._encode_text_feature
+        for name in ("_encode_gallery_feature", "_encode_text_feature"):
+            self._originals[name] = (name in evaluator.__dict__, evaluator.__dict__.get(name))
+
+        def gallery(*args, **kwargs):
+            observed = []
+            method_name = "_encode_visual_global_gaussian"
+            previous = (method_name in model.__dict__, model.__dict__.get(method_name))
+            gaussian_original = getattr(model, method_name)
+
+            def gaussian(*gaussian_args, **gaussian_kwargs):
+                values = gaussian_original(*gaussian_args, **gaussian_kwargs)
+                observed.append((values[0], values[2]))
+                return values
+
+            setattr(model, method_name, gaussian)
+            try:
+                output = gallery_original(*args, **kwargs)
+            finally:
+                self._restore(model, method_name, previous)
+            if len(observed) != 1:
+                raise ValueError("Expected exactly one original modality encoding call per gallery batch")
+            rgb, ir = observed[0]
+            fused = self._tensor(output)
+            if not torch.equal(fused, rgb + ir):
+                raise ValueError("Observed retrieval tensor is not exactly f_rgb + f_ir")
+            for destination, value in ((self.rgb, rgb), (self.ir, ir), (self.fused, fused)):
+                destination.append(value.detach().cpu().clone())
+            return output
+
+        def text(*args, **kwargs):
+            output = text_original(*args, **kwargs)
+            self.text.append(self._tensor(output).detach().cpu().clone())
+            return output
+
+        evaluator._encode_gallery_feature, evaluator._encode_text_feature = gallery, text
+        return self
+
+    def __exit__(self, *_):
+        for name, previous in self._originals.items():
+            self._restore(self.evaluator, name, previous)
+
+    def save(self, path, score_payload, dev_data, scenario):
+        import torch
+        import torch.nn.functional as F
+
+        if not self.rgb or not self.text:
+            raise ValueError("Feature recorder did not observe query and gallery encodings")
+        rgb, ir, fused, text = (torch.cat(rows) for rows in (self.rgb, self.ir, self.fused, self.text))
+        # Reuse the export's strict annotation/PID/order checks before assigning IDs.
+        per_query_records(score_payload, dev_data, scenario)
+        if rgb.shape != ir.shape or rgb.shape != fused.shape or text.shape[1:] != fused.shape[1:]:
+            raise ValueError("Feature shapes do not share the additive retrieval embedding dimension")
+        if rgb.shape[0] != len(dev_data["gallery_pids"]) or text.shape[0] != len(dev_data["queries"]):
+            raise ValueError("Recorded features do not match canonical query/gallery counts")
+        reconstructed = F.normalize(text.float(), dim=1) @ F.normalize(fused.float(), dim=1).T
+        error = float((reconstructed - score_payload["sim"].cpu().float()).abs().max())
+        if not math.isfinite(error) or error >= 1e-5:
+            raise ValueError(f"Saved scores are not additive cosine retrieval: max error={error}")
+        gallery_size, query_size = fused.shape[0], text.shape[0]
+        payload = {
+            "format": "p4_additive_modality_features_v1", "scenario": scenario,
+            "f_rgb": rgb, "f_ir": ir, "f_fused": fused, "text_features": text,
+            "img_pids": score_payload["img_pids"].cpu().long().clone(),
+            "txt_pids": score_payload["txt_pids"].cpu().long().clone(),
+            "gallery_raw_pids": torch.tensor(dev_data["gallery_raw_pids"], dtype=torch.long),
+            "query_raw_pids": torch.tensor([q["pid"] for q in dev_data["queries"]], dtype=torch.long),
+            "image_ids": torch.tensor(dev_data.get("gallery_annotation_indices", list(range(gallery_size))), dtype=torch.long),
+            "img_indices": torch.arange(gallery_size),
+            "txt_indices": torch.arange(query_size),
+            "query_ids": [q["query_id"] for q in dev_data["queries"]],
+            "captions": [q["caption"] for q in dev_data["queries"]],
+            "gallery_annotation_indices": dev_data.get("gallery_annotation_indices", []),
+            "gallery_file_paths": dev_data.get("gallery_file_paths", []),
+            "metadata": {
+                "tensor_semantics": "exact pre-addition rgb_mu/thermal_mu and original eval outputs; no reencoding",
+                "image_id_semantics": "zero-based source annotation index; img_indices are evaluation gallery indices; not training image_ids",
+                "pid_semantics": "img_pids/txt_pids contiguous evaluator IDs; raw_pids original annotation IDs",
+                "normalization": "modality/fused/text tensors are unnormalized; evaluator L2-normalizes fused and text",
+                "max_score_reconstruction_error": error,
+                "split_identity_sha256": dev_data.get("split_identity_sha256"),
+                "annotation": dev_data.get("annotation"),
+            },
+        }
+        path = Path(path)
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite modality features: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+        return payload
+
+
+def _eval_with_optional_features(evaluator, model, enabled):
+    if not enabled:
+        evaluator.eval(model)
+        return None
+    with ModalityFeatureRecorder(evaluator, model) as recorder:
+        evaluator.eval(model)
+    return recorder
+
+
 def _resolve_annotation(root_dir):
     dataset_root = Path(root_dir) / "RGBT-PEDES"
     for data_dir in (dataset_root / "RGBT-PEDES-Final", dataset_root / "RGBT-PEDES", dataset_root):
@@ -328,8 +468,8 @@ def _resolve_saved_split(config, config_path, explicit_training_split):
 
 def export(cli):
     # Deferred imports keep CSV/lexicon/bootstrap helpers independently CPU testable.
-    if cli.probe is not None:
-        raise NotImplementedError("Optional feat/zero probe is not implemented in this first P4 export tool")
+    if cli.probe == "zero":
+        raise NotImplementedError("P-zero probe is not added; existing rgb_missing/ir_missing encode zeroed inputs")
     if set(cli.scenarios) != set(SCENARIO_NAMES) or len(cli.scenarios) != len(SCENARIO_NAMES):
         raise ValueError("--scenarios must contain exactly the eleven P3 core scenario names")
     if int(cli.eval_degrade_seed) != 2026 and not bool(getattr(cli, "train_state_scenarios", False)):
@@ -400,6 +540,18 @@ def export(cli):
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger("IRRA", str(output_dir), if_train=False)
     color_words, stopwords = load_word_list(cli.color_lexicon), load_word_list(cli.stopwords)
+    save_features = bool(getattr(cli, "save_modality_features", False) or cli.probe == "feat")
+    if save_features:
+        # Only opt-in output paths are checked; all existing default writes remain unchanged.
+        for scenario in SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()):
+            if (output_dir / "features" / f"{scenario}.pt").exists():
+                raise FileExistsError(f"Refusing to overwrite modality features: {scenario}")
+        annos = json.loads(annotation.read_text(encoding="utf-8"))
+        dev_ids = set(dev_data["gallery_raw_pids"])
+        selected = [(i, a) for i, a in enumerate(annos)
+                    if a.get("split", "train") == "train" and int(a["id"]) in dev_ids]
+        dev_data["gallery_annotation_indices"] = [i for i, _ in selected]
+        dev_data["gallery_file_paths"] = [a["file_path"] for _, a in selected]
     metric_rows, query_rows, train_state_records = [], [], {}
     for scenario, mode, strength, kernel in CORE_SCENARIOS:
         args.eval_degrade_mode = mode
@@ -408,12 +560,14 @@ def export(cli):
         args.eval_degrade_seed = 2026
         args.eval_scores_file = str(output_dir / "scores" / f"{scenario}.pt")
         evaluator = Evaluator(img_loader, txt_loader, source="p4_dev_export")
-        evaluator.eval(model)
+        recorder = _eval_with_optional_features(evaluator, model, save_features)
         metrics = dict(evaluator.last_eval_result)
         if not all(math.isfinite(float(metrics[key])) for key in METRIC_FIELDS[1:]):
             raise ValueError(f"Nonfinite metrics for {scenario}")
         metric_rows.append({"scenario": scenario, **metrics})
         payload = torch.load(args.eval_scores_file, map_location="cpu", weights_only=False)
+        if recorder is not None:
+            recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
         records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
         if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
             raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
@@ -432,13 +586,15 @@ def export(cli):
                 img_loader, txt_loader, mode, seed=int(cli.eval_degrade_seed),
                 expected_gallery_size=len(dev_data["gallery_pids"]),
             )
-            evaluator.eval(model)
+            recorder = _eval_with_optional_features(evaluator, model, save_features)
             train_state_records[scenario] = evaluator.training_state_record()
             metrics = dict(evaluator.last_eval_result)
             if not all(math.isfinite(float(metrics[key])) for key in METRIC_FIELDS[1:]):
                 raise ValueError(f"Nonfinite metrics for {scenario}")
             metric_rows.append({"scenario": scenario, **metrics})
             payload = torch.load(args.eval_scores_file, map_location="cpu", weights_only=False)
+            if recorder is not None:
+                recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
             records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
             if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
                 raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
@@ -470,6 +626,10 @@ def export(cli):
         writer.writerows(query_rows)
     summary = build_summary(metric_rows, provenance)
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if cli.probe == "feat":
+        from tools.p4.analysis.modality_decomposition import analyze_export_dirs
+
+        analyze_export_dirs([output_dir], output_dir / "probes" / "feat")
     return summary
 
 
@@ -486,13 +646,15 @@ def build_parser():
                         help="P3 core scenarios stay at 2026; with --train_state_scenarios this seed controls only the six appended states")
     parser.add_argument("--train_state_scenarios", action="store_true",
                         help="Append six gallery degradations using the training _apply_mode definition")
+    parser.add_argument("--save_modality_features", action="store_true",
+                        help="Observe original encodings and save exact pre-addition modality features")
     parser.add_argument("--batch_size", type=int, default=None, help="Evaluation loader batch size")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--color_lexicon", default=str(Path(__file__).with_name("color_lexicon.txt")))
     parser.add_argument("--stopwords", default=str(Path(__file__).with_name("stopwords.txt")))
     parser.add_argument("--probe", choices=("feat", "zero"), default=None,
-                        help="Reserved optional probe; explicitly unsupported in the first implementation")
+                        help="feat saves modality features and runs offline P-feat; zero remains unsupported")
     return parser
 
 
