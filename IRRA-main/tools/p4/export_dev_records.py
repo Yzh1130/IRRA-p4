@@ -7,12 +7,17 @@ AP in per_query.csv is a fraction; metrics.tsv and summary.json use percentages.
 
 import argparse
 import csv
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
+import struct
+import subprocess
 import sys
+import time
 
 
 CODE_ROOT = Path(__file__).resolve().parents[2]
@@ -440,6 +445,252 @@ def _eval_with_optional_features(evaluator, model, enabled):
     return recorder
 
 
+@contextmanager
+def acd_missing_ir_route(model, controller, scenario):
+    """Enable ACD only inside the original missing-RGB thermal token call.
+
+    All RGB, text, complete-view IR and other scenario calls retain their exact
+    original method. The adapter itself supplies its bitwise original OFF path.
+    """
+    if controller is None or scenario != "rgb_missing":
+        yield
+        return
+    name = "_encode_visual_tokens"
+    previous = (name in model.__dict__, model.__dict__.get(name))
+    original = getattr(model, name)
+
+    def routed(image, *args, **kwargs):
+        modality = kwargs.get("modality", args[0] if args else "rgb")
+        if modality == "thermal":
+            with controller.enabled():
+                return original(image, *args, **kwargs)
+        return original(image, *args, **kwargs)
+
+    setattr(model, name, routed)
+    try:
+        yield
+    finally:
+        ModalityFeatureRecorder._restore(model, name, previous)
+
+
+def load_acd_for_export(model, adapter_path, checkpoint_path):
+    """Verify source weights before injecting any adapter modules."""
+    from tools.p4.acd_lora import inject_lora, load_adapter, read_adapter
+
+    payload = read_adapter(adapter_path)
+    config = payload["config"]
+    base_sha256 = _file_hashes(checkpoint_path)["sha256"]
+    if str(config.get("base_sha256", "")) != base_sha256:
+        raise ValueError("ACD adapter base checkpoint SHA256 does not match --checkpoint")
+    controller = inject_lora(
+        model, rank=int(config["rank"]), alpha=float(config["alpha"]),
+        init_seed=int(config.get("init_seed", 20261015)),
+        expected_layers=int(config["layers"]),
+    )
+    load_adapter(controller, adapter_path, expected_base_sha256=base_sha256)
+    return controller
+
+
+def dropblank_metrics(features, original_metrics, scenario):
+    """Additional missing-view scores, leaving the original metrics untouched."""
+    import torch.nn.functional as F
+    from utils.metrics import rank
+
+    row = {"scenario": scenario, **original_metrics}
+    key = {"rgb_missing": "f_ir", "ir_missing": "f_rgb"}.get(scenario)
+    if key is None:
+        return row
+    scores = F.normalize(features["text_features"].float(), dim=1) @ F.normalize(
+        features[key].float(), dim=1
+    ).T
+    cmc, mean_ap, mean_inp, _ = rank(
+        scores, features["txt_pids"], features["img_pids"], max_rank=10, get_mAP=True,
+    )
+    row.update(R1=float(cmc[0]), R5=float(cmc[4]), R10=float(cmc[9]),
+               mAP=float(mean_ap), mINP=float(mean_inp))
+    return row
+
+
+def _bitwise_leaf(reference, candidate):
+    """Typed value comparison, including signed zeros and NaN bit patterns."""
+    import torch
+
+    result = {"identical": False, "reference_type": type(reference).__name__,
+              "candidate_type": type(candidate).__name__}
+    if torch.is_tensor(reference) and torch.is_tensor(candidate):
+        left, right = reference.detach().cpu().contiguous(), candidate.detach().cpu().contiguous()
+        same_layout = left.dtype == right.dtype and left.shape == right.shape
+        result.update(reference_shape=list(left.shape), candidate_shape=list(right.shape),
+                      reference_dtype=str(left.dtype), candidate_dtype=str(right.dtype))
+        if same_layout:
+            # View flattened storage as bytes: torch.equal alone equates +0/-0.
+            result["identical"] = torch.equal(left.reshape(-1).view(torch.uint8),
+                                               right.reshape(-1).view(torch.uint8))
+            if left.is_floating_point() or left.is_complex():
+                difference = (left.to(torch.complex128 if left.is_complex() else torch.float64) -
+                              right.to(torch.complex128 if right.is_complex() else torch.float64)).abs()
+                result["max_abs_diff"] = float(difference.max()) if difference.numel() else 0.0
+                if not math.isfinite(result["max_abs_diff"]):
+                    result["max_abs_diff"] = None
+                    result["nonfinite_difference"] = True
+        return result
+    # NumPy is already a repository dependency, but keep the exporter import light.
+    import numpy as np
+
+    if isinstance(reference, np.ndarray) and isinstance(candidate, np.ndarray):
+        same_layout = reference.dtype == candidate.dtype and reference.shape == candidate.shape
+        result.update(reference_shape=list(reference.shape), candidate_shape=list(candidate.shape),
+                      reference_dtype=str(reference.dtype), candidate_dtype=str(candidate.dtype))
+        result["identical"] = bool(same_layout and reference.tobytes(order="C") == candidate.tobytes(order="C"))
+        if same_layout and np.issubdtype(reference.dtype, np.inexact):
+            difference = np.abs(reference.astype(np.complex128 if np.iscomplexobj(reference) else np.float64) -
+                                candidate.astype(np.complex128 if np.iscomplexobj(candidate) else np.float64))
+            maximum = float(difference.max()) if difference.size else 0.0
+            result["max_abs_diff"] = maximum if math.isfinite(maximum) else None
+        return result
+    if type(reference) is not type(candidate):
+        return result
+    if isinstance(reference, float):
+        result["identical"] = struct.pack("!d", reference) == struct.pack("!d", candidate)
+        maximum = abs(reference - candidate)
+        result["max_abs_diff"] = maximum if math.isfinite(maximum) else None
+    elif isinstance(reference, (str, bytes, int, bool, type(None))):
+        result["identical"] = reference == candidate
+    elif isinstance(reference, np.generic):
+        result["identical"] = reference.dtype == candidate.dtype and reference.tobytes() == candidate.tobytes()
+        if np.issubdtype(reference.dtype, np.inexact):
+            maximum = float(abs(reference - candidate))
+            result["max_abs_diff"] = maximum if math.isfinite(maximum) else None
+    else:
+        raise TypeError(f"Unsupported invariance leaf type: {type(reference).__name__}")
+    return result
+
+
+def compare_feature_values(reference, candidate, path=""):
+    """Recursively report every key, including container structure and leaves."""
+    rows = {}
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        for key in sorted(set(reference) | set(candidate), key=str):
+            child = f"{path}.{key}" if path else str(key)
+            if key not in reference or key not in candidate:
+                rows[child] = {"identical": False, "missing_from": "reference" if key not in reference else "candidate"}
+            else:
+                rows.update(compare_feature_values(reference[key], candidate[key], child))
+        if path:
+            rows[path] = {"identical": set(reference) == set(candidate) and
+                          all(row["identical"] for row in rows.values()), "kind": "dict"}
+    elif isinstance(reference, (list, tuple)) and type(reference) is type(candidate):
+        for index in range(max(len(reference), len(candidate))):
+            child = f"{path}[{index}]"
+            if index >= len(reference) or index >= len(candidate):
+                rows[child] = {"identical": False, "missing_from": "reference" if index >= len(reference) else "candidate"}
+            else:
+                rows.update(compare_feature_values(reference[index], candidate[index], child))
+        rows[path] = {"identical": len(reference) == len(candidate) and
+                      all(row["identical"] for row in rows.values()), "kind": type(reference).__name__}
+    else:
+        rows[path] = _bitwise_leaf(reference, candidate)
+    return rows
+
+
+def _feature_scenarios(directory):
+    paths = {path.stem: path for path in (Path(directory) / "features").glob("*.pt")}
+    names = set(paths)
+    if names not in (set(SCENARIO_NAMES), set(SCENARIO_NAMES + TRAIN_STATE_SCENARIO_NAMES)):
+        raise ValueError(f"Comparison requires all 11 core or all 17 feature scenarios: {directory}")
+    if not (Path(directory) / "metrics.tsv").is_file():
+        raise FileNotFoundError(Path(directory) / "metrics.tsv")
+    return paths
+
+
+def compare_exports(reference_dir, candidate_dir, *, allow_acd_changes=False):
+    """Persist strict semantic byte invariance before raising on unexpected changes."""
+    import torch
+
+    reference_dir, candidate_dir = Path(reference_dir), Path(candidate_dir)
+    report_path = candidate_dir / "invariance.json"
+    if report_path.exists():
+        raise FileExistsError(f"Refusing to overwrite invariance report: {report_path}")
+    left_paths, right_paths = _feature_scenarios(reference_dir), _feature_scenarios(candidate_dir)
+    if set(left_paths) != set(right_paths):
+        raise ValueError("Reference and candidate feature scenario sets differ")
+    allowed = {"f_ir", "f_fused", "metadata.max_score_reconstruction_error"}
+    report = {"reference_dir": str(reference_dir.resolve()), "candidate_dir": str(candidate_dir.resolve()),
+              "allow_acd_changes": bool(allow_acd_changes), "features": {}, "metrics": {},
+              "overall_pass": True, "unexpected_differences": [], "expected_differences": []}
+    for scenario in sorted(left_paths):
+        rows = compare_feature_values(
+            torch.load(left_paths[scenario], map_location="cpu", weights_only=False),
+            torch.load(right_paths[scenario], map_location="cpu", weights_only=False),
+        )
+        for key, row in rows.items():
+            permitted = bool(allow_acd_changes and scenario == "rgb_missing" and key in allowed
+                             and "missing_from" not in row
+                             and row.get("reference_type") == row.get("candidate_type")
+                             and row.get("reference_shape") == row.get("candidate_shape")
+                             and row.get("reference_dtype") == row.get("candidate_dtype"))
+            # Parent containers derive from their children; judge them using each leaf.
+            row["change_allowed"] = permitted
+            if not row["identical"] and "kind" not in row:
+                target = "expected_differences" if permitted else "unexpected_differences"
+                report[target].append(f"features/{scenario}.pt:{key}")
+        report["features"][scenario] = {"all_keys_identical": all(row["identical"] for row in rows.values()),
+                                           "keys": rows}
+    def metric_lines(directory):
+        content = (directory / "metrics.tsv").read_bytes().splitlines(keepends=True)
+        if not content:
+            raise ValueError("Empty metrics.tsv")
+        parsed = list(csv.DictReader((directory / "metrics.tsv").read_text(encoding="utf-8").splitlines(), delimiter="\t"))
+        if len(content) != len(parsed) + 1 or len({row["scenario"] for row in parsed}) != len(parsed):
+            raise ValueError("Malformed or duplicate metrics.tsv scenario rows")
+        if set(row["scenario"] for row in parsed) != set(left_paths):
+            raise ValueError("metrics.tsv scenarios do not match features")
+        return content[0], {row["scenario"]: (index, content[index + 1], row) for index, row in enumerate(parsed)}
+    left_header, left_metrics = metric_lines(reference_dir)
+    right_header, right_metrics = metric_lines(candidate_dir)
+    report["metrics_header_identical"] = left_header == right_header
+    if left_header != right_header:
+        report["unexpected_differences"].append("metrics.tsv:header")
+    for scenario in left_metrics:
+        left_index, left_line, left_row = left_metrics[scenario]
+        right_index, right_line, right_row = right_metrics[scenario]
+        permitted = bool(allow_acd_changes and scenario == "rgb_missing")
+        row = {"identical": left_index == right_index and left_line == right_line,
+               "line_order_identical": left_index == right_index,
+               "change_allowed": permitted, "keys": compare_feature_values(left_row, right_row)}
+        if left_index != right_index:
+            report["unexpected_differences"].append(f"metrics.tsv:{scenario}:row_order")
+        if left_line != right_line:
+            target = "expected_differences" if permitted else "unexpected_differences"
+            report[target].append(f"metrics.tsv:{scenario}")
+        report["metrics"][scenario] = row
+    report["overall_pass"] = not report["unexpected_differences"]
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    if not report["overall_pass"]:
+        raise ValueError(f"Unexpected export changes; see {report_path}: {report['unexpected_differences']}")
+    return report
+
+
+def _write_opt_in_record(output_dir, cli, args, started, started_utc, device, extra):
+    import torch
+
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=CODE_ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+    record = {"git_commit": commit, "arguments": vars(cli), "resolved_model_config": vars(args),
+              "started_utc": started_utc, "elapsed_seconds": time.perf_counter() - started,
+              "seeds": {"P3_eval_degrade_seed": 2026, "train_state_eval_degrade_seed": int(cli.eval_degrade_seed),
+                        "saved_train_seed": getattr(args, "train_seed", getattr(args, "seed", None)),
+                        "adapter_init_seed": extra.get("adapter_config", {}).get("init_seed")},
+              "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device) if str(device).startswith("cuda") else 0,
+              **extra}
+    path = Path(output_dir) / "export_run_record.json"
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite opt-in export record: {path}")
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+
+
 def _resolve_annotation(root_dir):
     dataset_root = Path(root_dir) / "RGBT-PEDES"
     for data_dir in (dataset_root / "RGBT-PEDES-Final", dataset_root / "RGBT-PEDES", dataset_root):
@@ -468,6 +719,7 @@ def _resolve_saved_split(config, config_path, explicit_training_split):
 
 def export(cli):
     # Deferred imports keep CSV/lexicon/bootstrap helpers independently CPU testable.
+    started, started_utc = time.perf_counter(), datetime.now(timezone.utc).isoformat()
     if cli.probe == "zero":
         raise NotImplementedError("P-zero probe is not added; existing rgb_missing/ir_missing encode zeroed inputs")
     if set(cli.scenarios) != set(SCENARIO_NAMES) or len(cli.scenarios) != len(SCENARIO_NAMES):
@@ -483,6 +735,19 @@ def export(cli):
     from utils.iotools import load_train_configs
     from utils.logger import setup_logger
     from utils.metrics import Evaluator
+
+    adapter_path = getattr(cli, "acd_adapter", None)
+    comparison_dir = getattr(cli, "compare_export", None)
+    save_features = bool(getattr(cli, "save_modality_features", False) or cli.probe == "feat"
+                         or adapter_path or comparison_dir)
+    if comparison_dir:
+        # Fail before loading the visual encoder for missing/incomplete references.
+        reference_paths = _feature_scenarios(comparison_dir)
+        expected_names = set(SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()))
+        if set(reference_paths) != expected_names:
+            raise ValueError("Reference feature scenarios do not match requested export scenarios")
+    if adapter_path and not Path(adapter_path).is_file():
+        raise FileNotFoundError(adapter_path)
 
     config_path = Path(cli.config_file or Path(cli.checkpoint).parent / "configs.yaml").resolve()
     args = load_train_configs(str(config_path))
@@ -511,6 +776,15 @@ def export(cli):
     device = cli.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
+    if save_features:
+        for scenario in SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()):
+            if (output_dir / "features" / f"{scenario}.pt").exists():
+                raise FileExistsError(f"Refusing to overwrite modality features: {scenario}")
+        for filename in ("metrics_dropblank.tsv", "export_run_record.json") + (("invariance.json",) if comparison_dir else ()):
+            if (output_dir / filename).exists():
+                raise FileExistsError(f"Refusing to overwrite opt-in export output: {filename}")
+        if device.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats(device)
     args.training = False
     args.distributed = False
     args.eval_dataset = "val"
@@ -537,10 +811,10 @@ def export(cli):
         restore_eval_extra_state(model, checkpoint.get("extra_eval_state", {}), logger=None)
     model.requires_grad_(False)
     model.to(device).eval()
+    acd_controller = load_acd_for_export(model, adapter_path, checkpoint_path) if adapter_path else None
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger("IRRA", str(output_dir), if_train=False)
     color_words, stopwords = load_word_list(cli.color_lexicon), load_word_list(cli.stopwords)
-    save_features = bool(getattr(cli, "save_modality_features", False) or cli.probe == "feat")
     if save_features:
         # Only opt-in output paths are checked; all existing default writes remain unchanged.
         for scenario in SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()):
@@ -552,7 +826,7 @@ def export(cli):
                     if a.get("split", "train") == "train" and int(a["id"]) in dev_ids]
         dev_data["gallery_annotation_indices"] = [i for i, _ in selected]
         dev_data["gallery_file_paths"] = [a["file_path"] for _, a in selected]
-    metric_rows, query_rows, train_state_records = [], [], {}
+    metric_rows, query_rows, train_state_records, dropblank_rows = [], [], {}, []
     for scenario, mode, strength, kernel in CORE_SCENARIOS:
         args.eval_degrade_mode = mode
         args.eval_degrade_strength = strength
@@ -560,14 +834,16 @@ def export(cli):
         args.eval_degrade_seed = 2026
         args.eval_scores_file = str(output_dir / "scores" / f"{scenario}.pt")
         evaluator = Evaluator(img_loader, txt_loader, source="p4_dev_export")
-        recorder = _eval_with_optional_features(evaluator, model, save_features)
+        with acd_missing_ir_route(model, acd_controller, scenario):
+            recorder = _eval_with_optional_features(evaluator, model, save_features)
         metrics = dict(evaluator.last_eval_result)
         if not all(math.isfinite(float(metrics[key])) for key in METRIC_FIELDS[1:]):
             raise ValueError(f"Nonfinite metrics for {scenario}")
         metric_rows.append({"scenario": scenario, **metrics})
         payload = torch.load(args.eval_scores_file, map_location="cpu", weights_only=False)
         if recorder is not None:
-            recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
+            features = recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
+            dropblank_rows.append(dropblank_metrics(features, metrics, scenario))
         records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
         if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
             raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
@@ -594,7 +870,8 @@ def export(cli):
             metric_rows.append({"scenario": scenario, **metrics})
             payload = torch.load(args.eval_scores_file, map_location="cpu", weights_only=False)
             if recorder is not None:
-                recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
+                features = recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
+                dropblank_rows.append(dropblank_metrics(features, metrics, scenario))
             records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
             if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
                 raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
@@ -630,6 +907,25 @@ def export(cli):
         from tools.p4.analysis.modality_decomposition import analyze_export_dirs
 
         analyze_export_dirs([output_dir], output_dir / "probes" / "feat")
+    if save_features:
+        with (output_dir / "metrics_dropblank.tsv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDS, delimiter="\t")
+            writer.writeheader()
+            writer.writerows(dropblank_rows)
+        extra = {"checkpoint": _file_hashes(checkpoint_path),
+                 "adapter": _file_hashes(adapter_path) if adapter_path else None,
+                 "adapter_config": dict(acd_controller.config) if acd_controller is not None else {},
+                 "adapter_route": "only rgb_missing _encode_visual_tokens(modality=thermal)" if adapter_path else None,
+                 "feature_export": True, "dropblank_metrics": "metrics_dropblank.tsv"}
+        try:
+            if comparison_dir:
+                comparison = compare_exports(comparison_dir, output_dir, allow_acd_changes=bool(adapter_path))
+                extra["invariance_overall_pass"] = comparison["overall_pass"]
+        except Exception:
+            extra["invariance_overall_pass"] = False
+            raise
+        finally:
+            _write_opt_in_record(output_dir, cli, args, started, started_utc, device, extra)
     return summary
 
 
@@ -647,7 +943,11 @@ def build_parser():
     parser.add_argument("--train_state_scenarios", action="store_true",
                         help="Append six gallery degradations using the training _apply_mode definition")
     parser.add_argument("--save_modality_features", action="store_true",
-                        help="Observe original encodings and save exact pre-addition modality features")
+                        help="Save exact pre-addition features and extra metrics_dropblank.tsv; original metrics.tsv remains unchanged")
+    parser.add_argument("--acd_adapter", default=None,
+                        help="Load base-hash-verified ACD adapter, enabled only for rgb_missing IR; implicitly saves modality features")
+    parser.add_argument("--compare_export", default=None,
+                        help="Compare every feature key and metrics row against this export, write invariance.json, fail on unexpected changes; implicitly saves features")
     parser.add_argument("--batch_size", type=int, default=None, help="Evaluation loader batch size")
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", default=None)

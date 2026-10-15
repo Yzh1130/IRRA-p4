@@ -1,0 +1,4 @@
+# Immutable calib_protocol.py uses NumPy's platform default integer dtype.
+# NumPy 2 gives int64 on Windows, as required by torch.nn.functional.one_hot.
+numpy>=2.0; platform_system == "Windows"
+pandas

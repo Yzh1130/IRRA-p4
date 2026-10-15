@@ -1,0 +1,4 @@
+# Preserve the supplied protocol files byte-for-byte on every checkout.
+analysis/calib_protocol.py -text
+analysis/verify_joint_loss.py -text
+pack_feats.py -text
