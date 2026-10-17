@@ -28,6 +28,53 @@ from tools.p4.acd_lora import file_sha256, inject_lora, save_adapter
 from tools.p4.acd_losses import acd_loss
 
 
+MECHANISM_VARIANTS = ("Pull", "A1const", "A1shuf", "DCLbal")
+
+
+def load_ref_stats(path):
+    """Read the fixed full-batch teacher reference once, outside the step loop."""
+    if not path:
+        raise ValueError("A1const requires --ref_stats_json")
+    path = Path(path).resolve()
+    content = path.read_bytes()
+    statistics = json.loads(content)
+    value = statistics.get("ref_mean_b64") if isinstance(statistics, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("Reference statistics require a finite numeric ref_mean_b64")
+    if (statistics.get("complete_epoch") is False
+            or statistics.get("valid_as_full_epoch_reference") is False):
+        raise ValueError("A1const requires a full-epoch reference; a smoke/partial JSON cannot be used")
+    return {"path": str(path), "sha256": hashlib.sha256(content).hexdigest(),
+            "ref_mean_b64": float(value), "statistics": statistics}
+
+
+def _mechanism_run_options(cli, record):
+    """New variants have private state; legacy runs keep their original record."""
+    reference, shuffle = None, None
+    if cli.variant == "A1const":
+        source = load_ref_stats(getattr(cli, "ref_stats_json", None))
+        reference = source["ref_mean_b64"]
+        record.update(ref_mean_b64=reference, ref_stats_json=source)
+    if cli.variant == "A1shuf":
+        seed = int(getattr(cli, "shuffle_seed", 20261017))
+        shuffle = torch.Generator(device="cpu").manual_seed(seed)
+        record.setdefault("seeds", {})["shuffle_seed"] = seed
+        record["teacher_permutation_sha1"] = []
+    return reference, shuffle
+
+
+def _run_record_arguments(cli):
+    """Keep the legacy default argument record; record new options when active."""
+    arguments = vars(cli)
+    if (cli.variant not in MECHANISM_VARIANTS
+            and not getattr(cli, "mechanism_diagnostics", False)
+            and getattr(cli, "ref_stats_json", None) is None
+            and getattr(cli, "shuffle_seed", 20261017) == 20261017):
+        return {name: value for name, value in arguments.items()
+                if name not in {"ref_stats_json", "shuffle_seed", "mechanism_diagnostics"}}
+    return arguments
+
+
 def worker_init_seed(worker_id):
     """DataLoader's private generator supplies initial_seed, not global RNG."""
     seed = torch.initial_seed() % (2 ** 32)
@@ -103,6 +150,7 @@ def learning_rate_factor(step, total_steps, warmup_steps):
 
 def train_epochs(model, controller, loader, cli, output, record):
     """Shared core also exercised by synthetic tests; no development selection."""
+    reference, shuffle = _mechanism_run_options(cli, record)
     model.eval()
     parameters = list(controller.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=cli.lr, weight_decay=0.0)
@@ -138,8 +186,28 @@ def train_epochs(model, controller, loader, cli, output, record):
                 for group in optimizer.param_groups:
                     group["lr"] = lr
                 z_f, z_i = encode_training_batch(model, controller, batch)
-                loss, diagnostics = acd_loss(z_f.float(), z_i.float(), batch["pids"],
-                                             cli.variant, cli.a1_impl)
+                if cli.variant in MECHANISM_VARIANTS:
+                    from tools.p4.acd_losses import draw_teacher_permutation
+
+                    permutation = None
+                    if shuffle is not None:
+                        permutation = draw_teacher_permutation(z_i.shape[0], shuffle)
+                        if step < 20:
+                            record["teacher_permutation_sha1"].append({
+                                "step": step + 1, "sha1": hashlib.sha1(
+                                    permutation.contiguous().numpy().tobytes()).hexdigest()})
+                    loss, diagnostics = acd_loss(
+                        z_f.float(), z_i.float(), batch["pids"], cli.variant,
+                        cli.a1_impl, ref_mean=reference, permutation=permutation)
+                else:
+                    # Keep the original three-variant call and operation order.
+                    loss, diagnostics = acd_loss(z_f.float(), z_i.float(), batch["pids"],
+                                                 cli.variant, cli.a1_impl)
+                    if getattr(cli, "mechanism_diagnostics", False):
+                        from tools.p4.acd_losses import repulsion_diagnostics
+
+                        diagnostics.update(repulsion_diagnostics(
+                            z_f, z_i, batch["pids"], cli.variant))
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Nonfinite ACD loss at step {step + 1}")
                 loss.backward()
@@ -156,6 +224,8 @@ def train_epochs(model, controller, loader, cli, output, record):
                 if step <= 20 or step % 10 == 0:
                     values = {name: float(value) if torch.isfinite(value) else None
                               for name, value in diagnostics.items()}
+                    if "t2i_no_negative_rows" in values:
+                        values["t2i_no_negative_rows"] = int(values["t2i_no_negative_rows"])
                     values.update(step=step, epoch=epoch + 1, lr=lr,
                                   lora_gradient_norm=float(grad_norm),
                                   lora_parameter_norm=math.sqrt(sum(float(
@@ -266,7 +336,8 @@ def build_parser():
     parser.add_argument("--base_run", required=True)
     parser.add_argument("--root_dir", required=True)
     parser.add_argument("--dev_split_file", required=True)
-    parser.add_argument("--variant", required=True, choices=("A0", "A0bal", "A1"))
+    parser.add_argument("--variant", required=True,
+                        choices=("A0", "A0bal", "A1", *MECHANISM_VARIANTS))
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -276,6 +347,12 @@ def build_parser():
     parser.add_argument("--a1_impl", choices=("joint", "decomposed"), default="joint")
     parser.add_argument("--smoke_steps", type=int, default=0)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--ref_stats_json", default=None,
+                        help="A1const requires teacher_ref_stats JSON; reads ref_mean_b64")
+    parser.add_argument("--shuffle_seed", type=int, default=20261017,
+                        help="A1shuf private CPU permutation generator seed")
+    parser.add_argument("--mechanism_diagnostics", action="store_true",
+                        help="Opt in to repulsion-coefficient logs for legacy variants; new variants always log them")
     return parser
 
 
@@ -283,6 +360,9 @@ def main(argv=None):
     cli = build_parser().parse_args(argv)
     if cli.epochs <= 0 or cli.smoke_steps < 0 or cli.lr <= 0 or not math.isfinite(cli.lr):
         raise ValueError("epochs and lr must be positive; smoke_steps must be nonnegative")
+    if cli.variant == "A1const":
+        # Fail before constructing loaders/models or creating a run directory.
+        load_ref_stats(cli.ref_stats_json)
     output = Path(cli.output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing to overwrite a nonempty output directory: {output}")
@@ -291,7 +371,7 @@ def main(argv=None):
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=CODE_ROOT,
                                      text=True).strip()
     record = dict(schema_version=1, tool="train_acd", git_commit=commit,
-                  arguments=vars(cli), argv=list(sys.argv if argv is None else argv),
+                  arguments=_run_record_arguments(cli), argv=list(sys.argv if argv is None else argv),
                   seeds={"data_seed": cli.data_seed, "dataloader_seed": cli.data_seed,
                          "lora_init_seed": cli.lora_init_seed}, status="running",
                   precision="native frozen teacher and visual student / FP32 LoRA weight delta and loss",
