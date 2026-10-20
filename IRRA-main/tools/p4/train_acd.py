@@ -29,6 +29,37 @@ from tools.p4.acd_losses import acd_loss
 
 
 MECHANISM_VARIANTS = ("Pull", "A1const", "A1shuf", "DCLbal")
+CONTROL_VARIANTS = ("TempCE", "MarginCE", "QueueCE")
+
+
+def validate_control_options(cli):
+    """Reject invalid control options before creating any output directory."""
+    tau = getattr(cli, "t2i_tau", 0.07)
+    margin = getattr(cli, "t2i_margin", 0.2)
+    size = getattr(cli, "queue_size", 4096)
+    if not math.isfinite(tau) or tau <= 0:
+        raise ValueError("t2i_tau must be finite and positive")
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError("t2i_margin must be finite and nonnegative")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("queue_size must be a positive integer")
+
+
+def _control_run_options(cli, record):
+    """Controls opt in to metadata and, for QueueCE only, a fresh per-run FIFO."""
+    if cli.variant not in CONTROL_VARIANTS:
+        return None
+    validate_control_options(cli)
+    record.update(t2i_tau=getattr(cli, "t2i_tau", 0.07),
+                  t2i_margin=getattr(cli, "t2i_margin", 0.2),
+                  t2i_margin_logit=50.0 * getattr(cli, "t2i_margin", 0.2),
+                  queue_size=getattr(cli, "queue_size", 4096))
+    if cli.variant == "QueueCE":
+        from tools.p4.acd_queue import NegativeFeatureQueue
+
+        record["queue_len_at_loss"] = []
+        return NegativeFeatureQueue(record["queue_size"])
+    return None
 
 
 def load_ref_stats(path):
@@ -66,6 +97,14 @@ def _mechanism_run_options(cli, record):
 def _run_record_arguments(cli):
     """Keep the legacy default argument record; record new options when active."""
     arguments = vars(cli)
+    if (cli.variant not in CONTROL_VARIANTS
+            and getattr(cli, "t2i_tau", 0.07) == 0.07
+            and getattr(cli, "t2i_margin", 0.2) == 0.2
+            and getattr(cli, "queue_size", 4096) == 4096):
+        arguments = {name: value for name, value in arguments.items()
+                     if name not in {"t2i_tau", "t2i_margin", "queue_size"}}
+    elif cli.variant in CONTROL_VARIANTS:
+        return arguments
     if (cli.variant not in MECHANISM_VARIANTS
             and not getattr(cli, "mechanism_diagnostics", False)
             and getattr(cli, "ref_stats_json", None) is None
@@ -139,6 +178,19 @@ def encode_training_batch(model, controller, batch):
     return 50.0 * (text @ fused.t()), 50.0 * (text @ student.t())
 
 
+def encode_training_batch_with_features(model, controller, batch):
+    """Queue-only encoding, with exactly the original operation order."""
+    with controller.enabled(False), torch.no_grad():
+        text = F.normalize(model.encode_text_deterministic(batch["caption_ids"]).float(), dim=1)
+        rgb, ir, _, _, _, _ = model.encode_rgbt_global(
+            batch["images"], batch["thermal_images"])
+        fused = F.normalize(rgb.float() + ir.float(), dim=1)
+    with controller.enabled():
+        student = F.normalize(model.encode_image(
+            batch["thermal_images"], modality="thermal").float(), dim=1)
+    return 50.0 * (text @ fused.t()), 50.0 * (text @ student.t()), text, student
+
+
 def learning_rate_factor(step, total_steps, warmup_steps):
     if step < warmup_steps:
         return (step + 1) / warmup_steps
@@ -151,6 +203,7 @@ def learning_rate_factor(step, total_steps, warmup_steps):
 def train_epochs(model, controller, loader, cli, output, record):
     """Shared core also exercised by synthetic tests; no development selection."""
     reference, shuffle = _mechanism_run_options(cli, record)
+    queue = _control_run_options(cli, record)
     model.eval()
     parameters = list(controller.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=cli.lr, weight_decay=0.0)
@@ -185,8 +238,26 @@ def train_epochs(model, controller, loader, cli, output, record):
                 lr = cli.lr * learning_rate_factor(step, total_steps, len(loader))
                 for group in optimizer.param_groups:
                     group["lr"] = lr
-                z_f, z_i = encode_training_batch(model, controller, batch)
-                if cli.variant in MECHANISM_VARIANTS:
+                if cli.variant == "QueueCE":
+                    z_f, z_i, text, student = encode_training_batch_with_features(
+                        model, controller, batch)
+                else:
+                    z_f, z_i = encode_training_batch(model, controller, batch)
+                if cli.variant in CONTROL_VARIANTS:
+                    queue_logits, queue_pids = None, None
+                    if queue is not None:
+                        if len(queue):
+                            queue_logits = queue.logits(text, batch["pids"])
+                        queue_pids = queue.pids
+                        if step + 1 in {1, 2, 10, 64, 65, 74, target_steps}:
+                            record["queue_len_at_loss"].append({
+                                "step": step + 1, "queue_len": len(queue)})
+                    loss, diagnostics = acd_loss(
+                        z_f.float(), z_i.float(), batch["pids"], cli.variant,
+                        cli.a1_impl, t2i_tau=getattr(cli, "t2i_tau", 0.07),
+                        t2i_margin=getattr(cli, "t2i_margin", 0.2),
+                        queue_logits=queue_logits, queue_pids=queue_pids)
+                elif cli.variant in MECHANISM_VARIANTS:
                     from tools.p4.acd_losses import draw_teacher_permutation
 
                     permutation = None
@@ -216,6 +287,10 @@ def train_epochs(model, controller, loader, cli, output, record):
                     raise RuntimeError("A frozen base parameter acquired a gradient")
                 grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
                 optimizer.step()
+                if queue is not None:
+                    # Enqueue the pre-update embeddings only after this step's
+                    # loss/backward/update, so a batch never queues itself.
+                    queue.enqueue(student, batch["pids"])
                 step += 1
                 loss_sum += float(loss.detach())
                 batches += 1
@@ -226,6 +301,8 @@ def train_epochs(model, controller, loader, cli, output, record):
                               for name, value in diagnostics.items()}
                     if "t2i_no_negative_rows" in values:
                         values["t2i_no_negative_rows"] = int(values["t2i_no_negative_rows"])
+                    if "queue_len" in values:
+                        values["queue_len"] = int(values["queue_len"])
                     values.update(step=step, epoch=epoch + 1, lr=lr,
                                   lora_gradient_norm=float(grad_norm),
                                   lora_parameter_norm=math.sqrt(sum(float(
@@ -331,13 +408,25 @@ def prepare_training(cli):
     }
 
 
+class _ControlArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        cli = super().parse_args(args, namespace)
+        # Keep the old seven variants' default Namespace (and its recorded
+        # arguments) byte compatible. Nondefault values remain for validation.
+        if (cli.variant not in CONTROL_VARIANTS and cli.t2i_tau == 0.07
+                and cli.t2i_margin == 0.2 and cli.queue_size == 4096):
+            for name in ("t2i_tau", "t2i_margin", "queue_size"):
+                delattr(cli, name)
+        return cli
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _ControlArgumentParser(description=__doc__)
     parser.add_argument("--base_run", required=True)
     parser.add_argument("--root_dir", required=True)
     parser.add_argument("--dev_split_file", required=True)
     parser.add_argument("--variant", required=True,
-                        choices=("A0", "A0bal", "A1", *MECHANISM_VARIANTS))
+                        choices=("A0", "A0bal", "A1", *MECHANISM_VARIANTS, *CONTROL_VARIANTS))
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
@@ -353,6 +442,12 @@ def build_parser():
                         help="A1shuf private CPU permutation generator seed")
     parser.add_argument("--mechanism_diagnostics", action="store_true",
                         help="Opt in to repulsion-coefficient logs for legacy variants; new variants always log them")
+    parser.add_argument("--t2i_tau", type=float, default=0.07,
+                        help="TempCE temperature (default: 0.07; base temperature is 0.02)")
+    parser.add_argument("--t2i_margin", type=float, default=0.2,
+                        help="MarginCE positive margin in cosine units (default: 0.2; logits: 50*m)")
+    parser.add_argument("--queue_size", type=int, default=4096,
+                        help="QueueCE FIFO capacity in image features (default: 4096)")
     return parser
 
 
@@ -360,6 +455,7 @@ def main(argv=None):
     cli = build_parser().parse_args(argv)
     if cli.epochs <= 0 or cli.smoke_steps < 0 or cli.lr <= 0 or not math.isfinite(cli.lr):
         raise ValueError("epochs and lr must be positive; smoke_steps must be nonnegative")
+    validate_control_options(cli)
     if cli.variant == "A1const":
         # Fail before constructing loaders/models or creating a run directory.
         load_ref_stats(cli.ref_stats_json)

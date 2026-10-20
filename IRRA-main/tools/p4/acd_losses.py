@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 
 MECHANISM_VARIANTS = ("Pull", "A1const", "A1shuf", "DCLbal")
+CONTROL_VARIANTS = ("TempCE", "MarginCE", "QueueCE")
 
 
 def draw_teacher_permutation(batch_size, generator):
@@ -157,8 +158,98 @@ def joint_t2i(z_f, z_i, pids, implementation="joint"):
     return loss, correction
 
 
+def control_t2i(z_i, pids, variant, *, t2i_tau=0.07, t2i_margin=0.2,
+                queue_logits=None, queue_pids=None):
+    """Pull controls: fixed 0.5 positive coefficient, alternate denominators.
+
+    Queue logits are always detached here, including when supplied by an
+    attached caller. Same-PID queue entries are excluded from the denominator.
+    """
+    if variant not in CONTROL_VARIANTS:
+        raise ValueError("Unknown control variant: " + str(variant))
+    positive, target = _mechanism_inputs(z_i, z_i, pids)
+    if variant == "TempCE":
+        if not math.isfinite(float(t2i_tau)) or float(t2i_tau) <= 0:
+            raise ValueError("t2i_tau must be finite and positive")
+        scaled = z_i * (0.02 / float(t2i_tau))
+        loss = 0.5 * (float(t2i_tau) / 0.02) * uniform_ce(scaled, pids)
+        probabilities = scaled.detach().softmax(dim=1)
+    elif variant == "MarginCE":
+        if not math.isfinite(float(t2i_margin)) or float(t2i_margin) < 0:
+            raise ValueError("t2i_margin must be finite and nonnegative")
+        shifted = z_i - (50.0 * float(t2i_margin)) * positive.to(z_i.dtype)
+        loss = 0.5 * uniform_ce(shifted, pids)
+        probabilities = shifted.detach().softmax(dim=1)
+    else:
+        if queue_logits is None:
+            if queue_pids is not None and queue_pids.numel():
+                raise ValueError("queue_pids require queue_logits")
+            queued = z_i.new_empty((z_i.shape[0], 0))
+        else:
+            if (not isinstance(queue_logits, torch.Tensor)
+                    or queue_logits.ndim != 2
+                    or queue_logits.shape[0] != z_i.shape[0]
+                    or not queue_logits.is_floating_point()):
+                raise ValueError("Expected floating B by K queue logits")
+            if (queue_pids is None or queue_pids.numel() != queue_logits.shape[1]):
+                raise ValueError("Expected one PID per queue column")
+            queued = queue_logits.detach().to(device=z_i.device, dtype=z_i.dtype)
+            labels = pids.reshape(-1).to(z_i.device)
+            queue_labels = queue_pids.reshape(-1).to(z_i.device)
+            queued = queued.masked_fill(labels[:, None].eq(queue_labels[None, :]),
+                                        -torch.inf)
+        # Keep the empty-queue calculation exactly on A0bal's original path.
+        if queued.shape[1] == 0:
+            loss = 0.5 * uniform_ce(z_i, pids)
+        else:
+            denominator = torch.logsumexp(torch.cat((z_i, queued), dim=1), dim=1)
+            loss = 0.5 * (denominator - (target * z_i).sum(dim=1)).mean()
+        probabilities = torch.cat((z_i.detach(), queued), dim=1).softmax(dim=1)
+    batch_probabilities = probabilities[:, :z_i.shape[1]]
+    diagnostics = {
+        "t2i_pos_prob_mean": (batch_probabilities * positive).sum(dim=1).mean(),
+        "t2i_batch_neg_mass_mean": (batch_probabilities * ~positive).sum(dim=1).mean(),
+    }
+    if variant == "QueueCE":
+        diagnostics["t2i_queue_mass_mean"] = probabilities[:, z_i.shape[1]:].sum(dim=1).mean()
+        diagnostics["queue_len"] = z_i.new_tensor(queued.shape[1], dtype=torch.int64)
+    return loss, diagnostics
+
+
+def _control_acd_loss(z_f, z_i, pids, variant, a1_impl, t2i_tau, t2i_margin,
+                      queue_logits, queue_pids):
+    t2i, extra = control_t2i(z_i, pids, variant, t2i_tau=t2i_tau,
+                            t2i_margin=t2i_margin, queue_logits=queue_logits,
+                            queue_pids=queue_pids)
+    # Match r10-mech diagnostics: these remain the original 50-scale losses.
+    l_i_t2i = uniform_ce(z_i, pids)
+    l_i_i2t = uniform_ce(z_i.t(), pids)
+    l_f = uniform_ce(z_f.detach(), pids)
+    _, correction = joint_t2i(z_f, z_i, pids, a1_impl)
+    total = t2i + l_i_i2t
+    positive, _ = _mechanism_inputs(z_f, z_i, pids)
+    negative = z_i.detach().masked_fill(positive, -torch.inf).max(dim=1).values
+    finite = torch.isfinite(negative)
+    diagnostics = {
+        "loss": total.detach(), "l_I_t2i": l_i_t2i.detach(),
+        "l_I_i2t": l_i_i2t.detach(), "l_F": l_f.detach(),
+        "log2cosh": correction.detach(),
+        "pi_I": torch.sigmoid(torch.logsumexp(z_i.detach(), dim=1)
+                              - torch.logsumexp(z_f.detach(), dim=1)).mean(),
+        "student_positive_logit_mean": z_i.detach()[positive].mean(),
+        "student_strongest_negative_logit_mean": negative[finite].mean()
+        if finite.any() else z_i.new_tensor(float("nan")),
+    }
+    diagnostics.update(extra)
+    return total, diagnostics
+
+
 def acd_loss(z_f, z_i, pids, variant, a1_impl="joint", *, ref_mean=None,
-             permutation=None):
+             permutation=None, t2i_tau=0.07, t2i_margin=0.2,
+             queue_logits=None, queue_pids=None):
+    if variant in CONTROL_VARIANTS:
+        return _control_acd_loss(z_f, z_i, pids, variant, a1_impl,
+                                 t2i_tau, t2i_margin, queue_logits, queue_pids)
     if variant in MECHANISM_VARIANTS:
         return _mechanism_acd_loss(z_f, z_i, pids, variant, a1_impl,
                                    ref_mean, permutation)
