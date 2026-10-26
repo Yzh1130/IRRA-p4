@@ -86,6 +86,56 @@ def _test_provenance(data):
             "test_records": data["test_records"], "test_captions": data["test_captions"]}
 
 
+def ap_tie_bounds(score_payload):
+    """Mean AP (percent) with exactly tied scores ordered worst and best for each query.
+
+    An exact float tie between a positive and a negative gallery item makes AP depend on
+    the sort implementation: the Evaluator sorts on the GPU, per_query_records on the CPU.
+    Returns (worst, best, number of queries whose AP depends on the tie order). Labels and
+    order must already have been verified by per_query_records.
+    """
+    import numpy as np
+
+    sim = score_payload["sim"].detach().cpu().double().numpy()
+    qids = score_payload["txt_pids"].detach().cpu().long().view(-1).numpy()
+    gids = score_payload["img_pids"].detach().cpu().long().view(-1).numpy()
+    best, worst, tied = [], [], 0
+    for row, qid in zip(sim, qids):
+        positive = gids == qid
+        values = []
+        for later in (~positive, positive):   # best: positives first among ties; worst: positives last
+            hits = np.flatnonzero(positive[np.lexsort((later, -row))]) + 1
+            values.append(float(np.mean(np.arange(1, len(hits) + 1) / hits)))
+        best.append(values[0])
+        worst.append(values[1])
+        tied += values[0] != values[1]
+    return 100.0 * float(np.mean(worst)), 100.0 * float(np.mean(best)), int(tied)
+
+
+def check_per_query_ap(records, score_payload, metrics, scenario, split, logger, tie_checks):
+    """Per-query AP must reproduce the Evaluator mAP; exact score ties may only move it within their bounds.
+
+    Development split: unchanged when the original 2e-4 check passes (no extra output).
+    Official test split: tie statistics are always recorded in tie_checks.
+    """
+    mean_ap = sum(row["AP"] for row in records) / len(records) * 100
+    evaluator = float(metrics["mAP"])
+    strict = abs(mean_ap - evaluator) <= 2e-4
+    if strict and split != "test":
+        return
+    worst, best, tied = ap_tie_bounds(score_payload)
+    if not strict and not (tied > 0 and worst - 2e-4 <= evaluator <= best + 2e-4):
+        raise ValueError(
+            f"Per-query AP disagrees with existing Evaluator mAP for {scenario}: per-query {mean_ap:.6f}, "
+            f"tie bounds [{worst:.6f}, {best:.6f}] over {tied} tie-dependent queries, Evaluator {evaluator:.6f}")
+    if not strict:
+        logger.info("[P4_EXPORT_TIE] scenario=%s tie_dependent_queries=%d per_query_mAP=%.6f bounds=[%.6f, %.6f] evaluator_mAP=%.6f",
+                    scenario, tied, mean_ap, worst, best, evaluator)
+    if split == "test":
+        tie_checks[scenario] = {"tie_dependent_queries": tied, "per_query_mean_ap": mean_ap,
+                                "ap_bounds": [worst, best], "evaluator_map": evaluator}
+
+
 def export_split(cli):
     _refuse_existing_output(cli.output_dir)
     # Deferred imports keep CSV/lexicon/bootstrap helpers independently CPU testable.
@@ -199,6 +249,7 @@ def export_split(cli):
         dev_data["gallery_annotation_indices"] = [i for i, _ in selected]
         dev_data["gallery_file_paths"] = [a["file_path"] for _, a in selected]
     metric_rows, query_rows, train_state_records, dropblank_rows = [], [], {}, []
+    tie_checks = {}
     for scenario, mode, strength, kernel in CORE_SCENARIOS:
         args.eval_degrade_mode = mode
         args.eval_degrade_strength = strength
@@ -217,8 +268,7 @@ def export_split(cli):
             features = recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
             dropblank_rows.append(dropblank_metrics(features, metrics, scenario))
         records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
-        if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
-            raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
+        check_per_query_ap(records, payload, metrics, scenario, cli.split, logger, tie_checks)
         query_rows.extend(records)
         logger.info("[P4_EXPORT] scenario=%s R1=%.6f mAP=%.6f", scenario, metrics["R1"], metrics["mAP"])
     if bool(getattr(cli, "train_state_scenarios", False)):
@@ -245,8 +295,7 @@ def export_split(cli):
                 features = recorder.save(output_dir / "features" / f"{scenario}.pt", payload, dev_data, scenario)
                 dropblank_rows.append(dropblank_metrics(features, metrics, scenario))
             records = per_query_records(payload, dev_data, scenario, color_words, stopwords)
-            if abs(sum(row["AP"] for row in records) / len(records) * 100 - metrics["mAP"]) > 2e-4:
-                raise ValueError(f"Per-query AP disagrees with existing Evaluator mAP for {scenario}")
+            check_per_query_ap(records, payload, metrics, scenario, cli.split, logger, tie_checks)
             query_rows.extend(records)
             logger.info("[P4_EXPORT] scenario=%s R1=%.6f mAP=%.6f", scenario, metrics["R1"], metrics["mAP"])
     provenance = {
@@ -264,6 +313,7 @@ def export_split(cli):
     }
     if cli.split == "test":
         provenance.update(_test_provenance(dev_data))
+        provenance["ap_tie_check"] = tie_checks
     if train_state_records:
         provenance["train_state_eval_degrade_seed"] = int(cli.eval_degrade_seed)
         provenance["training_state_degradation"] = train_state_records
@@ -293,6 +343,7 @@ def export_split(cli):
                  "feature_export": True, "dropblank_metrics": "metrics_dropblank.tsv"}
         if cli.split == "test":
             extra.update(_test_provenance(dev_data))
+            extra["ap_tie_check"] = tie_checks
         try:
             if comparison_dir:
                 comparison = compare_exports(comparison_dir, output_dir, allow_acd_changes=bool(adapter_path))

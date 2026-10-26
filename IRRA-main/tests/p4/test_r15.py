@@ -669,5 +669,72 @@ class R15ExportUnitTests(r15_unittest.TestCase):
                     self.assertEqual(before[name], after[name])
 
 
+class R15TieAwareCheckTests(r15_unittest.TestCase):
+    """Round-15 fix: exact score ties may move the CPU per-query mAP only within their bounds."""
+
+    @staticmethod
+    def _payload(rows, txt_pids, img_pids):
+        return {"sim": r15_torch.tensor(rows, dtype=r15_torch.float32),
+                "txt_pids": r15_torch.tensor(txt_pids, dtype=r15_torch.long),
+                "img_pids": r15_torch.tensor(img_pids, dtype=r15_torch.long)}
+
+    def test_05i_tie_bounds_hand_examples(self):
+        tied = self._payload([[0.5, 0.5, 0.1]], [0], [0, 1, 2])
+        self.assertEqual(r15_split_exporter.ap_tie_bounds(tied), (50.0, 100.0, 1))
+        untied = self._payload([[0.9, 0.5, 0.1]], [0], [0, 1, 2])
+        self.assertEqual(r15_split_exporter.ap_tie_bounds(untied), (100.0, 100.0, 0))
+        two = self._payload([[0.7, 0.7, 0.7, 0.1]], [0], [0, 1, 0, 2])   # positives at ties: best ranks 1,2; worst 2,3
+        worst, best, n = r15_split_exporter.ap_tie_bounds(two)
+        self.assertAlmostEqual(best, 100.0, places=12)
+        self.assertAlmostEqual(worst, 100.0 * (1 / 2 + 2 / 3) / 2, places=12)
+        self.assertEqual(n, 1)
+
+    def test_05j_check_accepts_ties_within_bounds_and_rejects_others(self):
+        payload = self._payload([[0.5, 0.5, 0.1], [0.1, 0.9, 0.2]], [0, 1], [0, 1, 2])   # query 0 tied; bounds [75, 100]
+        pessimistic = [{"AP": 0.5}, {"AP": 1.0}]
+        for split in ("test", "dev"):
+            with self.subTest(split=split):
+                logger, ties = r15_MagicMock(), {}
+                r15_split_exporter.check_per_query_ap(pessimistic, payload, {"mAP": 100.0}, "rgb_blur_k7", split, logger, ties)
+                self.assertTrue(logger.info.called)
+                if split == "test":
+                    self.assertEqual(ties["rgb_blur_k7"], {"tie_dependent_queries": 1, "per_query_mean_ap": 75.0,
+                                                           "ap_bounds": [75.0, 100.0], "evaluator_map": 100.0})
+                else:
+                    self.assertEqual(ties, {})
+                with self.assertRaisesRegex(ValueError, "Per-query AP disagrees.*tie bounds"):
+                    r15_split_exporter.check_per_query_ap(pessimistic, payload, {"mAP": 100.5}, "x", split, logger, {})
+        untied = self._payload([[0.9, 0.5, 0.1]], [0], [0, 1, 2])
+        for split in ("test", "dev"):
+            with self.subTest(split=split, case="untied mismatch"), self.assertRaisesRegex(ValueError, "Per-query AP disagrees"):
+                r15_split_exporter.check_per_query_ap([{"AP": 1.0}], untied, {"mAP": 99.0}, "x", split, r15_MagicMock(), {})
+
+    def test_05k_dev_strict_pass_adds_nothing_and_test_records_zero_ties(self):
+        payload = self._payload([[0.9, 0.5, 0.1]], [0], [0, 1, 2])
+        logger, ties = r15_MagicMock(), {}
+        with r15_patch.object(r15_split_exporter, "ap_tie_bounds") as bounds:
+            r15_split_exporter.check_per_query_ap([{"AP": 1.0}], payload, {"mAP": 100.0}, "clean", "dev", logger, ties)
+            bounds.assert_not_called()
+        self.assertEqual(ties, {})
+        self.assertFalse(logger.info.called)
+        r15_split_exporter.check_per_query_ap([{"AP": 1.0}], payload, {"mAP": 100.0}, "clean", "test", logger, ties)
+        self.assertEqual(ties["clean"]["tie_dependent_queries"], 0)
+        self.assertFalse(logger.info.called)
+
+    def test_05l_mocked_exports_record_tie_check_only_for_test(self):
+        for split in ("dev", "test"):
+            with self.subTest(split=split), r15_tempfile.TemporaryDirectory() as temporary:
+                fixture = _r15_export_fixture(r15_Path(temporary))
+                cli, _, _, summary = _r15_mock_export(fixture, split)
+                record = r15_json.loads((r15_Path(cli.output_dir) / "export_run_record.json").read_text(encoding="utf-8"))
+                if split == "dev":
+                    self.assertNotIn("ap_tie_check", record)
+                    self.assertNotIn("ap_tie_check", summary["provenance"])
+                else:
+                    self.assertEqual(len(record["ap_tie_check"]), 11)
+                    self.assertTrue(all(v["tie_dependent_queries"] == 0 for v in record["ap_tie_check"].values()))
+                    self.assertEqual(summary["provenance"]["ap_tie_check"], record["ap_tie_check"])
+
+
 if __name__ == "__main__":
     unittest.main()
