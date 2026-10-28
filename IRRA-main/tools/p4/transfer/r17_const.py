@@ -5,7 +5,9 @@
 #   QE+NoGate : the same with g = 1 (capped to r_max inside post_update)
 #   --fixed_selection : the round-15 front-end configuration is reused (never re-selected); only that configuration is calibrated
 #   --perq_ext        : per-query records with explicit keys (fit seed, evaluation set, mixture, assignment seed, method)
-#   --timing          : stage timing with warm-up and repeats on cached features (no retrieval metric inside the timed code)
+#   --timing          : stage timing with warm-up and repeats on cached features (no retrieval metric inside the timed code); every
+#                       stage carries its boundary (TIMING_SCOPE); per-stage allocation peaks (tracemalloc) are reported apart from
+#                       the whole-process peak RSS, which is not the memory of any single module
 #   --kappa_a_fixed / --wccn_shrink / --wccn_shrink_eval : development sensitivity of the association temperature and the WCCN map
 #   selections whose methods are not run are skipped (selection consumes no random numbers, so every other output is unchanged)
 # With none of the new options and the round-15 method list, the outputs are those of r15_test.py (tests/p4/test_r17.py checks this).
@@ -451,10 +453,48 @@ def _bench(fn, warm=2, reps=10):
     ts = np.array(ts)
     return dict(median_s=float(np.median(ts)), p25_s=float(np.percentile(ts, 25)), p75_s=float(np.percentile(ts, 75)), reps=reps, warmup=warm)
 
+TIMING_SCOPE = {   # what each timed stage contains; inputs are cached arrays, so image/text encoders and data loading are never timed
+    'fit_platt': 'offline: per-availability Platt fits on the development fit gallery',
+    'fit_wccn': 'offline: WCCN (shrunk LDA) map on the training-identity IR features',
+    'fit_episode_features': 'offline: gallery statistics of every development episode',
+    'fit_gate_logreg': 'offline: logistic gate fit',
+    'fit_kappa_a': 'offline: association temperature fit',
+    'online_link_graph': 'IR link graph: WCCN projection of the cached IR features of IR-bearing items + Gram matrix',
+    'online_bstar_scoring': 'complete B* front end from cached encoder outputs (raw text features of the queries, raw RGB/IR features of '
+                            'each item in its state): drop-blank embedding, L2 normalisation, query-item cosine, per-availability Platt, sigmoid',
+    'online_bstar_sigmoid_only': 'ONLY the final sigmoid of precomputed calibrated logits; not the B* front end',
+    'online_qedba_after_bstar': 'QE-DBA given the B* posterior and the item embeddings: alpha-DBA, query expansion, re-scoring, '
+                                'per-availability calibration, sigmoid',
+    'online_frontend_full': 'whole front end from cached encoder outputs: online_bstar_scoring followed by QE-DBA',
+    'online_gate_and_assoc': 'adaptive gate (gallery statistics, gate features, logistic) and association softmax, given the link graph',
+    'online_assoc_only': 'association softmax only (all the constant gain needs), given the link graph',
+    'online_transfer_gate': "transfer p' = [I - D_r + D_r A] p with the adaptive gate, given gate, association and front-end posterior",
+    'online_transfer_const': 'transfer with the constant gain, given association and front-end posterior',
+    'online_sort': 'final ranking (lexsort with the B* tie-break)'}
+
+def _peak_alloc_mb(fn):
+    """peak of the Python/NumPy allocations made during one call of fn, in MiB (tracemalloc): arrays that exist before the call, BLAS
+    work buffers and other allocations outside Python's and NumPy's allocators are not counted"""
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        fn(); return round(tracemalloc.get_traced_memory()[1] / 2 ** 20, 3)
+    finally:
+        tracemalloc.stop()
+
+def _mb(*xs): return round(sum(x.nbytes for x in xs) / 2 ** 20, 3)
+
 def r17_timing(ss, f):
     """fitting stages on the development identities, then the online stages on one evaluation gallery (first mixture other than M0,
-    first assignment seed). Uses the module-level state of the current fit (the main loop runs at module level)."""
-    import os, platform, resource
+    first assignment seed). Uses the module-level state of the current fit (the main loop runs at module level).
+    Boundaries: TIMING_SCOPE. Memory: module_memory = per-stage inputs and tracemalloc allocation peak of one call;
+    process_peak_rss_mb = peak resident memory of the whole Python process so far (archives, every fitted model and method's matrices,
+    runtime), which is not the memory of the transfer module."""
+    import os, platform
+    try:
+        import resource
+    except ImportError:   # Windows has no resource module: the process peak RSS is not recorded, every timed stage still runs
+        resource = None
     out = dict(split=int(ss), fold=int(f))
     out['fit_platt'] = _bench(lambda: {a: fit_affine(Sst[st_][np.ix_(qf, gf)].ravel(), POS[np.ix_(qf, gf)].ravel().astype(float))
                                        for a, st_ in {0: 'clean', 1: 'rgb_missing', 2: 'ir_missing'}.items()}, 1, 3)
@@ -476,6 +516,23 @@ def r17_timing(ss, f):
     def _link():
         U = np.where(hasIR[:, None], proj(X), 0); return U @ U.T
     out['online_link_graph'] = _bench(_link, 2, 10)
+    # complete B* front end from cached encoder outputs (the drop-blank embedding of every item in its state, then calibrated cosine)
+    TQr_ = zb['clean/text_features'][qe].astype(np.float64)
+    FRr_ = np.zeros((len(ge), TQr_.shape[1])); FIr_ = np.zeros_like(FRr_)
+    for s_ in np.unique(st):
+        cols_ = np.where(st == s_)[0]; FRr_[cols_] = ga(s_, 'f_rgb')[ge[cols_]]; FIr_[cols_] = ga(s_, 'f_ir')[ge[cols_]]
+    m1_, m2_ = av == 1, av == 2; m0_ = ~(m1_ | m2_)
+    def _bstar_full(ret_E=False):
+        E_ = np.empty_like(FRr_)
+        E_[m1_] = l2n(FIr_[m1_]); E_[m2_] = l2n(FRr_[m2_]); E_[m0_] = l2n(FRr_[m0_] + FIr_[m0_])
+        S_ = l2n(TQr_) @ E_.T; L_ = np.empty_like(S_)
+        for a_ in np.unique(av):
+            c_ = av == a_; L_[:, c_] = cal_logit(cal[a_], S_[:, c_])
+        P_ = sig(L_)
+        return (P_, E_) if ret_E else P_
+    out['online_bstar_scoring'] = _bench(_bstar_full, 2, 10)
+    out['check_bstar_scoring_max_abs_diff'] = float(np.abs(_bstar_full() - G['P']).max())   # the timed code is the B* used by every method
+    out['online_bstar_sigmoid_only'] = _bench(lambda: sig(G['L']), 2, 10)
     def _gate_assoc():
         g_ = gallery_struct(C, av); c2_ = (np.array(gal_ctx2(C, av)) - mu_c2) / sd_c2
         r_ = src2N.predict_proba(np.c_[Z(g_['X'])[:, [0, 5]], np.tile(c2_, (len(g_['J']), 1))])[:, 1]
@@ -486,19 +543,33 @@ def r17_timing(ss, f):
     out['online_gate_and_assoc'] = _bench(_gate_assoc, 2, 10)
     out['online_assoc_only'] = _bench(_const_assoc, 2, 10)
     g_, r_, A_ = _gate_assoc(); J_, Fi_ = g_['J'], g_['Fi']
-    out['online_frontend_bstar'] = _bench(lambda: sig(G['L']), 2, 10)
-    Py = G['P']
+    Py = G['P']; mem = {}
     if 'QE-DBA' in chosen:
         calq_ = cal_qe[('emb', chosen['QE-DBA'])]
-        out['online_frontend_qedba'] = _bench(lambda: qedba_post(G, chosen['QE-DBA'], calq_), 2, 5)
+        out['online_qedba_after_bstar'] = _bench(lambda: qedba_post(G, chosen['QE-DBA'], calq_), 2, 5)
+        def _frontend_full():
+            P_, E_ = _bstar_full(True); return qedba_post(dict(qi=qe, P=P_, E=E_, av=av), chosen['QE-DBA'], calq_)
+        out['online_frontend_full'] = _bench(_frontend_full, 2, 5)
         Py = qedba_post(G, chosen['QE-DBA'], calq_)
+        out['check_frontend_full_max_abs_diff'] = float(np.abs(_frontend_full() - Py).max())
+        mem['qedba_after_bstar'] = dict(inputs_mb=_mb(G['P'], G['E']), alloc_peak_mb=_peak_alloc_mb(lambda: qedba_post(G, chosen['QE-DBA'], calq_)))
+        mem['frontend_full'] = dict(inputs_mb=_mb(TQr_, FRr_, FIr_), alloc_peak_mb=_peak_alloc_mb(_frontend_full))
     W_ = r_[:, None] * A_; gm_ = float(chosen.get('QE+Const', 0.5))
     out['online_transfer_gate'] = _bench(lambda: post_update(Py, J_, Fi_, W_), 3, 20)
     out['online_transfer_const'] = _bench(lambda: post_update(Py, J_, Fi_, gm_ * A_), 3, 20)
     Pn = post_update(Py, J_, Fi_, W_)
     out['online_sort'] = _bench(lambda: order_rows(Pn, G['P']), 2, 10)
+    mem['link_graph'] = dict(inputs_mb=_mb(X), alloc_peak_mb=_peak_alloc_mb(_link))
+    mem['bstar_scoring'] = dict(inputs_mb=_mb(TQr_, FRr_, FIr_), alloc_peak_mb=_peak_alloc_mb(_bstar_full))
+    mem['gate_and_assoc'] = dict(inputs_mb=_mb(C), alloc_peak_mb=_peak_alloc_mb(_gate_assoc))
+    mem['assoc_only'] = dict(inputs_mb=_mb(C), alloc_peak_mb=_peak_alloc_mb(_const_assoc))
+    mem['transfer_gate'] = dict(inputs_mb=_mb(Py, W_), alloc_peak_mb=_peak_alloc_mb(lambda: post_update(Py, J_, Fi_, W_)))
+    mem['transfer_const'] = dict(inputs_mb=_mb(Py, A_), alloc_peak_mb=_peak_alloc_mb(lambda: post_update(Py, J_, Fi_, gm_ * A_)))
+    mem['sort'] = dict(inputs_mb=_mb(Pn, G['P']), alloc_peak_mb=_peak_alloc_mb(lambda: order_rows(Pn, G['P'])))
+    out['module_memory'] = mem
+    out['scope'] = {k: v for k, v in TIMING_SCOPE.items() if k in out}
     out['shape'] = dict(evalset=ename, mixture=mx, aseed=int(asd), n_queries=int(len(qe)), n_items=int(len(ge)), n_ir_only=int(len(J_)), n_complete=int(len(Fi_)))
-    out['peak_rss_mb'] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+    out['process_peak_rss_mb'] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1) if resource else None   # Linux: KiB
     out['env'] = dict(platform=platform.platform(), processor=platform.processor(), cpu_count=os.cpu_count(),
                       affinity=len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None, numpy=np.__version__,
                       dtype='float64', torch_threads=torch.get_num_threads(),

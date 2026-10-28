@@ -14,18 +14,27 @@ Sections:
   [locality]      top-1 changes relative to QE-DBA, split by the availability of QE-DBA's top-1 item
   [harm/help]     rank-1 flips relative to QE-DBA with explicit denominators
   [top-5]         R5 losses of QE+M relative to QE-DBA and the composition of the new top-5 (IR-only negatives)
-  [timing]        stage timing from --timing (medians over fits)
-usage: python -B r17_judge.py --r17_root DIR --r15_root DIR --seeds 101 102 103 --out JSON [--devsens_root DIR]
+  [timing]        stage timing from --timing (medians over fits), each stage with its boundary; per-stage allocation peaks apart
+                  from the whole-process peak RSS
+If [structure] or [reproduction] fails (or a run was made by another r17_const.py than --expect_script_sha), the report stops there:
+status INVALID, exit 3, and no table pairs the new control with the frozen results.
+--devsens_only: only the [dev sensitivity] section (development half galleries), written to its own report; INVALID (exit 3) if an
+expected directory (--devsens_expect) is missing or incomplete.
+usage: python -B r17_judge.py --r17_root DIR --r15_root DIR --seeds 101 102 103 --out JSON [--expect_script_sha SHA256]
+       python -B r17_judge.py --devsens_only --devsens_root DIR --devsens_expect ref_s101 ... --out JSON
 """
 import argparse, glob, json, os, pickle, re
 import numpy as np, pandas as pd
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--r17_root', required=True); ap.add_argument('--r15_root', required=True)
+ap.add_argument('--r17_root'); ap.add_argument('--r15_root')
 ap.add_argument('--seeds', type=int, nargs='+', default=[101, 102, 103]); ap.add_argument('--fits', type=int, nargs='+', default=[7001, 7002, 7003])
 ap.add_argument('--boot', type=int, default=4000); ap.add_argument('--out', required=True); ap.add_argument('--devsens_root', default=None)
-ap.add_argument('--tol', type=float, default=1e-6)
+ap.add_argument('--tol', type=float, default=1e-6); ap.add_argument('--expect_script_sha', default=None)
+ap.add_argument('--devsens_only', action='store_true'); ap.add_argument('--devsens_expect', nargs='*', default=None)
 a = ap.parse_args()
+if a.devsens_only and not a.devsens_root: raise SystemExit('--devsens_only requires --devsens_root')
+if not a.devsens_only and not (a.r17_root and a.r15_root): raise SystemExit('--r17_root and --r15_root are required')
 
 A_GRP = ['M4', 'M6c', 'M1g', 'M4c60', 'M9']; B_GRP = ['M5e', 'M5f', 'M4id']
 SHARED = ['B*', 'QE-DBA', 'QE+M', 'QE+CAET', 'QE+SRC2f', 'QE+EM']
@@ -71,8 +80,46 @@ def star(lo, hi): return '*' if (lo > 0 or hi < 0) else ' '
 
 
 out_lines = []
-def P(*x): out_lines.append(' '.join(str(v) for v in x))
+def P(*x):   # printed at once, so a crash later in the report still leaves every section written so far
+    line = ' '.join(str(v) for v in x); out_lines.append(line); print(line, flush=True)
 
+
+def finish(valid, problems):
+    """status line, JSON report and exit: 0 = VALID, 3 = INVALID"""
+    P('\n[status] ' + ('VALID: ' + ('development sensitivity report complete' if a.devsens_only else 'structure and reproduction checks passed')
+                       if valid else 'INVALID: ' + '; '.join(problems)))
+    REPORT['problems'] = problems; REPORT['valid'] = bool(valid)
+    json.dump(REPORT, open(a.out, 'w'), indent=1, default=str)
+    raise SystemExit(0 if valid else 3)
+
+
+def devsens_section():
+    """development sensitivity on the development half galleries (B* front end, transfer layer A-2f-ctxn); returns the problems found"""
+    P('\n[dev sensitivity] development half galleries, B* front end, MAIN (A-2f-ctxn) - B*, cell means over 5 splits x 2 folds x assignment seeds')
+    REPORT['devsens'] = {}; probs = []
+    dirs = {os.path.basename(d): d for d in sorted(glob.glob(os.path.join(a.devsens_root, '*'))) if os.path.isdir(d) and not os.path.basename(d).startswith('_')}
+    for name in (a.devsens_expect if a.devsens_expect is not None else sorted(dirs)):
+        d = dirs.get(name)
+        if d is None: probs.append(f'{name}: directory missing'); continue
+        hits = glob.glob(os.path.join(d, 'r12_*_summary.csv')); lgs = glob.glob(os.path.join(d, 'r17_*_r17log.json'))
+        if len(hits) != 1 or len(lgs) != 1: probs.append(f'{name}: incomplete ({len(hits)} summary, {len(lgs)} r17log files)'); continue
+        c = pd.read_csv(hits[0][:-len('summary.csv')] + 'cells.csv'); c = c[c['method'] == 'A-2f-ctxn']
+        if c.empty: probs.append(f'{name}: no A-2f-ctxn cells'); continue
+        lg = json.load(open(lgs[0]))
+        g = lambda mixes, k: float(np.mean([c[c['mixture'] == x][k].mean() for x in mixes if (c['mixture'] == x).any()]))
+        ka = sorted({round(x['ka_used'], 3) for x in lg['r17log']}); kf = sorted({round(x['ka_fitted'], 3) for x in lg['r17log']})
+        v = dict(A_dmAP=g(A_GRP, 'dmAP'), A_dR1=g(A_GRP, 'dR1'), B_dmAP=g(B_GRP, 'dmAP'), B_dR1=g(B_GRP, 'dR1'), ka_used=ka, ka_fitted=kf,
+                 wccn_shrink=lg['wccn_shrink'], wccn_shrink_eval=lg['wccn_shrink_eval'], n_cells=int(len(c)))
+        REPORT['devsens'][name] = v
+        P(f"  {name:28s} A dmAP {v['A_dmAP']:+6.2f} dR1 {v['A_dR1']:+6.2f} | B dmAP {v['B_dmAP']:+6.2f} dR1 {v['B_dR1']:+6.2f} | "
+          f"kappa_a used {ka} (fitted {kf}) | shrink fit {v['wccn_shrink']} eval {v['wccn_shrink_eval']} | {v['n_cells']} cells")
+    P('  problems: ' + ('; '.join(probs) if probs else 'none'))
+    return probs
+
+
+if a.devsens_only:
+    P('################ 论文4 第十七轮 开发集敏感性（开发集半图库；不回改最终方法，不进入测试集结论）################')
+    pr = devsens_section(); finish(not pr, pr)
 
 P('################ 论文4 第十七轮 常数迁移对照（事后补充对照，同一测试集，非盲；C1-C5 原判定不变）################')
 DATA = {}
@@ -101,6 +148,8 @@ for s in a.seeds:
             elif not np.array_equal(qref, r['q']): PROBLEMS.append(f's{s} f{f}: query index mismatch at {(mx, asd, m)}')
         want_rec = len(aseeds) * len(mixes) * len([m for m in methods if not m.startswith('QE+Const@')])
         if nrec != want_rec: PROBLEMS.append(f's{s} f{f}: {nrec} per-query records, expected {want_rec}')
+        if a.expect_script_sha and D['rec'].get('script_sha256') != a.expect_script_sha:
+            PROBLEMS.append(f's{s} f{f}: made by r17_const.py {str(D["rec"].get("script_sha256"))[:12]}, expected {a.expect_script_sha[:12]}')
         P(f'  s{s} f{f}: {len(c)} cells ({len(mixes)} mixtures x {len(aseeds)} assignment seeds x {len(methods)} methods), {nrec} per-query records, '
           f'{0 if qref is None else len(qref)} queries; script {D["rec"].get("script_sha256", "")[:12]}; fixed selection {os.path.basename(str(args_.get("fixed_selection")))}')
 P('  problems: ' + ('; '.join(PROBLEMS) if PROBLEMS else 'none'))
@@ -113,13 +162,23 @@ for s in a.seeds:
         f15 = prefix(os.path.join(a.r15_root, f's{s}_f{f}')) + 'cells.csv'
         c15 = pd.read_csv(f15); c15 = c15[c15['evalset'].astype(str) == 'test']
         m = D['cells'][D['cells']['method'].isin(SHARED)].merge(c15[c15['method'].isin(SHARED)], on=['split', 'mixture', 'aseed', 'method'], suffixes=('', '_15'))
-        n17 = D['cells']['method'].isin(SHARED).sum()
+        n17 = int(D['cells']['method'].isin(SHARED).sum())
+        miss = sorted((set(SHARED) - set(D['cells']['method'])) | (set(SHARED) - set(c15['method'])))   # every shared method on both sides
         cols = [c for c in ('mAP', 'R1', 'R5', 'R10', 'mINP', 'dmAP', 'dR1') if c in m.columns and c + '_15' in m.columns]
-        mx = max(float((m[c] - m[c + '_15']).abs().max()) for c in cols) if len(m) else float('nan')
-        ok = len(m) == n17 and n17 > 0 and mx <= a.tol
-        REPRO_OK &= ok; REPORT['reproduction'][f's{s}_f{f}'] = dict(matched=int(len(m)), cells=int(n17), max_abs_diff=mx, ok=bool(ok))
-        P(f'  s{s} f{f}: matched {len(m)}/{n17} cells, max |diff| over {cols} = {mx:.3g} -> {"reproduced" if ok else "NOT REPRODUCED"}')
+        mx, nan_mis = 0.0, 0   # NaN on one side only is a mismatch (pandas max() would skip it); NaN on both sides is equal
+        for c in cols:
+            x, y = m[c].to_numpy(float), m[c + '_15'].to_numpy(float); both = ~np.isnan(x) & ~np.isnan(y)
+            nan_mis += int((np.isnan(x) != np.isnan(y)).sum())
+            if both.any(): mx = max(mx, float(np.abs(x[both] - y[both]).max()))
+        ok = (not miss) and len(m) == n17 and n17 > 0 and nan_mis == 0 and mx <= a.tol
+        REPRO_OK &= ok; REPORT['reproduction'][f's{s}_f{f}'] = dict(matched=int(len(m)), cells=n17, max_abs_diff=mx, nan_mismatches=nan_mis, missing_methods=miss, ok=bool(ok))
+        P(f'  s{s} f{f}: matched {len(m)}/{n17} cells, max |diff| over {cols} = {mx:.3g}, NaN on one side only {nan_mis}'
+          + (f', shared methods missing {miss}' if miss else '') + f' -> {"reproduced" if ok else "NOT REPRODUCED"}')
 P('  verdict: ' + ('all shared methods reproduced within tolerance %.0e' % a.tol if REPRO_OK else 'REPRODUCTION FAILED: the new control must not be paired with the frozen results'))
+if PROBLEMS or not REPRO_OK:   # stop here: nothing below may pair or report the new control
+    REPORT['reproduction_ok'] = bool(REPRO_OK)
+    P('\n[stopped] structure or reproduction check failed: tables, curve, locality and timing are not produced')
+    finish(False, PROBLEMS + ([] if REPRO_OK else ['reproduction failed']))
 
 # ---------------------------------------------------------------- selection
 P('\n[selection] QE+Const gain chosen on the development fit galleries (frozen main rule; differences relative to B* as for every selected method)')
@@ -134,6 +193,9 @@ for s in a.seeds:
         qe_ = [x for x in D['sel'] if x['method'] == 'QE-DBA']
         P(f"           front end QE-DBA {qe_[0]['chosen'] if qe_ else '?'} ({qe_[0].get('source', '') if qe_ else ''}); kappa_a {D['log']['r17log'][0]['ka_used']}; "
           f"selection time {D['log']['times'].get('select_const_s', ['?'])[0]} s")
+if PROBLEMS:
+    P('\n[stopped] selection check failed: tables are not produced')
+    REPORT['reproduction_ok'] = bool(REPRO_OK); finish(False, PROBLEMS)
 
 # ---------------------------------------------------------------- absolute metrics (cell means)
 P('\n[table A] absolute metrics (%), cell means over 3 fits x assignment seeds; groups are means over their mixtures')
@@ -250,42 +312,45 @@ for s in a.seeds:
           f"on R5-loss pairs {d['ir_neg_top5_front_on_loss']:.2f} -> {d['ir_neg_top5_x_on_loss']:.2f}")
 
 # ---------------------------------------------------------------- timing
-P('\n[timing] medians over fits of the per-fit medians (warm-up + repeats); online stages on one test gallery; float64')
+P('\n[timing] medians over fits of the per-fit medians (warm-up + repeats); online stages on one test gallery; float64, one thread;')
+P('         inputs are cached arrays: image/text encoders and data loading are never timed. Boundary of every stage on the right.')
 stages = [st for s in a.seeds for D in DATA[s].values() for st in D['log']['times'].get('stages', [])]
 REPORT['timing'] = {}
 if stages:
     keys = [k for k, v in stages[0].items() if isinstance(v, dict) and 'median_s' in v]
+    scope = stages[0].get('scope', {})
     nq = np.median([st['shape']['n_queries'] for st in stages]); ni = np.median([st['shape']['n_items'] for st in stages])
     for k in keys:
         v = float(np.median([st[k]['median_s'] for st in stages if k in st])); REPORT['timing'][k] = v
-        per_q = f' ({v / nq * 1e3:.4f} ms per query)' if k.startswith('online') else ''
-        P(f'  {k:28s} {v * 1e3:10.2f} ms{per_q}')
+        per_q = f' ({v / nq * 1e3:.4f} ms/query)' if k.startswith('online') else ''
+        P(f'  {k:26s} {v * 1e3:10.2f} ms{per_q:20s} | {scope.get(k, "")}')
     sel = [st.get('fit_const_selection_s') for st in stages if st.get('fit_const_selection_s') is not None]
     if sel: P(f'  QE+Const gain selection (development fit galleries, whole grid): median {np.median(sel):.2f} s per fit'); REPORT['timing']['const_selection_s'] = float(np.median(sel))
     inc = float(np.median([st['online_gate_and_assoc']['median_s'] - st['online_assoc_only']['median_s'] for st in stages]))
-    P(f'  incremental online cost of the adaptive gate over the constant gain (gate features + logistic + gallery statistics): {inc * 1e3:.2f} ms per gallery')
-    P(f"  gallery: {int(ni)} items, {int(nq)} queries; peak RSS median {np.median([st['peak_rss_mb'] for st in stages]):.0f} MB; env {stages[0]['env']}")
+    P(f'  incremental online cost of the adaptive gate over the constant gain (online_gate_and_assoc - online_assoc_only): {inc * 1e3:.2f} ms per gallery')
     REPORT['timing']['incremental_gate_s'] = inc
+    for ck in ('check_bstar_scoring_max_abs_diff', 'check_frontend_full_max_abs_diff'):
+        vals = [st[ck] for st in stages if ck in st]
+        if vals: P(f'  {ck}: max {max(vals):.3g} (timed code vs the posterior every method uses; should be ~1e-15)'); REPORT['timing'][ck] = float(max(vals))
+    mm = [st['module_memory'] for st in stages if 'module_memory' in st]
+    if mm:
+        P('  memory per stage (one call; inputs = arrays the stage reads; alloc peak = tracemalloc peak of the Python/NumPy allocations made')
+        P('  during the call, BLAS work buffers not counted), medians over fits:')
+        REPORT['timing']['module_memory'] = {}
+        for k in mm[0]:
+            i_ = float(np.median([m[k]['inputs_mb'] for m in mm if k in m])); p_ = float(np.median([m[k]['alloc_peak_mb'] for m in mm if k in m]))
+            REPORT['timing']['module_memory'][k] = dict(inputs_mb=i_, alloc_peak_mb=p_)
+            P(f'    {k:20s} inputs {i_:9.2f} MiB | alloc peak {p_:9.2f} MiB')
+    rss = [st.get('process_peak_rss_mb') for st in stages if st.get('process_peak_rss_mb') is not None]
+    if rss:
+        P(f'  whole-process peak RSS (median {np.median(rss):.0f} MB): the entire Python process up to the timing point (both archives, every fitted')
+        P('  model, the matrices of every method run, interpreter and libraries); NOT the memory of the transfer module')
+        REPORT['timing']['process_peak_rss_mb'] = float(np.median(rss))
+    P(f"  gallery: {int(ni)} items, {int(nq)} queries; env {stages[0]['env']}")
 
-# ---------------------------------------------------------------- development sensitivity (optional)
+# ---------------------------------------------------------------- development sensitivity (optional; the driver writes it to its own report)
 if a.devsens_root:
-    P('\n[dev sensitivity] development half galleries, B* front end, MAIN (A-2f-ctxn) - B*, cell means over 5 splits x 2 folds x assignment seeds')
-    REPORT['devsens'] = {}
-    for d in sorted(glob.glob(os.path.join(a.devsens_root, '*'))):
-        hits = glob.glob(os.path.join(d, 'r12_*_summary.csv'))
-        if len(hits) != 1: continue
-        c = pd.read_csv(hits[0][:-len('summary.csv')] + 'cells.csv'); c = c[c['method'] == 'A-2f-ctxn']
-        lg = json.load(open(one(os.path.join(d, 'r17_*_r17log.json'))))
-        g = lambda mixes, k: float(np.mean([c[c['mixture'] == x][k].mean() for x in mixes if (c['mixture'] == x).any()]))
-        ka = sorted({round(x['ka_used'], 3) for x in lg['r17log']}); kf = sorted({round(x['ka_fitted'], 3) for x in lg['r17log']})
-        v = dict(A_dmAP=g(A_GRP, 'dmAP'), A_dR1=g(A_GRP, 'dR1'), B_dmAP=g(B_GRP, 'dmAP'), B_dR1=g(B_GRP, 'dR1'), ka_used=ka, ka_fitted=kf,
-                 wccn_shrink=lg['wccn_shrink'], wccn_shrink_eval=lg['wccn_shrink_eval'], n_cells=int(len(c)))
-        REPORT['devsens'][os.path.basename(d)] = v
-        P(f"  {os.path.basename(d):28s} A dmAP {v['A_dmAP']:+6.2f} dR1 {v['A_dR1']:+6.2f} | B dmAP {v['B_dmAP']:+6.2f} dR1 {v['B_dR1']:+6.2f} | "
-          f"kappa_a used {ka} (fitted {kf}) | shrink fit {v['wccn_shrink']} eval {v['wccn_shrink_eval']} | {v['n_cells']} cells")
+    PROBLEMS += devsens_section()
 
-P('\n[status] ' + ('VALID: structure and reproduction checks passed' if (REPRO_OK and not PROBLEMS) else 'INVALID: ' + '; '.join(PROBLEMS + ([] if REPRO_OK else ['reproduction failed']))))
-REPORT['problems'] = PROBLEMS; REPORT['reproduction_ok'] = bool(REPRO_OK)
-json.dump(REPORT, open(a.out, 'w'), indent=1, default=str)
-print('\n'.join(out_lines))
-raise SystemExit(0 if (REPRO_OK and not PROBLEMS) else 3)
+REPORT['reproduction_ok'] = bool(REPRO_OK)
+finish(REPRO_OK and not PROBLEMS, PROBLEMS + ([] if REPRO_OK else ['reproduction failed']))

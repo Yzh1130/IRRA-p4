@@ -5,13 +5,18 @@
 2. With --fixed_selection, the shared methods (B*, QE-DBA, QE+M, QE+CAET, QE+SRC2f, QE+EM) are reproduced exactly, and the new
    methods satisfy: QE+Const@0 == QE-DBA, QE+Const@1 == QE+NoGate, QE+Const == QE+Const@<chosen gain>; no top-1 change when the
    front end's top-1 item is not IR-only; explicit-key per-query records agree with the cells.
-3. r17_judge.py, r17_reagg_r15.py and r17_check_archives.py run on these outputs and report VALID / exit 0.
+3. r17_judge.py, r17_reagg_r15.py and r17_check_archives.py run on these outputs and report VALID / exit 0; the judge stops with
+   INVALID (exit 3) and prints no table when a shared cell differs from round 15, is NaN on one side only, or a run was made by another
+   r17_const.py.
+4. --timing: every stage has its boundary, the timed B* scoring and front end equal the posteriors every method uses, per-stage
+   allocation peaks exist; the whole-process peak RSS is recorded where the POSIX `resource` module exists (not on Windows).
+5. r17_judge.py --devsens_only on a development-sensitivity run: VALID, and INVALID when an expected directory is missing.
 Run: python -m pytest IRRA-main/tests/p4/test_r17.py -q   (or python IRRA-main/tests/p4/test_r17.py)
-Windows: the --timing path is skipped (it reads peak memory from the POSIX-only `resource` module); it runs in the AutoDL driver.
 Child processes use UTF-8 for their output, so a GBK console does not matter.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -33,7 +38,7 @@ R15_METHODS = ['B*', 'CAET', 'A-SRC-2f', 'A-2f-EM', 'A-2f-ctxn', 'A-2f-ctxn-g', 
                'QE+CAET', 'QE+SRC2f', 'QE+EM', 'QE+Orc', 'DB', 'Oracle-A']
 R17_METHODS = ['B*', 'QE-DBA', 'QE+M', 'QE+CAET', 'QE+SRC2f', 'QE+EM', 'QE+Const', 'QE+NoGate']
 SHARED = ['B*', 'QE-DBA', 'QE+M', 'QE+CAET', 'QE+SRC2f', 'QE+EM']
-HAS_RESOURCE = importlib.util.find_spec('resource') is not None   # POSIX only; r17_const.py --timing needs it
+HAS_RESOURCE = importlib.util.find_spec('resource') is not None   # POSIX only: process peak RSS (absent on Windows)
 
 
 def l2n(x):
@@ -95,9 +100,14 @@ class R17(unittest.TestCase):
         cls.p15 = run([TRANSFER / 'r15_test.py', '--out', cls.r15, '--tag', 't_s101_f7001', '--methods'] + R15_METHODS + common, CODE_ROOT)
         cls.p17a = run([TRANSFER / 'r17_const.py', '--out', cls.r17a, '--tag', 't_s101_f7001', '--methods'] + R15_METHODS + common, CODE_ROOT)
         sel = cls.r15 / 'r12_t_s101_f7001_selection.json'
-        timing = ['--timing'] if HAS_RESOURCE else []
         cls.p17 = run([TRANSFER / 'r17_const.py', '--out', cls.r17, '--tag', 'c_s101_f7001', '--methods'] + R17_METHODS + common +
-                      ['--fixed_selection', sel, '--const_curve', '--perq_ext'] + timing, CODE_ROOT)
+                      ['--fixed_selection', sel, '--const_curve', '--perq_ext', '--timing'], CODE_ROOT)
+        cls.dev = T / 'devsens' / 'ka20_s101'; cls.dev.mkdir(parents=True)
+        cls.pdev = run([TRANSFER / 'r17_const.py', '--b12', '.', '--feats', T / 'feats', '--assign', 'none', '--out', cls.dev, '--base', 'base_ref_s101',
+                        '--adapter', 'base_ref_s101', '--tag', 'd_ka20_s101', '--folds', '2', '--split_seeds', '2026', '--assign_seeds', '2026',
+                        '--mixes', 'M4', 'M1g', 'M5e', 'M4id', '--skip_joint', '--methods', 'B*', 'A-2f-ctxn', '--grid_preset', 'dev',
+                        '--select_rule', 'constrained', '--r_max', '0.999999', '--tie_break', 'bstar', '--link_map', 'train_lda',
+                        '--train_ir_npz', T / 'train_ir.npz', '--kappa_a_fixed', '20'], CODE_ROOT)
 
     @classmethod
     def tearDownClass(cls):
@@ -107,7 +117,7 @@ class R17(unittest.TestCase):
             pass
 
     def test_0_runs(self):
-        for p in (self.p15, self.p17a, self.p17):
+        for p in (self.p15, self.p17a, self.p17, self.pdev):
             self.assertEqual(p.returncode, 0, p.stdout[-2000:] + p.stderr[-4000:])
 
     def test_1_no_option_equals_r15(self):
@@ -155,9 +165,18 @@ class R17(unittest.TestCase):
             if m in ('QE+M', 'QE+Const', 'QE+NoGate', 'QE+CAET', 'QE+SRC2f', 'QE+EM'):
                 keep = f['top1_av'] != 1
                 self.assertEqual(int((r['top1'][keep] != f['top1'][keep]).sum()), 0, (mx, asd, m))
-        log = jload(self.r17 / 'r17_c_s101_f7001_r17log.json')
-        if HAS_RESOURCE:   # the timing stages exist only where --timing was run (not on Windows)
-            self.assertIn('stages', log['times']); self.assertIn('online_transfer_gate', log['times']['stages'][0])
+
+    def test_4b_timing_boundaries(self):
+        st = jload(self.r17 / 'r17_c_s101_f7001_r17log.json')['times']['stages'][0]
+        for k in ('online_link_graph', 'online_bstar_scoring', 'online_bstar_sigmoid_only', 'online_qedba_after_bstar', 'online_frontend_full',
+                  'online_gate_and_assoc', 'online_assoc_only', 'online_transfer_gate', 'online_transfer_const', 'online_sort'):
+            self.assertIn('median_s', st[k], k); self.assertIn(k, st['scope'], k)
+        self.assertNotIn('online_frontend_bstar', st); self.assertNotIn('peak_rss_mb', st)
+        self.assertIn('ONLY the final sigmoid', st['scope']['online_bstar_sigmoid_only'])
+        self.assertLess(st['check_bstar_scoring_max_abs_diff'], 1e-9); self.assertLess(st['check_frontend_full_max_abs_diff'], 1e-9)
+        for k in ('bstar_scoring', 'frontend_full', 'gate_and_assoc', 'assoc_only', 'transfer_gate', 'transfer_const', 'sort'):
+            self.assertGreater(st['module_memory'][k]['alloc_peak_mb'], 0.0, k); self.assertGreater(st['module_memory'][k]['inputs_mb'], 0.0, k)
+        self.assertEqual(st['process_peak_rss_mb'] is not None, HAS_RESOURCE)
 
     def test_5_reports(self):
         T = self.T
@@ -165,14 +184,43 @@ class R17(unittest.TestCase):
         for f in self.r17.iterdir(): (rt / 's101_f7001' / f.name).write_bytes(f.read_bytes())
         r15root = T / 'r15root'; (r15root / 's101_f7001').mkdir(parents=True)
         for f in self.r15.iterdir(): (r15root / 's101_f7001' / f.name).write_bytes(f.read_bytes())
-        p = run([TRANSFER / 'r17_judge.py', '--r17_root', rt, '--r15_root', r15root, '--seeds', '101', '--fits', '7001', '--boot', '200',
-                 '--out', T / 'judge.json'], CODE_ROOT)
+        sha = hashlib.sha256((TRANSFER / 'r17_const.py').read_bytes()).hexdigest()
+        judge = lambda r15, out, extra=(): run([TRANSFER / 'r17_judge.py', '--r17_root', rt, '--r15_root', r15, '--seeds', '101', '--fits', '7001',
+                                               '--boot', '200', '--out', T / out] + list(extra), CODE_ROOT)
+        p = judge(r15root, 'judge.json', ['--expect_script_sha', sha])
         self.assertEqual(p.returncode, 0, p.stdout[-3000:] + p.stderr[-3000:]); self.assertIn('[status] VALID', p.stdout)
+        self.assertIn('[table B]', p.stdout); self.assertIn('online_bstar_scoring', p.stdout); self.assertIn('alloc peak', p.stdout)
+        if HAS_RESOURCE:   # the whole-process line exists only where the peak RSS was recorded
+            self.assertIn('NOT the memory of the transfer module', p.stdout)
+        p = judge(r15root, 'judge_badsha.json', ['--expect_script_sha', '0' * 64])
+        self.assertEqual(p.returncode, 3, p.stdout[-3000:]); self.assertIn('[stopped]', p.stdout); self.assertNotIn('[table B]', p.stdout)
+        bad = T / 'r15bad'; (bad / 's101_f7001').mkdir(parents=True)                 # one round-15 cell of QE+M changed in a copy
+        for f in self.r15.iterdir(): (bad / 's101_f7001' / f.name).write_bytes(f.read_bytes())
+        cf = bad / 's101_f7001' / 'r12_t_s101_f7001_cells.csv'; c = pd.read_csv(cf)
+        i = c.index[(c['method'] == 'QE+M') & (c['evalset'].astype(str) == 'test')][0]; c.loc[i, 'R10'] += 0.01; c.to_csv(cf, index=False)
+        p = judge(bad, 'judge_bad.json')
+        self.assertEqual(p.returncode, 3, p.stdout[-3000:]); self.assertIn('NOT REPRODUCED', p.stdout); self.assertIn('[status] INVALID', p.stdout)
+        self.assertNotIn('[table B]', p.stdout); self.assertNotIn('[timing]', p.stdout)
+        nan = T / 'r15nan'; (nan / 's101_f7001').mkdir(parents=True)                # one round-15 cell of QE+M set to NaN: a NaN on one side only
+        for f in self.r15.iterdir(): (nan / 's101_f7001' / f.name).write_bytes(f.read_bytes())
+        cf = nan / 's101_f7001' / 'r12_t_s101_f7001_cells.csv'; c = pd.read_csv(cf)
+        i = c.index[(c['method'] == 'QE+M') & (c['evalset'].astype(str) == 'test')][0]; c.loc[i, 'mAP'] = np.nan; c.to_csv(cf, index=False)
+        p = judge(nan, 'judge_nan.json')
+        self.assertEqual(p.returncode, 3, p.stdout[-3000:]); self.assertIn('NaN on one side only 1', p.stdout); self.assertNotIn('[table B]', p.stdout)
         qr = f's101={T / "feats" / "base_ref_s101.npz"},{T / "test_base_s101.npz"}'
         p = run([TRANSFER / 'r17_reagg_r15.py', '--r15_root', r15root, '--qraw', qr, '--fits', '7001', '--boot', '200', '--json', T / 'reagg.json'], CODE_ROOT)
         self.assertEqual(p.returncode, 0, p.stdout[-3000:] + p.stderr[-3000:]); self.assertIn('[status] VALID', p.stdout)
         p = run([TRANSFER / 'r17_check_archives.py', '--pairs', qr, '--assign_seeds', '7031', '7032', '--json', T / 'arch.json'], CODE_ROOT)
         self.assertEqual(p.returncode, 0, p.stdout[-3000:] + p.stderr[-3000:])
+
+    def test_6_devsens_report(self):
+        T = self.T; root = T / 'devsens'
+        p = run([TRANSFER / 'r17_judge.py', '--devsens_only', '--devsens_root', root, '--devsens_expect', 'ka20_s101', '--out', T / 'dev.json'], CODE_ROOT)
+        self.assertEqual(p.returncode, 0, p.stdout[-3000:] + p.stderr[-3000:]); self.assertIn('[status] VALID', p.stdout)
+        self.assertIn('kappa_a used [20.0]', p.stdout)
+        p = run([TRANSFER / 'r17_judge.py', '--devsens_only', '--devsens_root', root, '--devsens_expect', 'ka20_s101', 'ka45_s101',
+                 '--out', T / 'dev2.json'], CODE_ROOT)
+        self.assertEqual(p.returncode, 3, p.stdout[-3000:]); self.assertIn('ka45_s101: directory missing', p.stdout)
 
 
 if __name__ == '__main__':
