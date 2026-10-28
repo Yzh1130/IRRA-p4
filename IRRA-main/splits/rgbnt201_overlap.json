@@ -1,0 +1,89 @@
+{
+  "rule": "图像对：同名的 RGB 与 T 构成一个对，两边都这样配。RGBNT201 的对 a 与 PEDES 的对 b\"匹配\"，当且仅当满足下面任一条：\n- 任一模态的 SHA-256 相同；\n- RGB 与 T 两个模态都满足 dHash ≤ 6 且 pHash ≤ 6：a 的 RGB 对 b 的 RGB，a 的 T 对 b 的 T。\n只有一个模态近重复的，记为\"待人工查看\"，不算匹配。\n重叠身份：至少有一个对匹配的 RGBNT201 身份。",
+  "thresholds": {
+    "dhash": 6,
+    "phash": 6
+  },
+  "pedes_dir": "RGBT-PEDES-Final",
+  "overlap_test_ids": [
+    176,
+    188,
+    194,
+    195
+  ],
+  "overlap_test_pids": [
+    "000275",
+    "000276",
+    "000282",
+    "000288"
+  ],
+  "overlap_train_ids": [
+    1,
+    12,
+    14,
+    17,
+    20,
+    27,
+    34,
+    40,
+    46,
+    50,
+    69,
+    74,
+    78,
+    81,
+    92,
+    103,
+    109,
+    135,
+    136,
+    138,
+    140,
+    146,
+    150,
+    155,
+    161,
+    165,
+    170
+  ],
+  "n_test_ids": 30,
+  "n_test_ids_after_exclusion": 26,
+  "pedes_ids_of_overlap_test_ids": {
+    "176": [
+      1364
+    ],
+    "188": [
+      1366
+    ],
+    "194": [
+      1365
+    ],
+    "195": [
+      1367
+    ]
+  },
+  "pedes_split_of_overlap_test_ids": {
+    "176": {
+      "1364": [
+        "test"
+      ]
+    },
+    "188": {
+      "1366": [
+        "test"
+      ]
+    },
+    "194": {
+      "1365": [
+        "train"
+      ]
+    },
+    "195": {
+      "1367": [
+        "train"
+      ]
+    }
+  },
+  "evidence_sha256": "80b89c11eda54b5b3fb5e40e14e8ddf6b78f71211a79347b9972e0e94d1fbf2f",
+  "script_sha256": "60ee079e376124894d61c5577dfb6afdf4feee344fa9e5aaf662b94f2c3c6f4a"
+}

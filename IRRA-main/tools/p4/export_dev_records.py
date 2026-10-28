@@ -86,7 +86,7 @@ def _file_hashes(path):
     }
 
 
-def validate_dev_split(annotation_path, split_path):
+def validate_dev_split(annotation_path, split_path, dataset_name="RGBT-PEDES"):
     """Verify identities, annotation hash and recorded counts before evaluation.
 
     Raw identity labels are retained for exports. Contiguous PID labels mirror
@@ -94,6 +94,11 @@ def validate_dev_split(annotation_path, split_path):
     """
     annotation_path, split_path = Path(annotation_path), Path(split_path)
     annos = json.loads(annotation_path.read_text(encoding="utf-8"))
+    if dataset_name == "RGBNT201-PEDES":
+        from tools.p4.r18.common import nonblank_annotations
+        annos = nonblank_annotations(annos)
+    elif dataset_name != "RGBT-PEDES":
+        raise ValueError(f"Unsupported P4 dataset: {dataset_name}")
     split = json.loads(split_path.read_text(encoding="utf-8"))
     required = ("dev_ids", "train_reduced_ids", "n_dev", "n_train_reduced", "anno_md5")
     missing = [key for key in required if key not in split]
@@ -691,7 +696,15 @@ def _write_opt_in_record(output_dir, cli, args, started, started_utc, device, ex
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
-def _resolve_annotation(root_dir):
+def _resolve_annotation(root_dir, dataset_name="RGBT-PEDES"):
+    if dataset_name == "RGBNT201-PEDES":
+        directory = Path(root_dir) / "RGBNT201"
+        annotation = directory / "captionform0_8B.json"
+        if not annotation.is_file() or not (directory / "RGB").is_dir() or not (directory / "T").is_dir():
+            raise FileNotFoundError(f"No registered RGBNT201 RGB/T annotation under {directory}")
+        return annotation
+    if dataset_name != "RGBT-PEDES":
+        raise ValueError(f"Unsupported P4 dataset: {dataset_name}")
     dataset_root = Path(root_dir) / "RGBT-PEDES"
     for data_dir in (dataset_root / "RGBT-PEDES-Final", dataset_root / "RGBT-PEDES", dataset_root):
         if (data_dir / "RGB").is_dir() and (data_dir / "T").is_dir():
@@ -751,14 +764,14 @@ def export(cli):
 
     config_path = Path(cli.config_file or Path(cli.checkpoint).parent / "configs.yaml").resolve()
     args = load_train_configs(str(config_path))
-    if getattr(args, "dataset_name", None) != "RGBT-PEDES":
+    if getattr(args, "dataset_name", None) not in {"RGBT-PEDES", "RGBNT201-PEDES"}:
         raise ValueError("P4 development export is restricted to RGBT-PEDES")
     if cli.root_dir is not None:
         args.root_dir = str(Path(cli.root_dir).resolve())
-    annotation = _resolve_annotation(args.root_dir)
-    dev_data = validate_dev_split(annotation, cli.dev_split_file)
+    annotation = (_resolve_annotation(args.root_dir) if args.dataset_name == "RGBT-PEDES" else _resolve_annotation(args.root_dir, args.dataset_name))
+    dev_data = (validate_dev_split(annotation, cli.dev_split_file) if args.dataset_name == "RGBT-PEDES" else validate_dev_split(annotation, cli.dev_split_file, args.dataset_name))
     training_split, saved_training_split = _resolve_saved_split(args, config_path, cli.training_split_file)
-    training_data = validate_dev_split(annotation, training_split)
+    training_data = (validate_dev_split(annotation, training_split) if args.dataset_name == "RGBT-PEDES" else validate_dev_split(annotation, training_split, args.dataset_name))
     if training_data["split_identity_sha256"] != dev_data["split_identity_sha256"]:
         raise ValueError("Checkpoint training split does not match supplied development split")
     # Prevent optional research rerank/diagnostic paths stored in another run from
@@ -815,7 +828,7 @@ def export(cli):
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger("IRRA", str(output_dir), if_train=False)
     color_words, stopwords = load_word_list(cli.color_lexicon), load_word_list(cli.stopwords)
-    if save_features:
+    if save_features or bool(getattr(cli, "save_item_meta", False)):
         # Only opt-in output paths are checked; all existing default writes remain unchanged.
         for scenario in SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()):
             if (output_dir / "features" / f"{scenario}.pt").exists():
@@ -926,11 +939,15 @@ def export(cli):
             raise
         finally:
             _write_opt_in_record(output_dir, cli, args, started, started_utc, device, extra)
+    if bool(getattr(cli, "save_item_meta", False)):
+        from tools.p4.r18.common import item_meta, write_json
+        write_json(output_dir / "item_meta.json", item_meta(annotation, dev_data, args.dataset_name, "dev"))
     return summary
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--save_item_meta", action="store_true", default=argparse.SUPPRESS, help="Save verified item/query filename, raw PID and camera order")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config_file", default=None, help="Defaults to configs.yaml beside the checkpoint")
     parser.add_argument("--dev_split_file", default=str(CODE_ROOT / "splits" / "dev_190.json"))

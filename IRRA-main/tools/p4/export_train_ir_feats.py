@@ -40,15 +40,18 @@ def prepare_metadata(cli, config):
     """
     from datasets.rgbtpedes import RGBTPEDES
 
-    if getattr(config, "dataset_name", None) != "RGBT-PEDES":
+    if getattr(config, "dataset_name", None) not in {"RGBT-PEDES", "RGBNT201-PEDES"}:
         raise ValueError("R13 training-feature export requires RGBT-PEDES")
     config_path = Path(cli.config_file or Path(cli.checkpoint).parent / "configs.yaml").resolve()
     root_dir = Path(cli.root_dir or config.root_dir).resolve()
     split_path = Path(cli.dev_split_file).resolve()
-    annotation = _resolve_annotation(root_dir)
-    dev_data = validate_dev_split(annotation, split_path)
-    if dev_data["n_train"] != 1076:
-        raise ValueError(f"Expected exactly 1076 train_reduced_ids, got {dev_data['n_train']}")
+    from tools.p4.r18.common import dataset_class, expected_training_ids
+    name = config.dataset_name
+    annotation = _resolve_annotation(root_dir) if name == "RGBT-PEDES" else _resolve_annotation(root_dir, name)
+    dev_data = validate_dev_split(annotation, split_path) if name == "RGBT-PEDES" else validate_dev_split(annotation, split_path, name)
+    expected_count = expected_training_ids(name, split_path)
+    if dev_data["n_train"] != expected_count:
+        raise ValueError(f"Expected exactly {expected_count} train_reduced_ids, got {dev_data['n_train']}")
     # Check the saved file when accessible. Only a relocated, unavailable path
     # falls back to the supplied local split, as allowed by the existing export.
     # An accessible different partition must not be silently overridden.
@@ -56,17 +59,18 @@ def prepare_metadata(cli, config):
         training_split, saved_training_split = _resolve_saved_split(config, config_path, None)
     except FileNotFoundError:
         training_split, saved_training_split = _resolve_saved_split(config, config_path, split_path)
-    training_data = validate_dev_split(annotation, training_split)
+    training_data = validate_dev_split(annotation, training_split) if name == "RGBT-PEDES" else validate_dev_split(annotation, training_split, name)
     if training_data["split_identity_sha256"] != dev_data["split_identity_sha256"]:
         raise ValueError("Checkpoint training split does not match supplied development split")
-    dataset = RGBTPEDES(root=str(root_dir), dev_split_file=str(split_path), verbose=False)
+    cls = RGBTPEDES if name == "RGBT-PEDES" else dataset_class(name)
+    dataset = cls(root=str(root_dir), dev_split_file=str(split_path), verbose=False)
     train_gallery, identities = dataset._process_anno(dataset.train_annos, training=False)
     raw_pids = [int(anno["id"]) for anno in dataset.train_annos]
     file_paths = [str(anno["file_path"]) for anno in dataset.train_annos]
     split = json.loads(split_path.read_text(encoding="utf-8"))
     expected_train = {int(pid) for pid in split["train_reduced_ids"]}
-    if set(raw_pids) != expected_train or len(identities) != 1076:
-        raise ValueError("Training gallery does not match the 1076 reduced-training identities")
+    if set(raw_pids) != expected_train or len(identities) != expected_count:
+        raise ValueError(f"Training gallery does not match the {expected_count} reduced-training identities")
     if list(dataset.val["image_pids"]) != dev_data["gallery_pids"]:
         raise ValueError("Development gallery order disagrees with validated annotations")
     if [int(anno["id"]) for anno in dataset.val_annos] != dev_data["gallery_raw_pids"]:
@@ -113,7 +117,8 @@ def build_inference_model(args, checkpoint_path, device):
     from model import build_model
     from processor.processor import apply_img_local_filter_stage, restore_eval_extra_state
 
-    model = build_model(args, num_classes=1076)
+    from tools.p4.r18.common import expected_training_ids
+    model = build_model(args, num_classes=expected_training_ids(getattr(args, "dataset_name", "RGBT-PEDES"), getattr(args, "dev_split_file", None)))
     checkpoint = load_strict_checkpoint(model, checkpoint_path)
     apply_img_local_filter_stage(
         model, args, int(checkpoint.get("epoch", 1)), logger=None, prefix="R13_TRAIN_FEATURES",
@@ -211,7 +216,7 @@ def make_provenance(cli, metadata, verification=None):
         "training_split_verified": str(metadata["training_split"]),
         "git_head": commit, "git_dirty": bool(status.strip()),
         "git_status_porcelain": status.splitlines(),
-        "n_train_reduced_identities": 1076,
+        "n_train_reduced_identities": metadata["dev_data"]["n_train"],
         "n_images": len(metadata["train_raw_pids"]),
         "arguments": vars(cli), "verify_dev": verification,
         "row_order": "RGBTPEDES.train_annos, one image pair per row, no caption expansion",

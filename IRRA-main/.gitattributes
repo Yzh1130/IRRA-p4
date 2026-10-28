@@ -1,0 +1,12 @@
+# Round 18: portable, committed LF bytes.
+tools/p4/r18/** text eol=lf
+splits/rgbnt201_*.json text eol=lf
+tests/p4/test_r18_*.py text eol=lf
+datasets/build.py text eol=lf
+datasets/rgbnt201pedes.py text eol=lf
+tools/p4/export_eval_split.py text eol=lf
+tools/p4/export_train_ir_feats.py text eol=lf
+tools/p4/export_dev_records.py text eol=lf
+.gitattributes text eol=lf
+tools/p4/export_text_bank.py text eol=lf
+tools/p4/train_acd.py text eol=lf

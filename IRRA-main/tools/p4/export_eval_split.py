@@ -29,15 +29,18 @@ from tools.p4.export_dev_records import (
 )
 
 
-def build_test_data(annotation, dev_split_file):
+def build_test_data(annotation, dev_split_file, dataset_name="RGBT-PEDES"):
     """Build annotation-ordered official-test metadata without reading any images.
 
     The checkpoint's reduced-training identity signature is deliberately retained:
     official-test evaluation must still verify that it uses the same dev protocol.
     Contiguous test labels follow RGBTPEDES._process_anno's sorted raw IDs.
     """
-    development = validate_dev_split(annotation, dev_split_file)
+    development = (validate_dev_split(annotation, dev_split_file) if dataset_name == "RGBT-PEDES" else validate_dev_split(annotation, dev_split_file, dataset_name))
     annos = json.loads(Path(annotation).read_text(encoding="utf-8"))
+    if dataset_name == "RGBNT201-PEDES":
+        from tools.p4.r18.common import nonblank_annotations
+        annos = nonblank_annotations(annos)
     split = json.loads(Path(dev_split_file).read_text(encoding="utf-8"))
     development_ids = {int(pid) for pid in split["dev_ids"]}
     training_ids = {int(pid) for pid in split["train_reduced_ids"]}
@@ -171,15 +174,19 @@ def export_split(cli):
 
     config_path = Path(cli.config_file or Path(cli.checkpoint).parent / "configs.yaml").resolve()
     args = load_train_configs(str(config_path))
-    if getattr(args, "dataset_name", None) != "RGBT-PEDES":
+    if getattr(args, "dataset_name", None) not in {"RGBT-PEDES", "RGBNT201-PEDES"}:
         raise ValueError("P4 development export is restricted to RGBT-PEDES")
     if cli.root_dir is not None:
         args.root_dir = str(Path(cli.root_dir).resolve())
-    annotation = _resolve_annotation(args.root_dir)
-    dev_data = (validate_dev_split(annotation, cli.dev_split_file) if cli.split == "dev"
-                else build_test_data(annotation, cli.dev_split_file))
+    annotation = (_resolve_annotation(args.root_dir) if args.dataset_name == "RGBT-PEDES" else _resolve_annotation(args.root_dir, args.dataset_name))
+    if args.dataset_name == "RGBT-PEDES":
+        dev_data = (validate_dev_split(annotation, cli.dev_split_file) if cli.split == "dev"
+                    else build_test_data(annotation, cli.dev_split_file))
+    else:
+        dev_data = (validate_dev_split(annotation, cli.dev_split_file, args.dataset_name) if cli.split == "dev"
+                    else build_test_data(annotation, cli.dev_split_file, args.dataset_name))
     training_split, saved_training_split = _resolve_saved_split(args, config_path, cli.training_split_file)
-    training_data = validate_dev_split(annotation, training_split)
+    training_data = (validate_dev_split(annotation, training_split) if args.dataset_name == "RGBT-PEDES" else validate_dev_split(annotation, training_split, args.dataset_name))
     if training_data["split_identity_sha256"] != dev_data["split_identity_sha256"]:
         raise ValueError("Checkpoint training split does not match supplied development split")
     # Prevent optional research rerank/diagnostic paths stored in another run from
@@ -236,7 +243,7 @@ def export_split(cli):
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger("IRRA", str(output_dir), if_train=False)
     color_words, stopwords = load_word_list(cli.color_lexicon), load_word_list(cli.stopwords)
-    if save_features:
+    if save_features or bool(getattr(cli, "save_item_meta", False)):
         # Only opt-in output paths are checked; all existing default writes remain unchanged.
         for scenario in SCENARIO_NAMES + (TRAIN_STATE_SCENARIO_NAMES if getattr(cli, "train_state_scenarios", False) else ()):
             if (output_dir / "features" / f"{scenario}.pt").exists():
@@ -353,6 +360,9 @@ def export_split(cli):
             raise
         finally:
             _write_opt_in_record(output_dir, cli, args, started, started_utc, device, extra)
+    if bool(getattr(cli, "save_item_meta", False)):
+        from tools.p4.r18.common import item_meta, write_json
+        write_json(output_dir / "item_meta.json", item_meta(annotation, dev_data, args.dataset_name, cli.split))
     return summary
 
 

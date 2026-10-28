@@ -23,6 +23,7 @@ from .cuhkpedes import CUHKPEDES
 from .icfgpedes import ICFGPEDES
 from .rstpreid import RSTPReid
 from .rgbtpedes import RGBTPEDES
+from .rgbnt201pedes import RGBNT201PEDES
 from .mga_pseudo import collect_mga_pseudo_stats, load_mga_pseudo_json
 
 __factory = {
@@ -30,6 +31,7 @@ __factory = {
     'ICFG-PEDES': ICFGPEDES,
     'RSTPReid': RSTPReid,
     'RGBT-PEDES': RGBTPEDES,
+    'RGBNT201-PEDES': RGBNT201PEDES,
 }
 
 
@@ -449,7 +451,7 @@ def build_dataloader(args, tranforms=None):
     # Instantiate dataset by name from factory. The optional development split is
     # specific to RGBT-PEDES; all other datasets retain their original constructor.
     dataset_kwargs = {"root": args.root_dir}
-    if args.dataset_name == "RGBT-PEDES":
+    if args.dataset_name in {"RGBT-PEDES", "RGBNT201-PEDES"}:
         dataset_kwargs["dev_split_file"] = (
             getattr(args, "dev_split_file", "") or None
         )

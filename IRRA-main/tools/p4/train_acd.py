@@ -374,8 +374,11 @@ def prepare_training(cli):
     saved_split_data = validate_dev_split(annotation, saved_split)
     if split["split_identity_sha256"] != saved_split_data["split_identity_sha256"]:
         raise ValueError("Requested development split differs from base checkpoint training split")
-    if split["n_train"] != 1076 or split["n_dev"] != 190:
-        raise ValueError("ACD requires the verified 1076/190 identity development split")
+    from tools.p4.r18.common import expected_training_ids, read_json, CODE as R18_CODE
+    expected_train = expected_training_ids(args.dataset_name, requested_split)
+    expected_dev = int(read_json(R18_CODE / "splits/dev_190.json")["n_dev"])
+    if split["n_train"] != expected_train or split["n_dev"] != expected_dev:
+        raise ValueError(f"ACD requires the verified {expected_train}/{expected_dev} identity development split")
     args.dev_split_file = str(requested_split)
     # Build the full original checkpoint structure before changing loader-only
     # controls; loss_names stays intact so MLM/ID weights load strictly.
@@ -386,8 +389,8 @@ def prepare_training(cli):
     args.degrade_aug_mode = "none"
     args.deg_retrieval_loss = "none"
     loader, _, _, num_classes = build_dataloader(args)
-    if num_classes != 1076:
-        raise ValueError("Repository loader did not construct the 1076-ID training subset")
+    if num_classes != expected_train:
+        raise ValueError(f"Repository loader did not construct the {expected_train}-ID training subset")
     loader = clone_training_loader(loader, cli.data_seed)
     model = build_model(args, num_classes)
     load_strict_checkpoint(model, checkpoint)

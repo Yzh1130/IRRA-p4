@@ -97,8 +97,10 @@ def main(argv=None):
         base_split = validate_dev_split(annotation, saved_split)
         if verified["split_identity_sha256"] != base_split["split_identity_sha256"]:
             raise ValueError("Requested training split differs from the checkpoint configuration")
-        if verified["n_train"] != 1076:
-            raise ValueError("Expected the verified 1076-identity reduced training subset")
+        from tools.p4.r18.common import expected_training_ids
+        expected_ids = expected_training_ids(args.dataset_name, cli.dev_split_file)
+        if verified["n_train"] != expected_ids:
+            raise ValueError(f"Expected the verified {expected_ids}-identity reduced training subset")
         annos = json.loads(Path(annotation).read_text(encoding="utf-8"))
         split = json.loads(Path(cli.dev_split_file).read_text(encoding="utf-8"))
         rows = training_caption_records(annos, split["train_reduced_ids"])
@@ -143,7 +145,7 @@ def main(argv=None):
         with record_path.open("x", encoding="utf-8") as handle:
             json.dump(record, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-    print(f"{output}: captions={len(rows)}, identities=1076")
+    print(f"{output}: captions={len(rows)}, identities={expected_ids}")
     return 0
 
 
