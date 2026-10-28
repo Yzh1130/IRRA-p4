@@ -68,6 +68,7 @@ if [ "${SKIP_GIT:-0}" != 1 ]; then
 fi
 # BEGIN EXPECTED_SHA256 (workspace values must equal committed blob values before push)
 R17_SHA=0871f83d715f64fe1099969d0918f9e7348739c8b7a51f71e4c74d34f8163d95
+R15_SHA=670a89bed5c5a7a367382bc3d9484c1f38455f828826e6f41711db4674fdb82c
 XCAM_SHA=ea2951d63034244ac407418a43b8b8237d2a7e36c1a2eb6052b1800e82b0e61d
 while read -r expected relative; do
   actual=$(sha256sum "$CODE/$relative") || stop "Code file missing: $relative"
@@ -81,20 +82,22 @@ c50c78a0215f43ad63b5f14a25fe1db0e2f229b34d97d648b36b91d6b55f7bfe  datasets/build
 767580b5acf6ef749596d5cb76a1a63695f360e4387f88c2f6b2194ad5e8711d  splits/rgbnt201_overlap.json
 fef3ad5ee2907a47657380237d97248bda4fbd458db83363934f8f5cb1a13114  tests/p4/test_r18_data.py
 152655fe2d8b3665367c4720b0118184020acfe70bd900ab45af88cf2a68b8f4  tests/p4/test_r18_eval.py
+5bd0069fc2d8f712f1a43e79ab4d71e910c23def5f641ac3dc2c2328f3d8e275  tests/p4/test_r18_runner.py
 e387c70c55582e9bacbd8b78f6edb64bc9dcef9b859e91f11ccf33f1392c0a1c  tools/p4/export_dev_records.py
 8dc919479ab8922694feea324b020f4665b6e22fbb65b05c195f1a1a27cfd6f0  tools/p4/export_eval_split.py
 9b8b64765927ff34ec6dfb26b42d4e08c1a64378a58074210387d8468fb58801  tools/p4/export_text_bank.py
 84e9725540f62ba4fdf8896c5e5c40771b49f8d1c09b9b825b76d88d4dacb2fb  tools/p4/export_train_ir_feats.py
 15abd8312bafa628cf2192ff1c64b5bc33e167e1f7d8bf5fd0dcbd545b7a8cff  tools/p4/pack_feats.py
 8acb3386908d634cb5fc06b2a585e65a67c81a0c32a5ad633d6e69b9f13e5cbe  tools/p4/r18/common.py
-2d89d7916ec3f5a8a64c274757fd1d0865d75b3cacad13ede5566df7771f7d3e  tools/p4/r18/driver_support.py
+36f8ce7001a48f6e60b2143a1748574f3b29a2c9159ac2aa2983066d80e3a040  tools/p4/r18/driver_support.py
 d12473117d954766d6f3dbe50c33647b2f39d367a20d3fc2199f996e07ca8b7b  tools/p4/r18/local_smoke.py
 71c154d51378a0bd6ab23f0ffe28acb001dfc24a64523f3a75e628fe5d1915ba  tools/p4/r18/make_rgbnt201_dev_split.py
 60ee079e376124894d61c5577dfb6afdf4feee344fa9e5aaf662b94f2c3c6f4a  tools/p4/r18/overlap_map.py
 dded39d3a611e2981c734638811b6fae88a24d813d1746f8ec1f08686db32fb5  tools/p4/r18/package_data.py
-90f2ee74ea0cf708c124fbd4d33e89e9098e9c4f7262120378ba3ce340575dc8  tools/p4/r18/r18_devsmoke_report.py
-baaad54d6c76a7f953d9991a6abecbeea04dfe45306f56c830567ed5db77583e  tools/p4/r18/r18_exact.py
+13cf243728da62975339b79fe18e55fba27650f214ccc5f31a5716c1881e7bb7  tools/p4/r18/r18_devsmoke_report.py
+e2d89f515d0d38986041cb827b22a80bd5f93b0a31f50a32aa951edb9c8801d5  tools/p4/r18/r18_exact.py
 89e508c7fcdf3af68a80a2243c60ea7e0739d04704fa032e46c74a5b23dba7fd  tools/p4/r18/r18_subset.py
+bbb245ff9a0f142eb529c2ecf9328eae517d7f4931fe6cccddabfc5e4ccc0f99  tools/p4/r18/run_frozen.py
 7520f5a25b48a2a69c7d37c9352b7eb6645186feb591ca796086b0532b0743aa  tools/p4/r18/workflow.py
 d62102d63a544726821a759b646625b34fbca8a73c0912e920fa81b9f07c1fdf  tools/p4/r18/xcam_core.py
 f12ed883cbc0b3639f3578a5cbc505bc5f3a7bfb5d15b14ad43c0fe7cce04d3e  tools/p4/train_acd.py
@@ -201,7 +204,7 @@ if [ "$STAGE" = L1 ]; then
   done
   check_archives dev
   must unit devsmoke "$OUT/devsmoke/s101" "$OUT/feats/r201_dev_s101.npz" "$OUT/train_ir/r201_s101_train_ir.npz" -- \
-    "$PY" -B "$T/r17_const.py" --b12 . --feats "$OUT/feats" --base r201_dev_s101 --adapter r201_dev_s101 --assign none \
+    "$PY" -B "$R/run_frozen.py" --expect_sha "$R17_SHA" --log "$OUT/devsmoke/s101/degenerate_fits.json" -- "$T/r17_const.py" --b12 . --feats "$OUT/feats" --base r201_dev_s101 --adapter r201_dev_s101 --assign none \
     --out "$OUT/devsmoke/s101" --tag d_smoke_s101 --folds 2 --split_seeds 2026 --assign_seeds 2026 2027 2028 \
     --mixes M0 M4 M6c M1g M4c60 M9 M5e M5f M4id --skip_joint --methods 'B*' QE-DBA QE+M QE+CAET QE+SRC2f QE+EM FeatImp-g A-2f-ctxn \
     --grid_preset v3 --select_rule constrained --r_max 0.999999 --tie_break bstar --link_map train_lda --train_ir_npz "$OUT/train_ir/r201_s101_train_ir.npz" --timing
@@ -234,19 +237,19 @@ evaluate_units() {
   local branch=$1 prefix=$2 suffix=$3 s fs n=0 pid failed=0
   local pids=()
   for s in $SEEDS; do for fs in $FIT_SEEDS; do
-    local target=$OUT/${prefix}${branch}/s${s}_f${fs} tag script methods extra=()
-    tag=t_constrained_s${s}_f${fs}; script=$T/r15_test.py; methods=$METHODS
+    local target=$OUT/${prefix}${branch}/s${s}_f${fs} tag script methods expected extra=()
+    tag=t_constrained_s${s}_f${fs}; script=$T/r15_test.py; methods=$METHODS; expected=$R15_SHA
     if [ "$branch" = const ]; then
-      tag=c_s${s}_f${fs}; script=$T/r17_const.py; methods=$METHODS17
+      tag=c_s${s}_f${fs}; script=$T/r17_const.py; methods=$METHODS17; expected=$R17_SHA
       extra=(--fixed_selection "$OUT/${prefix}test/constrained/s${s}_f${fs}/r12_t_constrained_s${s}_f${fs}_selection.json" --const_grid $CONST_GRID --const_curve --perq_ext --timing)
     elif [ "$branch" = xcam ]; then
-      tag=x_s${s}_f${fs}; script=$T/r18_xcam.py; methods='B* QE-DBA QE+M QE+M-xcam'
+      tag=x_s${s}_f${fs}; script=$T/r18_xcam.py; methods='B* QE-DBA QE+M QE+M-xcam'; expected=$XCAM_SHA
       extra=(--fixed_selection "$OUT/test/constrained/s${s}_f${fs}/r12_t_constrained_s${s}_f${fs}_selection.json" --item_cams "$OUT/feats/cams_s$s.npz" --perq_ext)
     fi
     local ins=("$OUT/feats/r201_dev_s$s.npz" "$OUT/feats/r201_${suffix}_s$s.npz" "$OUT/train_ir/r201_s${s}_train_ir.npz")
     [ "$branch" = test/constrained ] || ins+=("${extra[1]}")
     [ "$branch" != xcam ] || ins+=("$OUT/feats/cams_s$s.npz")
-    local command=("$PY" -B "$script" --b12 . --feats "$OUT/feats" --assign none --out "$target" --base "r201_dev_s$s" --adapter "r201_dev_s$s" --tag "$tag" \
+    local command=("$PY" -B "$R/run_frozen.py" --expect_sha "$expected" --log "$target/degenerate_fits.json" -- "$script" --b12 . --feats "$OUT/feats" --assign none --out "$target" --base "r201_dev_s$s" --adapter "r201_dev_s$s" --tag "$tag" \
       --assign_seeds $ASSIGN_SEEDS --mixes $MIXES --skip_joint --methods $methods --grid_preset "$GRID" --select_rule constrained --r_max 0.999999 --tie_break bstar \
       --test_npz "$OUT/feats/r201_${suffix}_s$s.npz" --link_map train_lda --train_ir_npz "$OUT/train_ir/r201_s${s}_train_ir.npz" --test_seed "$fs" "${extra[@]}")
     local key=${prefix//\//_}${branch//\//_}_s${s}_f${fs}
@@ -281,6 +284,7 @@ must "$PY" -B "$T/r18_xcam_judge.py" --xcam_root "$OUT/xcam" --r15_root "$OUT/te
   --seeds $SEEDS --fits $FIT_SEEDS --expect_script_sha "$XCAM_SHA" --out "$OUT/report_xcam.json"
 must "$PY" -B "$R/driver_support.py" reports "$OUT/report_xcam.json"
 JUDGES=("full=$OUT/verdict_full.json"); R17S=("full=$OUT/report_const_full.json"); CELLS=("full=$OUT/test/constrained")
+RUNNERS=("full=$OUT/test/constrained" "full=$OUT/const" "full=$OUT/xcam")
 NOVERLAP=$("$PY" -B -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["overlap_test_ids"]))' "$OVERLAP") || stop 'Overlap JSON'
 if [ "$NOVERLAP" -gt 0 ]; then
   COMPLETE_SUBSET=1
@@ -308,10 +312,11 @@ if [ "$NOVERLAP" -gt 0 ]; then
     reports subset subset/ testnov
     must "$PY" -B "$R/workflow.py" selection --full "$OUT/test/constrained" --subset "$OUT/subset/test/constrained" --out "$OUT/checks/selection_equal.json"
     JUDGES+=("subset=$OUT/verdict_subset.json"); R17S+=("subset=$OUT/report_const_subset.json"); CELLS+=("subset=$OUT/subset/test/constrained")
+    RUNNERS+=("subset=$OUT/subset/test/constrained" "subset=$OUT/subset/const")
   fi
 else
   echo 'No overlap test IDs; no subset generated'
 fi
-must "$PY" -B "$R/r18_exact.py" --judge "${JUDGES[@]}" --r17 "${R17S[@]}" --xcam "$OUT/report_xcam.json" --cells "${CELLS[@]}" --seeds $SEEDS --out "$OUT/R18J.txt"
+must "$PY" -B "$R/r18_exact.py" --judge "${JUDGES[@]}" --r17 "${R17S[@]}" --xcam "$OUT/report_xcam.json" --cells "${CELLS[@]}" --runner_roots "${RUNNERS[@]}" --seeds $SEEDS --out "$OUT/R18J.txt"
 must guard
 FINAL=COMPLETE

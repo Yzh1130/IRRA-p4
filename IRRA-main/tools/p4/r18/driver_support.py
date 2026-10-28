@@ -1,5 +1,6 @@
 """Read-only checks and result packaging used by the R18 shell driver."""
 from pathlib import Path
+from collections import Counter
 import argparse,hashlib,json,os,platform,sys,tarfile
 CODE=Path(__file__).resolve().parents[3];sys.path.insert(0,str(CODE))
 from tools.p4.r18.common import read_json,write_json,sha256
@@ -70,6 +71,10 @@ def smoke_health(directory,output):
 def finish(out,root,phase,status):
     out,root=Path(out),Path(root);digest=out/('DIGEST18_'+phase+'.txt')
     parts=['STATUS_'+phase+'='+status]
+    parts.append('\n===== run_frozen auxiliary single-class fits by unit =====')
+    for log in sorted(out.rglob('degenerate_fits.json')):
+        events=read_json(log)['events'];counts=Counter(e['head'] for e in events)
+        parts.append(str(log.parent.relative_to(out))+' events='+str(len(events))+' heads='+json.dumps(dict(sorted(counts.items())),sort_keys=True))
     for p in sorted(out.glob('checks/*.json'))+sorted(out.glob('report*.json'))+sorted(out.glob('verdict*.json'))+sorted(out.glob('R18J*.txt')):
         parts.extend(['\n===== '+str(p.relative_to(out))+' =====',p.read_text(encoding='utf-8')])
     parts.extend(['\n===== stage manifests =====']+[str(p.relative_to(out))+' '+sha256(p) for p in sorted((out/'.manifests').glob('*.json'))])

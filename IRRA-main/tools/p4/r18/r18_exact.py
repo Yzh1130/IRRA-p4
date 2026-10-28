@@ -2,7 +2,7 @@
 from pathlib import Path
 from decimal import Decimal,ROUND_HALF_UP
 import argparse
-from collections import defaultdict
+from collections import defaultdict,Counter
 import json
 import math
 import re
@@ -33,8 +33,24 @@ def flatten_json(records,src,scope,node,seeds,path=(),inherited=None):
     else:
         for seed in ([inherited] if inherited is not None else seeds):emit(records,src,scope,seed,'.'.join(path),node)
 
+def runner_records(records,roots):
+    seen=set()
+    for spec in roots:
+        scope,directory=spec.split('=',1);root=Path(directory)
+        if not root.is_dir():raise FileNotFoundError(root)
+        for log in sorted(root.rglob('degenerate_fits.json')):
+            if log.resolve() in seen:continue
+            seen.add(log.resolve());data=json.loads(log.read_text(encoding='utf-8'))
+            match=re.search(r'(?:^|/)s(\d+)(?:_f\d+)?(?:/|$)',log.parent.as_posix())
+            seed=match.group(1) if match else 'unknown'
+            counts=Counter(event['head'] for event in data['events'])
+            emit(records,'runner',scope,seed,root.name+'/'+log.parent.relative_to(root).as_posix(),
+                 {'events':len(data['events']),'heads':dict(sorted(counts.items())),
+                  'script':data['script'],'script_sha256':data['script_sha256']})
+
 def build(cli):
     records=[]
+    runner_records(records,getattr(cli,'runner_roots',[]))
     for src,items in [('judge',cli.judge),('r17',cli.r17)]:
         for spec in items:
             scope,path=spec.split('=',1);flatten_json(records,src,scope,json.loads(Path(path).read_text(encoding='utf-8')),cli.seeds)
@@ -60,6 +76,7 @@ def build(cli):
             for (mixture,method),frame in dg.groupby(['mixture','method']):emit(records,'diag_cells',scope,seed,'mixture.'+mixture+'.'+method,{k:float(frame[k].mean()) for k in ('frac_src','leak','coverage') if k in frame})
     grouped=defaultdict(dict)
     for row in records:
+        if row['src']=='runner':continue  # exactly one raw row per execution unit
         for field,value in row['v'].items():
             if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value):grouped[(row['src'],row['set'],row['key'],field)][row['seed']]=float(value)
     def rounded(value):return str(Decimal(str(value)).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP))
@@ -71,5 +88,5 @@ def build(cli):
     Path(cli.out).parent.mkdir(parents=True,exist_ok=True);Path(cli.out).write_text(text,encoding='utf-8',newline='\n');print(text,end='');return records
 
 if __name__=='__main__':
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--judge',nargs='*',default=[]);ap.add_argument('--r17',nargs='*',default=[]);ap.add_argument('--xcam');ap.add_argument('--cells',nargs='+',required=True);ap.add_argument('--seeds',nargs='+',type=int,default=[101,102,103]);ap.add_argument('--out',required=True)
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--judge',nargs='*',default=[]);ap.add_argument('--r17',nargs='*',default=[]);ap.add_argument('--xcam');ap.add_argument('--cells',nargs='+',required=True);ap.add_argument('--seeds',nargs='+',type=int,default=[101,102,103]);ap.add_argument('--out',required=True);ap.add_argument('--runner_roots',nargs='*',default=[])
     build(ap.parse_args())
