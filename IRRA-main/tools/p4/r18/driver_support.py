@@ -1,7 +1,7 @@
 """Read-only checks and result packaging used by the R18 shell driver."""
 from pathlib import Path
 from collections import Counter
-import argparse,hashlib,json,os,platform,sys,tarfile
+import argparse,hashlib,json,math,os,platform,sys,tarfile
 CODE=Path(__file__).resolve().parents[3];sys.path.insert(0,str(CODE))
 from tools.p4.r18.common import read_json,write_json,sha256
 
@@ -32,25 +32,38 @@ def construct(root,split):
     if any(sets[i]&sets[j] for i in range(3) for j in range(i)):raise ValueError('Identity split overlap')
     print(json.dumps(counts,ensure_ascii=False))
 
-def environment(synthetic=False):
+def resource_summary(root=Path('/')):
+    def read(relative):
+        try:return (Path(root)/relative).read_text().strip()
+        except OSError:return ''
+    available=0
+    for line in read('proc/meminfo').splitlines():
+        if line.startswith('MemAvailable:'):available=int(line.split()[1])*1024
+    limit=read('sys/fs/cgroup/memory.max') or read('sys/fs/cgroup/memory/memory.limit_in_bytes')
+    used=read('sys/fs/cgroup/memory.current') or read('sys/fs/cgroup/memory/memory.usage_in_bytes')
+    if limit.isdigit() and int(limit)<2**60 and used.isdigit():available=min(available,max(0,int(limit)-int(used)))
+    try:affinity=len(os.sched_getaffinity(0))
+    except AttributeError:affinity=os.cpu_count() or 1
+    quota=read('sys/fs/cgroup/cpu.max').split()
+    if len(quota)!=2:quota=[read('sys/fs/cgroup/cpu/cpu.cfs_quota_us'),read('sys/fs/cgroup/cpu/cpu.cfs_period_us')]
+    cpu=affinity
+    if quota[0].isdigit() and quota[1].isdigit() and int(quota[0])>0 and int(quota[1])>0:
+        cpu=min(cpu,max(1,math.ceil(int(quota[0])/int(quota[1]))))
+    gib=available//2**30
+    jobs=max(1,min(cpu-1,(gib-6)//8,9))
+    return {'available_memory_bytes':available,'available_memory_GiB':gib,'affinity_cpus':affinity,'nproc':cpu,'PAR':jobs}
+
+def environment(synthetic=False,parallel_json=None):
     import numpy as np,torch
     print('Python',sys.version,'numpy',np.__version__,'torch',torch.__version__,'CUDA',torch.version.cuda,'platform',platform.platform())
     np.show_config()
     if not synthetic:
         if not torch.cuda.is_available():raise ValueError('CUDA is required for a real L1/L2 run')
         print('GPU',torch.cuda.get_device_name(0))
-    available=0
-    if Path('/proc/meminfo').exists():
-        for line in Path('/proc/meminfo').read_text().splitlines():
-            if line.startswith('MemAvailable:'):available=int(line.split()[1])*1024
-        try:
-            limit=Path('/sys/fs/cgroup/memory.max').read_text().strip();used=int(Path('/sys/fs/cgroup/memory.current').read_text())
-            if limit.isdigit():available=min(available,max(0,int(limit)-used))
-        except (OSError,ValueError):pass
-    # Same conservative memory budget as R17: 12 GiB per fit plus 6 GiB reserve.
-    jobs=max(1,min(3,(available//2**30-6)//12)) if available else 1
-    print('AVAILABLE_BYTES',available,'PARALLEL_FITS',jobs)
-    return jobs
+    resources=resource_summary()
+    if parallel_json:write_json(parallel_json,resources)
+    print('[R18_RESOURCES]',json.dumps(resources,sort_keys=True))
+    return resources['PAR']
 
 def validate_reports(paths):
     for path in paths:
@@ -68,17 +81,49 @@ def smoke_health(directory,output):
     if record['status']!='smoke_completed' or len(steps)!=30 or not all(s['finite'] for s in steps):raise ValueError('Smoke incomplete/nonfinite')
     write_json(output,{'steps':steps,'record':str(records[0]),'status':record['status']})
 
+def compact_check(path,data):
+    if path.stem.startswith('archives_'):
+        return {seed:{'status':'OK' if not result.get('problems') else 'PROBLEMS',
+                      'problems':result.get('problems',[])} for seed,result in data.items()}
+    if path.stem=='smoke':
+        steps=data.get('steps',[])
+        return {'status':data.get('status'),'record':data.get('record'),'steps':len(steps),
+                'all_finite':all(s.get('finite',False) for s in steps),
+                'seconds':sum(s.get('seconds',0) for s in steps),
+                'peak_memory_bytes':max((s.get('peak_memory_bytes',0) for s in steps),default=0),
+                'loss_min':min((s.get('L_total',float('inf')) for s in steps),default=None),
+                'loss_max':max((s.get('L_total',-float('inf')) for s in steps),default=None)}
+    return data
+
 def finish(out,root,phase,status):
     out,root=Path(out),Path(root);digest=out/('DIGEST18_'+phase+'.txt')
     parts=['STATUS_'+phase+'='+status]
+    for p in sorted(out.glob('STATUS_*')):parts.append(p.name+'='+p.read_text(encoding='utf-8').strip())
+    protected=out/'checks/protected.json'
+    if protected.is_file():
+        parts.append('PROTECTED_MANIFEST files='+str(len(read_json(protected)))+' sha256='+sha256(protected))
     parts.append('\n===== run_frozen auxiliary single-class fits by unit =====')
     for log in sorted(out.rglob('degenerate_fits.json')):
         events=read_json(log)['events'];counts=Counter(e['head'] for e in events)
         parts.append(str(log.parent.relative_to(out))+' events='+str(len(events))+' heads='+json.dumps(dict(sorted(counts.items())),sort_keys=True))
-    for p in sorted(out.glob('checks/*.json'))+sorted(out.glob('report*.json'))+sorted(out.glob('verdict*.json'))+sorted(out.glob('R18J*.txt')):
-        parts.extend(['\n===== '+str(p.relative_to(out))+' =====',p.read_text(encoding='utf-8')])
+    checks=('regression','smoke','recipe_paths','devsmoke','selection_equal','parallel')
+    for p in sorted(out.glob('checks/*.json')):
+        if p.stem not in checks and not p.stem.startswith(('health_s','archives_')):continue
+        parts.extend(['\n===== '+str(p.relative_to(out))+' =====',json.dumps(compact_check(p,read_json(p)),ensure_ascii=False,indent=2)])
+    if (out/'checks/parallel.txt').is_file():parts.append('PAR='+str((out/'checks/parallel.txt').read_text().strip()))
+    text_reports=sorted(out.glob('verdict_*.txt'))+sorted(out.glob('report_const_*.txt'))
+    if (out/'report_xcam.txt').is_file():text_reports.append(out/'report_xcam.txt')
+    if (out/'R18J_core.txt').is_file():text_reports.append(out/'R18J_core.txt')
+    for p in text_reports:parts.extend(['\n===== '+p.name+' =====',p.read_text(encoding='utf-8')])
     parts.extend(['\n===== stage manifests =====']+[str(p.relative_to(out))+' '+sha256(p) for p in sorted((out/'.manifests').glob('*.json'))])
-    digest.write_text('\n'.join(parts)+'\n',encoding='utf-8',newline='\n')
+    body='\n'.join(parts)+'\n';footer=''
+    while True:
+        text=body+footer
+        updated=f'DIGEST_STATS lines={text.count(chr(10))} bytes={len(text.encode("utf-8"))}\n'
+        if updated==footer:break
+        footer=updated
+    digest.write_text(text,encoding='utf-8',newline='\n')
+    print('[R18_DIGEST]',digest.name,'lines='+str(text.count('\n')),'bytes='+str(len(text.encode('utf-8'))))
     target=root/('p4_r18_'+phase+'_results.tar.gz')
     with tarfile.open(target,'w:gz') as tf:
         for p in sorted(out.rglob('*')):
@@ -91,7 +136,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__);sub=ap.add_subparsers(dest='op',required=True)
     p=sub.add_parser('data');p.add_argument('--root',required=True);p.add_argument('--upload',required=True)
     p=sub.add_parser('construct');p.add_argument('--root',required=True);p.add_argument('--split',required=True)
-    p=sub.add_parser('environment');p.add_argument('--synthetic',action='store_true');p.add_argument('--parallel_file')
+    p=sub.add_parser('environment');p.add_argument('--synthetic',action='store_true');p.add_argument('--parallel_file');p.add_argument('--parallel_json')
     p=sub.add_parser('reports');p.add_argument('paths',nargs='+')
     p=sub.add_parser('finish');p.add_argument('--out',required=True);p.add_argument('--root',required=True);p.add_argument('--phase',required=True);p.add_argument('--status',required=True)
     p=sub.add_parser('base-config');p.add_argument('--config',required=True)
@@ -100,7 +145,7 @@ def main():
     if a.op=='data':prepare_data(a.root,a.upload)
     elif a.op=='construct':construct(a.root,a.split)
     elif a.op=='environment':
-        jobs=environment(a.synthetic)
+        jobs=environment(a.synthetic,a.parallel_json)
         if a.parallel_file:Path(a.parallel_file).write_text(str(jobs)+'\n',encoding='utf-8',newline='\n')
     elif a.op=='reports':validate_reports(a.paths)
     elif a.op=='smoke':smoke_health(a.directory,a.out)

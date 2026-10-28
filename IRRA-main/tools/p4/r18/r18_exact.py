@@ -85,8 +85,13 @@ def build(cli):
         mean=float(np.mean(numbers));sd=float(np.std(numbers,ddof=1)) if len(numbers)>1 else None
         emit(records,src,scope,'mean',key+'.'+field,dict(mean=mean,std_ddof1=sd,n=len(numbers),mean_2dp_HALF_UP=rounded(mean),std_2dp_HALF_UP=rounded(sd) if sd is not None else None))
     text='\n'.join('R18J '+json.dumps(r,sort_keys=True,ensure_ascii=False,separators=(',',':')) for r in records)+'\n'
-    Path(cli.out).parent.mkdir(parents=True,exist_ok=True);Path(cli.out).write_text(text,encoding='utf-8',newline='\n');print(text,end='');return records
+    Path(cli.out).parent.mkdir(parents=True,exist_ok=True);Path(cli.out).write_text(text,encoding='utf-8',newline='\n');print(text,end='')
+    if getattr(cli,'core_out',None):
+        from tools.p4.r18.r18_core import write_core
+        write_core(cli,records)
+    return records
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--judge',nargs='*',default=[]);ap.add_argument('--r17',nargs='*',default=[]);ap.add_argument('--xcam');ap.add_argument('--cells',nargs='+',required=True);ap.add_argument('--seeds',nargs='+',type=int,default=[101,102,103]);ap.add_argument('--out',required=True);ap.add_argument('--runner_roots',nargs='*',default=[])
+    ap.add_argument('--core_out');ap.add_argument('--selection_equal',nargs='*',default=[]);ap.add_argument('--judge_exit_status',nargs='*',default=[],help='Recorded successful judge exit codes, e.g. full=0 subset=0; omitted means unrecorded')
     build(ap.parse_args())

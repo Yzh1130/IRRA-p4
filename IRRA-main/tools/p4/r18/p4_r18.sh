@@ -16,7 +16,7 @@ GRID=v3; CONST_GRID='0 0.05 0.1 0.2 0.25 0.5 0.75 1'
 case $STAGE in L1|L2|L2R) ;; *) echo 'STAGE must be L1, L2 or L2R'; exit 2;; esac
 PHASE=$STAGE; [ "$STAGE" != L2R ] || PHASE=L2
 mkdir -p "$OUT/logs" "$OUT/checks" "$OUT/.manifests"
-mkdir "$OUT/.lock" 2>/dev/null || { echo 'R18 lock exists; stopped'; exit 2; }
+mkdir "$OUT/.lock" 2>/dev/null || { echo "上次运行可能被中断；确认没有 p4_r18 进程在运行后，执行 rmdir $OUT/.lock 再重试"; exit 2; }
 TS=$(date +%Y%m%d_%H%M%S); LOG=$OUT/logs/${STAGE}_${TS}.log
 exec > >(tee -a "$LOG") 2>&1
 export PYTHONUTF8=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -41,20 +41,25 @@ finish() {
   trap - EXIT INT TERM
   while read -r pid; do wait "$pid" || rc=1; done < <(jobs -rp)
   guard || { rc=1; FINAL=PROTECTED_TREE_CHANGED; }
-  [ "$rc" -eq 0 ] || FINAL="STOPPED exit=$rc"
+  if [ "$rc" -ne 0 ]; then FINAL="$FINAL (exit=$rc)"; fi
   printf '%s\n' "$FINAL" > "$STATUS"
   "$PY" -B "$R/driver_support.py" finish --out "$OUT" --root "$ROOT" --phase "$PHASE" --status "$FINAL" || rc=1
   rmdir "$OUT/.lock"
   if [ "$AUTO_SHUTDOWN" = 1 ]; then
-    echo "Shutdown in 180 seconds; touch $ROOT/p4_r18_no_shutdown to cancel"
-    (sleep 180; [ -e "$ROOT/p4_r18_no_shutdown" ] || /usr/sbin/shutdown -h now) </dev/null >/dev/null 2>&1 &
+    if [ ! -e /usr/bin/shutdown ]; then
+      echo '!!! /usr/bin/shutdown 不存在：无法自动关机；请人工确认实例状态。不会尝试其他路径。 !!!'
+    else
+      echo "Shutdown in 180 seconds; touch $ROOT/p4_r18_no_shutdown to cancel"
+      (sleep 180; [ -e "$ROOT/p4_r18_no_shutdown" ] || { sync; /usr/bin/shutdown; }) </dev/null >/dev/null 2>&1 &
+    fi
   fi
   exit "$rc"
 }
 trap finish EXIT
 trap 'exit 130' INT TERM
-stop() { echo "STOPPED: $*"; exit 1; }
+stop() { FINAL="STOPPED: $*"; echo "$FINAL"; exit 1; }
 must() { "$@" || stop "command failed: $*"; }
+capture() { local file=$1; shift; "$@" | tee "$file" || stop "report failed: $*"; }
 if [ "${SKIP_CONDA:-0}" != 1 ]; then
   CONDA_BASE=${CONDA_BASE:-/root/miniconda3}
   source "$CONDA_BASE/etc/profile.d/conda.sh" || stop 'conda setup'
@@ -80,8 +85,10 @@ c50c78a0215f43ad63b5f14a25fe1db0e2f229b34d97d648b36b91d6b55f7bfe  datasets/build
 21a35ce04ad56b6ba64ebb611b8a732b02f75b97fcf78443fe214a6005127a8c  datasets/rgbnt201pedes.py
 3d94e6622fb2dd62f5f305f353308d0cf6ec97649d197130bac8477acd7cdea0  splits/rgbnt201_dev30.json
 767580b5acf6ef749596d5cb76a1a63695f360e4387f88c2f6b2194ad5e8711d  splits/rgbnt201_overlap.json
+7a2c4aac36ad549fcff30baf8f9c0460a6c4101d5f184efed78c3cfeb7f79540  tests/p4/test_r18_core.py
 fef3ad5ee2907a47657380237d97248bda4fbd458db83363934f8f5cb1a13114  tests/p4/test_r18_data.py
 152655fe2d8b3665367c4720b0118184020acfe70bd900ab45af88cf2a68b8f4  tests/p4/test_r18_eval.py
+e6ce3b30fb0f71fb9760d24eb412404ab2e4175d1fe51d1771e06c0df66d6866  tests/p4/test_r18_execution.py
 5bd0069fc2d8f712f1a43e79ab4d71e910c23def5f641ac3dc2c2328f3d8e275  tests/p4/test_r18_runner.py
 e387c70c55582e9bacbd8b78f6edb64bc9dcef9b859e91f11ccf33f1392c0a1c  tools/p4/export_dev_records.py
 8dc919479ab8922694feea324b020f4665b6e22fbb65b05c195f1a1a27cfd6f0  tools/p4/export_eval_split.py
@@ -89,16 +96,18 @@ e387c70c55582e9bacbd8b78f6edb64bc9dcef9b859e91f11ccf33f1392c0a1c  tools/p4/expor
 84e9725540f62ba4fdf8896c5e5c40771b49f8d1c09b9b825b76d88d4dacb2fb  tools/p4/export_train_ir_feats.py
 15abd8312bafa628cf2192ff1c64b5bc33e167e1f7d8bf5fd0dcbd545b7a8cff  tools/p4/pack_feats.py
 8acb3386908d634cb5fc06b2a585e65a67c81a0c32a5ad633d6e69b9f13e5cbe  tools/p4/r18/common.py
-36f8ce7001a48f6e60b2143a1748574f3b29a2c9159ac2aa2983066d80e3a040  tools/p4/r18/driver_support.py
+d8d8e3fc984329270565fceb60dc6a5cdf8f139481b3a767a45b8700065c3da8  tools/p4/r18/driver_support.py
 d12473117d954766d6f3dbe50c33647b2f39d367a20d3fc2199f996e07ca8b7b  tools/p4/r18/local_smoke.py
 71c154d51378a0bd6ab23f0ffe28acb001dfc24a64523f3a75e628fe5d1915ba  tools/p4/r18/make_rgbnt201_dev_split.py
 60ee079e376124894d61c5577dfb6afdf4feee344fa9e5aaf662b94f2c3c6f4a  tools/p4/r18/overlap_map.py
 dded39d3a611e2981c734638811b6fae88a24d813d1746f8ec1f08686db32fb5  tools/p4/r18/package_data.py
+b9d0a6d661fd276af410cf715b0f58ead92fb1c0f161a7c5fa51c72c493c493a  tools/p4/r18/r18_core.py
 13cf243728da62975339b79fe18e55fba27650f214ccc5f31a5716c1881e7bb7  tools/p4/r18/r18_devsmoke_report.py
-e2d89f515d0d38986041cb827b22a80bd5f93b0a31f50a32aa951edb9c8801d5  tools/p4/r18/r18_exact.py
+7ee81a07e3a6e9777457ba8d2761b213c0d5f19c4b066d9bb43a60fd1e9ac2af  tools/p4/r18/r18_exact.py
 89e508c7fcdf3af68a80a2243c60ea7e0739d04704fa032e46c74a5b23dba7fd  tools/p4/r18/r18_subset.py
+86326a969104dfa5029aee31dcdea5eed5398fd0bb1677361589265b08a32399  tools/p4/r18/read_e1_core.py
 bbb245ff9a0f142eb529c2ecf9328eae517d7f4931fe6cccddabfc5e4ccc0f99  tools/p4/r18/run_frozen.py
-7520f5a25b48a2a69c7d37c9352b7eb6645186feb591ca796086b0532b0743aa  tools/p4/r18/workflow.py
+7829a0f03266421ad7a657b78dc9c634cf731984cf387748f35e0cc862a22ede  tools/p4/r18/workflow.py
 d62102d63a544726821a759b646625b34fbca8a73c0912e920fa81b9f07c1fdf  tools/p4/r18/xcam_core.py
 f12ed883cbc0b3639f3578a5cbc505bc5f3a7bfb5d15b14ad43c0fe7cce04d3e  tools/p4/train_acd.py
 1375f6add366f72e2ff9677d16b6a84fab950a2ece4d99a94494dd5c123e126a  tools/p4/transfer/judge_test.py
@@ -115,13 +124,13 @@ R18_HASHES
 echo 'Driver SHA256 (printed only):'; must sha256sum "$R/p4_r18.sh"
 must guard
 if [ "$SYNTHETIC" = 1 ]; then
-  must "$PY" -B "$R/driver_support.py" environment --synthetic --parallel_file "$OUT/checks/parallel.txt"
+  must "$PY" -B "$R/driver_support.py" environment --synthetic --parallel_file "$OUT/checks/parallel.txt" --parallel_json "$OUT/checks/parallel.json"
 else
-  must "$PY" -B "$R/driver_support.py" environment --parallel_file "$OUT/checks/parallel.txt"
+  must "$PY" -B "$R/driver_support.py" environment --parallel_file "$OUT/checks/parallel.txt" --parallel_json "$OUT/checks/parallel.json"
   must nvidia-smi -L
   must df -h "$ROOT"
   must "$PY" -B "$R/driver_support.py" data --root "$DATA_ROOT" --upload "$UPLOAD"
-  (cd "$DATA_ROOT" && sha256sum -c "$UPLOAD/RGBNT201_files.sha256") || stop 'Dataset file verification'
+  (cd "$DATA_ROOT" && sha256sum -c --quiet "$UPLOAD/RGBNT201_files.sha256") || stop 'Dataset file verification'
   [ "$(wc -l < "$UPLOAD/RGBNT201_files.sha256")" -eq 9575 ] || stop 'Data count'
   must git check-ignore "$DATA_ROOT/RGBNT201/captionform0_8B.json"
 fi
@@ -131,8 +140,9 @@ echo "Memory-limited parallel fits: $PAR"
 # unit NAME OUTPUT INPUT... -- COMMAND...; every output remains read-only on reuse.
 unit() {
   local name=$1 output=$2; shift 2
-  local inputs=() cmd=() make=()
+  local inputs=() cmd=() make=() kind=l1
   case "$name" in test_constrained_*|const_*|xcam_*|subset_test_constrained_*|subset_const_*|devsmoke) make=(--mkdir);; esac
+  case "$name" in test_constrained_*|const_*|xcam_*|subset_*|devsmoke) kind=eval;; esac
   while [ "$#" -gt 0 ] && [ "$1" != -- ]; do inputs+=("$1"); shift; done
   if [ "$SYNTHETIC" != 1 ]; then
     inputs+=("$UPLOAD/RGBNT201_files.sha256" "$DATA_ROOT/RGBNT201/captionform0_8B.json")
@@ -146,8 +156,7 @@ unit() {
     done
   fi
   "$PY" -B "$R/workflow.py" stage --manifest "$OUT/.manifests/$name.json" --done "$OUT/.manifests/$name.done" \
-    "${VERIFY[@]}" "${make[@]}" --inputs "${inputs[@]}" --outputs "$output" -- "${cmd[@]}" || return $?
-  guard
+    "${VERIFY[@]}" "${make[@]}" --signature_kind "$kind" --inputs "${inputs[@]}" --outputs "$output" -- "${cmd[@]}"
 }
 find_run() { "$PY" -B "$R/workflow.py" find-run --parent "$1" --name "$2" "${@:3}"; }
 export_split() {
@@ -183,8 +192,9 @@ if [ "$STAGE" = L1 ]; then
   must unit regression12 "$OUT/feats/regression.npz" "$OUT/feats_full/regression/regression.npz" -- \
     "$PY" -B "$R/workflow.py" pack12 --input "$OUT/feats_full/regression/regression.npz" --output "$OUT/feats/regression.npz"
   must "$PY" -B "$R/workflow.py" compare-npz --first "$OUT/feats/regression.npz" --second "$R13_IN/base_ref_s101.npz" --out "$OUT/checks/regression.json"
+  must guard
   must "$PY" -B "$R/driver_support.py" construct --root "$DATA_ROOT" --split "$DEV_SPLIT"
-  must unit smoke "$OUT/smoke" "$BASE_YAML" "$DEV_SPLIT" -- env TRAIN_SEED=101 "$PY" -B train.py \
+  must unit smoke "$OUT/smoke" "$BASE_YAML" "$DEV_SPLIT" -- env -u OPENBLAS_NUM_THREADS -u OMP_NUM_THREADS -u MKL_NUM_THREADS TRAIN_SEED=101 "$PY" -B train.py \
     --config_file "$BASE_YAML" --dataset_name RGBNT201-PEDES --root_dir "$DATA_ROOT" --dev_split_file "$DEV_SPLIT" \
     --name r201_smoke --output_dir "$OUT/smoke" --smoke_steps 30
   must "$PY" -B "$R/driver_support.py" smoke --directory "$OUT/smoke" --out "$OUT/checks/smoke.json"
@@ -196,11 +206,13 @@ if [ "$STAGE" = L1 ]; then
       --name "r201_base_s$s" --output_dir "$OUT/runs/r201_base_s$s"
     RUN=$(find_run "$OUT/runs/r201_base_s$s/RGBNT201-PEDES" "r201_base_s$s") || stop "train run s$s"
     must "$PY" -B "$R/workflow.py" health --run "$RUN" --base "$S102/configs.yaml" --out "$OUT/checks/health_s$s.json"
+    must guard
     export_split "$s" dev "$RUN"
     must unit "ir_s$s" "$OUT/train_ir/r201_s${s}_train_ir.npz" "$RUN/last.pth" "$RUN/configs.yaml" "$DEV_SPLIT" "$OUT/feats/r201_dev_s$s.npz" -- \
       "$PY" -B tools/p4/export_train_ir_feats.py --checkpoint "$RUN/last.pth" --config_file "$RUN/configs.yaml" --root_dir "$DATA_ROOT" \
       --dev_split_file "$DEV_SPLIT" --output "$OUT/train_ir/r201_s${s}_train_ir.npz" --verify_dev_npz "$OUT/feats/r201_dev_s$s.npz" --device cuda
     L1FILES+=("$RUN/last.pth" "$OUT/feats/r201_dev_s$s.npz" "$OUT/train_ir/r201_s${s}_train_ir.npz" "$OUT/exports/r201_dev_s$s/item_meta.json")
+    must guard
   done
   check_archives dev
   must unit devsmoke "$OUT/devsmoke/s101" "$OUT/feats/r201_dev_s101.npz" "$OUT/train_ir/r201_s101_train_ir.npz" -- \
@@ -209,6 +221,7 @@ if [ "$STAGE" = L1 ]; then
     --mixes M0 M4 M6c M1g M4c60 M9 M5e M5f M4id --skip_joint --methods 'B*' QE-DBA QE+M QE+CAET QE+SRC2f QE+EM FeatImp-g A-2f-ctxn \
     --grid_preset v3 --select_rule constrained --r_max 0.999999 --tie_break bstar --link_map train_lda --train_ir_npz "$OUT/train_ir/r201_s101_train_ir.npz" --timing
   must "$PY" -B "$R/r18_devsmoke_report.py" --run "$OUT/devsmoke/s101" --archive "$OUT/feats/r201_dev_s101.npz" --out "$OUT/checks/devsmoke.json"
+  must guard
   must "$PY" -B "$R/workflow.py" manifest --out "$OUT/L1_manifest.json" "${L1FILES[@]}" "$UPLOAD/RGBNT201_files.sha256" "$DATA_ROOT/RGBNT201/captionform0_8B.json"
   FINAL=COMPLETE; exit 0
 fi
@@ -227,6 +240,7 @@ if [ "$STAGE" = L2 ]; then
         --dev_full "$OUT/feats_full/r201_dev_s$s/r201_dev_s$s.npz" --test_full "$OUT/feats_full/r201_test_s$s/r201_test_s$s.npz"
     done
   fi
+  must guard
   check_archives test
   must touch "$OUT/.eval_started"
 else
@@ -271,10 +285,11 @@ reports() {
     paths=''; for fs in $FIT_SEEDS; do paths=${paths:+$paths,}$OUT/${prefix}test/constrained/s${s}_f${fs}; done
     runs+=("s$s=$paths"); qraw+=("s$s=$OUT/feats/r201_dev_s$s.npz,$OUT/feats/r201_${suffix}_s$s.npz")
   done
-  must "$PY" -B "$T/judge_test.py" --runs "${runs[@]}" --qraw "${qraw[@]}" --evalset test --out "$OUT/verdict_$scope.json"
-  must "$PY" -B "$T/r17_judge.py" --r17_root "$OUT/${prefix}const" --r15_root "$OUT/${prefix}test/constrained" \
+  capture "$OUT/verdict_$scope.txt" "$PY" -B "$T/judge_test.py" --runs "${runs[@]}" --qraw "${qraw[@]}" --evalset test --out "$OUT/verdict_$scope.json"
+  capture "$OUT/report_const_$scope.txt" "$PY" -B "$T/r17_judge.py" --r17_root "$OUT/${prefix}const" --r15_root "$OUT/${prefix}test/constrained" \
     --seeds $SEEDS --fits $FIT_SEEDS --expect_script_sha "$R17_SHA" --out "$OUT/report_const_$scope.json"
   must "$PY" -B "$R/driver_support.py" reports "$OUT/verdict_$scope.json" "$OUT/report_const_$scope.json"
+  must guard
 }
 evaluate_units test/constrained '' test
 evaluate_units const '' test
@@ -283,8 +298,10 @@ reports full '' test
 must "$PY" -B "$T/r18_xcam_judge.py" --xcam_root "$OUT/xcam" --r15_root "$OUT/test/constrained" \
   --seeds $SEEDS --fits $FIT_SEEDS --expect_script_sha "$XCAM_SHA" --out "$OUT/report_xcam.json"
 must "$PY" -B "$R/driver_support.py" reports "$OUT/report_xcam.json"
+must guard
 JUDGES=("full=$OUT/verdict_full.json"); R17S=("full=$OUT/report_const_full.json"); CELLS=("full=$OUT/test/constrained")
 RUNNERS=("full=$OUT/test/constrained" "full=$OUT/const" "full=$OUT/xcam")
+SELECTIONS=(); JUDGE_EXITS=(full=0)
 NOVERLAP=$("$PY" -B -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["overlap_test_ids"]))' "$OVERLAP") || stop 'Overlap JSON'
 if [ "$NOVERLAP" -gt 0 ]; then
   COMPLETE_SUBSET=1
@@ -313,10 +330,11 @@ if [ "$NOVERLAP" -gt 0 ]; then
     must "$PY" -B "$R/workflow.py" selection --full "$OUT/test/constrained" --subset "$OUT/subset/test/constrained" --out "$OUT/checks/selection_equal.json"
     JUDGES+=("subset=$OUT/verdict_subset.json"); R17S+=("subset=$OUT/report_const_subset.json"); CELLS+=("subset=$OUT/subset/test/constrained")
     RUNNERS+=("subset=$OUT/subset/test/constrained" "subset=$OUT/subset/const")
+    SELECTIONS+=("subset=$OUT/checks/selection_equal.json"); JUDGE_EXITS+=(subset=0)
   fi
 else
   echo 'No overlap test IDs; no subset generated'
 fi
-must "$PY" -B "$R/r18_exact.py" --judge "${JUDGES[@]}" --r17 "${R17S[@]}" --xcam "$OUT/report_xcam.json" --cells "${CELLS[@]}" --runner_roots "${RUNNERS[@]}" --seeds $SEEDS --out "$OUT/R18J.txt"
+must "$PY" -B "$R/r18_exact.py" --judge "${JUDGES[@]}" --r17 "${R17S[@]}" --xcam "$OUT/report_xcam.json" --cells "${CELLS[@]}" --runner_roots "${RUNNERS[@]}" --seeds $SEEDS --out "$OUT/R18J.txt" --core_out "$OUT/R18J_core.txt" --selection_equal "${SELECTIONS[@]}" --judge_exit_status "${JUDGE_EXITS[@]}"
 must guard
 FINAL=COMPLETE

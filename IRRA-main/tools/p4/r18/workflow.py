@@ -1,6 +1,7 @@
 """Fail-closed R18 manifests, configuration health, packing and camera metadata."""
 from pathlib import Path
 import argparse
+import ast
 import fnmatch
 import json
 import math
@@ -28,15 +29,50 @@ def files_of(paths,exclude=()):
             result[str(q.resolve())]=sha256(q)
     return result
 
-def code_signature():
-    paths=[CODE/'train.py']
+REPORT_FILES={'tools/p4/r18/p4_r18.sh','tools/p4/r18/driver_support.py',
+              'tools/p4/r18/r18_exact.py','tools/p4/r18/r18_devsmoke_report.py',
+              'tools/p4/transfer/r18_xcam_judge.py','tools/p4/transfer/judge_test.py',
+              'tools/p4/transfer/r17_judge.py'}
+EVAL_FILES=('tools/p4/transfer/r15_test.py','tools/p4/transfer/r17_const.py',
+            'tools/p4/transfer/r17_check_archives.py','tools/p4/transfer/r18_xcam.py',
+            'tools/p4/r18/xcam_core.py','tools/p4/r18/run_frozen.py',
+            'tools/p4/r18/r18_subset.py','tools/p4/r18/common.py')
+
+def signature_paths(kind='l1'):
+    if kind=='eval':return [CODE/p for p in EVAL_FILES]
+    if kind!='l1':raise ValueError('Unknown code signature kind: '+kind)
+    paths={CODE/'train.py',CODE/'tools/p4/pack_feats.py',CODE/'tools/p4/r18/common.py',CODE/'tools/p4/r18/workflow.py'}
     for directory in ('datasets','model','utils','processor'):
-        paths.extend(sorted((CODE/directory).rglob('*.py')))
-    paths.extend(sorted((CODE/'tools/p4').glob('export_*.py')))
-    paths.extend(sorted((CODE/'tools/p4/r18').glob('*')))
-    paths.extend(sorted((CODE/'tools/p4/transfer').glob('r18*.py')))
-    paths.extend(CODE/'tools/p4/transfer'/name for name in ('r15_test.py','judge_test.py','r17_const.py','r17_judge.py','r17_check_archives.py','r17_reagg_r15.py','p4_r17.sh'))
-    return files_of([str(p) for p in paths if p.is_file()])
+        paths.update((CODE/directory).rglob('*.py'))
+    paths.update((CODE/'tools/p4').glob('export_*.py'))
+    # Resolve the repository-local import closure, including imports inside
+    # optional training/export branches, without importing or running them.
+    todo=list(paths);seen=set()
+    def candidates(parts):
+        base=CODE.joinpath(*parts)
+        return [base.with_suffix('.py'),base/'__init__.py']
+    while todo:
+        path=todo.pop()
+        if path in seen or not path.is_file():continue
+        seen.add(path)
+        if path.relative_to(CODE).as_posix() in REPORT_FILES:continue
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8-sig'))):
+            names=[]
+            if isinstance(node,ast.Import):names=[alias.name.split('.') for alias in node.names]
+            elif isinstance(node,ast.ImportFrom):
+                if node.level:
+                    package=list(path.relative_to(CODE).parts[:-1]);prefix=package[:len(package)-node.level+1]
+                else:prefix=[]
+                module=prefix+(node.module.split('.') if node.module else [])
+                names=[module]+[module+alias.name.split('.') for alias in node.names if alias.name!='*']
+            for parts in names:
+                for imported in candidates(parts):
+                    if imported.is_file() and imported not in paths:
+                        paths.add(imported);todo.append(imported)
+    return sorted(p for p in paths if p.is_file() and p.relative_to(CODE).as_posix() not in REPORT_FILES)
+
+def code_signature(kind='l1'):
+    return files_of(signature_paths(kind))
 
 def guard(paths,manifest):
     current=files_of(paths)
@@ -48,7 +84,8 @@ def guard(paths,manifest):
 def stage(cli):
     manifest=Path(cli.manifest);done=Path(cli.done)
     command=cli.command[1:] if cli.command and cli.command[0]=='--' else cli.command
-    signature={'command':command,'inputs':files_of(cli.inputs),'code':code_signature()}
+    kind=getattr(cli,'signature_kind','l1')
+    signature={'kind':kind,'command':command,'inputs':files_of(cli.inputs),'code':code_signature(kind)}
     if manifest.is_file() and done.is_file():
         record=read_json(manifest)
         if record['signature']!=signature:raise ValueError('Completed stage manifest/input/code differs; refusing reuse')
@@ -79,7 +116,7 @@ def verify_manifest(path):
     record=read_json(path);done=Path(path).with_suffix('.done')
     if not done.is_file():raise ValueError('Completed unit has no .done: '+str(path))
     sig=record['signature']
-    if sig['code']!=code_signature() or sig['inputs']!=files_of(sig['inputs']):raise ValueError('Completed unit input/code changed')
+    if sig['code']!=code_signature(sig.get('kind','l1')) or sig['inputs']!=files_of(sig['inputs']):raise ValueError('Completed unit input/code changed')
     if record['outputs']!=files_of(record['outputs']):raise ValueError('Completed unit output changed')
     print('[R18_VERIFIED]',path)
 
@@ -138,7 +175,9 @@ def find_run(parent,name,expected_sha=None):
 
 def pack12(source,output):
     with np.load(source,allow_pickle=False) as z:
-        arrays={key:z[key] if key in z else z['clean/'+key.rsplit('/',1)[1]] for key in KEYS12}
+        missing=[key for key in KEYS12 if key not in z]
+        if missing:raise ValueError('Missing mandatory KEYS12 entries: '+', '.join(missing))
+        arrays={key:z[key] for key in KEYS12}
     output=Path(output)
     if output.exists():raise FileExistsError(output)
     output.parent.mkdir(parents=True,exist_ok=True)
@@ -194,6 +233,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__);sub=ap.add_subparsers(dest='operation',required=True)
     p=sub.add_parser('guard');p.add_argument('--manifest',required=True);p.add_argument('paths',nargs='+')
     p=sub.add_parser('stage');p.add_argument('--manifest',required=True);p.add_argument('--done',required=True);p.add_argument('--inputs',nargs='*',default=[]);p.add_argument('--outputs',nargs='+',required=True);p.add_argument('--rerun',action='store_true');p.add_argument('--verify_only',action='store_true');p.add_argument('--mkdir',action='store_true');p.add_argument('command',nargs=argparse.REMAINDER)
+    p.add_argument('--signature_kind',choices=('l1','eval'),default='l1')
     p=sub.add_parser('verify-manifest');p.add_argument('--manifest',required=True)
     p=sub.add_parser('find-run');p.add_argument('--parent',required=True);p.add_argument('--name',required=True);p.add_argument('--sha')
     p=sub.add_parser('config-paths');p.add_argument('--config',required=True);p.add_argument('--out')
@@ -226,8 +266,8 @@ def main():
     elif a.operation=='manifest':
         if a.verify:
             record=read_json(a.out)
-            if record['code']!=code_signature() or record['files']!=files_of(record['files']):raise ValueError('L1 manifest changed')
-        else:write_json(a.out,{'code':code_signature(),'files':files_of(a.paths)})
+            if record['code']!=code_signature('l1') or record['files']!=files_of(record['files']):raise ValueError('L1 manifest changed')
+        else:write_json(a.out,{'kind':'l1','code':code_signature('l1'),'files':files_of(a.paths)})
     if result is not None:print(json.dumps(result,ensure_ascii=False,indent=2))
 
 if __name__=='__main__':main()
