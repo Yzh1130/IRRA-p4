@@ -31,6 +31,7 @@ class RunRecord:
                      "deg_rng_seed": resolve_deg_rng_seed(train_seed, getattr(args, "deg_rng_seed", None)),
                      "deg_lambda": float(getattr(args, "deg_lambda", 1.0)),
                      "loss_names": str(getattr(args, "loss_names", "")),
+                     "mlm_single_count": bool(getattr(args, "mlm_single_count", False)),
                      "deg_retrieval_loss": str(getattr(args, "deg_retrieval_loss", "none")),
                      "started_at": _now(), "ended_at": None,
                      "status": "running", "epochs": [], "steps": []}

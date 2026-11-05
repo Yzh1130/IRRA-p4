@@ -2407,6 +2407,11 @@ def _build_total_loss(args, ret, epoch=None):
                 continue
             if k == "loss_sdm_prob" and "sdm_loss" in ret:
                 continue
+            # R19 opt-in: retain the historical weighted MLM term once.
+            # The default keeps both legacy aliases and their original order.
+            if (getattr(args, "mlm_single_count", False)
+                    and k == "loss_mlm" and "mlm_loss" in ret):
+                continue
             # These terms are added explicitly with dedicated weights below.
             if k in {
                 "loss_unc_total",

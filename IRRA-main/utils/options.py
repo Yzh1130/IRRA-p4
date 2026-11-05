@@ -121,6 +121,7 @@ def get_args():
     # loss_names combines multiple tasks via '+'.
     parser.add_argument("--loss_names", default='sdm+id+mlm', help="which loss to use ['mlm', 'cmpm', 'id', 'itc', 'sdm']")
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
+    parser.add_argument("--mlm_single_count", default=False, action="store_true", help="R19 opt-in: count the weighted MLM term once instead of both legacy aliases")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
     p4_group = parser.add_argument_group("P4 degraded retrieval")
     p4_group.add_argument("--deg_retrieval_loss", choices=["none", "sdm", "ce"], default="none")
