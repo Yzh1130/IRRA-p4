@@ -7,12 +7,18 @@ ROOT=${P4_ROOT:-/root/autodl-tmp}
 REPO=${P4_REPO:-$ROOT/IRRA-p4}
 PY=${PYTHON:-python}
 STAGE=${STAGE:-S0}
+PAR=${R19_PAR:-1}
+MIN_FREE_GB=${R19_MIN_FREE_GB:-10}
+if [[ ! "$PAR" =~ ^[0-9]+$ || ! "$PAR" =~ [1-9] ]]; then
+  echo 'R19_PAR must be a positive integer'
+  exit 2
+fi
 case "$STAGE" in S0|S1|S2|S3|S4) ;; *) echo 'STAGE must be S0, S1, S2, S3 or S4'; exit 2;; esac
 if [ "${SKIP_CONDA:-0}" != 1 ]; then
   source "${CONDA_BASE:-/root/miniconda3}/etc/profile.d/conda.sh"
   conda activate rgbt5090
 fi
-ARGS=(--stage "$STAGE" --root "$ROOT" --repo "$REPO")
+ARGS=(--stage "$STAGE" --root "$ROOT" --repo "$REPO" --par "$PAR" --min_free_gb "$MIN_FREE_GB")
 [ -z "${R19_SPEC_JSON:-}" ] || ARGS+=(--spec "$R19_SPEC_JSON")
 [ "${R19_SYNTHETIC:-0}" != 1 ] || ARGS+=(--synthetic)
 exec "$PY" -B "$REPO/IRRA-main/tools/p4/r19/driver.py" "${ARGS[@]}"

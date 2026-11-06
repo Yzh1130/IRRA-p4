@@ -8,7 +8,10 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import contextmanager
 import csv
+from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
 import json
@@ -16,9 +19,14 @@ import math
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from urllib.parse import quote
+import uuid
 
 CODE = Path(__file__).resolve().parents[3]
 if str(CODE) not in sys.path:
@@ -63,13 +71,209 @@ def canonical(value):
 def save(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(canonical(value))
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(canonical(value))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def resolved_path(path):
+    path = Path(path).resolve()
+    if os.name == 'nt':
+        text = str(path)
+        if text.startswith('\\\\?\\UNC\\'):
+            return Path('\\\\' + text[8:])
+        if text.startswith('\\\\?\\'):
+            return Path(text[4:])
+    return path
+
+
+@contextmanager
+def stage_lock(out, stage, commit):
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / ('.driver_' + stage + '.lock')
+    metadata = dict(pid=os.getpid(), hostname=socket.gethostname(), started_at=now_iso(), git_commit=commit)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        # A concurrent creator may not have finished the very short JSON write.
+        for _ in range(50):
+            try:
+                previous = json.loads(path.read_text(encoding='utf-8'))
+                break
+            except (ValueError, OSError):
+                previous = {'metadata': 'unavailable; inspect this lock file'}
+                time.sleep(0.01)
+        raise RuntimeError('Stage already locked; not deleting ' + str(path) + ': ' + json.dumps(previous, ensure_ascii=False))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(canonical(metadata))
+        yield metadata
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def protected_baseline(path, snapshot):
+    """Serialize first publication across stages, then publish one atomic JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    claim = path.parent / '.protected_init.lock'
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Protected baseline initialization is locked; inspect ' + str(claim))
+            time.sleep(0.02)
+    try:
+        if path.exists():
+            if path.read_bytes() != canonical(snapshot):
+                raise ValueError('Protected directories differ from the recorded baseline')
+        else:
+            save(path, snapshot)
+    finally:
+        claim.unlink(missing_ok=True)
+
+
+def calculation_paths(code):
+    code = Path(code).resolve()
+    from tools.p4.r18 import workflow
+    paths = set(FROZEN) | {'tools/p4/transfer/r19_variants.py',
+                          'tools/p4/r19/core.py', 'tools/p4/r19/r19_judge.py'}
+    paths.update(Path(p).resolve().relative_to(CODE).as_posix()
+                 for p in workflow.signature_paths('eval'))
+    return sorted('IRRA-main/' + p for p in paths)
+
+
+def require_prerequisites(out, stage, code):
+    out, code = Path(out), Path(code).resolve()
+    if stage == 'S0':
+        return
+    status = out / 'STATUS_S0'
+    if not status.is_file() or status.read_text(encoding='utf-8').strip() != 'COMPLETE':
+        raise ValueError('S0 prerequisite: STATUS_S0 must be COMPLETE')
+    digest = out / 'DIGEST19_S0.txt'
+    if not digest.is_file():
+        raise ValueError('S0 prerequisite: DIGEST19_S0.txt is missing')
+    import re
+    commits = re.findall(r'^git_commit ([0-9a-f]{40})$', digest.read_text(encoding='utf-8'), re.M)
+    if len(commits) != 1:
+        raise ValueError('S0 prerequisite: expected one full git_commit in DIGEST19_S0.txt')
+    paths = calculation_paths(code)
+    for refs in ((commits[0], 'HEAD'), ('HEAD',)):
+        result = subprocess.run(['git', 'diff', '--quiet', *refs, '--', *paths], cwd=code.parent,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            reason = 'calculation-related files changed' if result.returncode == 1 else 'cannot compare S0 git commit'
+            raise ValueError('S0 prerequisite: ' + reason + ': ' + result.stderr.decode('utf-8', errors='replace').strip())
+    if stage == 'S4':
+        s3 = out / 'STATUS_S3'
+        if not s3.is_file() or s3.read_text(encoding='utf-8').strip() != 'COMPLETE':
+            raise ValueError('S4 prerequisite: STATUS_S3 must be COMPLETE')
+        if (out / '.driver_S3.lock').exists():
+            raise ValueError('S4 prerequisite: S3 is still running')
+        if not (out / 'mlm1/evaluation_inputs.json').is_file():
+            raise FileNotFoundError('S4 requires mlm1/evaluation_inputs.json')
+    if stage == 'S3' and (out / '.driver_S4.lock').exists():
+        raise ValueError('S3 cannot start while S4 is running')
+
+
+@dataclass(frozen=True)
+class Unit:
+    name: str
+    directory: Path
+    inputs: object
+    commands: object
+    parameters: object = None
+    dependencies: tuple = field(default_factory=tuple)
+    serial: bool = False
+
+
+def stage_inputs(out, stage):
+    relative = {'S1': 's1', 'S2': 's2', 'S4': 'mlm1/eval'}[stage]
+    return sorted(p for p in (Path(out) / relative).rglob('*') if p.is_file() and
+                  p.name.endswith(('_cells.csv', '_diag_cells.csv', '_selection.json', '_perq_ext.pkl', '_run_record.json')))
+
+
+def run_units(runner, units):
+    """Bounded DAG dispatch: no queued excess work; drain on the first failure."""
+    units = list(units)
+    names = [u.name for u in units]
+    if len(names) != len(set(names)) or any(set(u.dependencies) - set(names) for u in units):
+        raise ValueError('Duplicate unit names or unknown dependencies')
+    pending, active, completed = units.copy(), {}, set()
+    error = None
+    def execute(unit):
+        try:
+            inputs = unit.inputs() if callable(unit.inputs) else unit.inputs
+            return runner.unit(unit.name, unit.directory, inputs, unit.commands, unit.parameters)
+        except BaseException as exc:
+            runner.fail(exc)
+            raise
+    with ThreadPoolExecutor(max_workers=runner.par) as pool:
+        while pending or active:
+            if runner.stop_event.is_set() and error is None:
+                error = runner.first_error or RuntimeError('Unit failed; stopping dispatch')
+            if error is None:
+                for unit in list(pending):
+                    if len(active) >= runner.par or runner.stop_event.is_set():
+                        break
+                    if not set(unit.dependencies) <= completed:
+                        continue
+                    if unit.serial and active:
+                        continue
+                    try:
+                        with runner.dispatch_lock:
+                            if runner.stop_event.is_set():
+                                break
+                            runner.check_disk()
+                            pending.remove(unit)
+                            if unit.serial:
+                                execute(unit)
+                                completed.add(unit.name)
+                            else:
+                                active[pool.submit(execute, unit)] = unit
+                    except BaseException as exc:
+                        error = exc
+                        runner.fail(exc)
+                        break
+            if active:
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    unit = active.pop(future)
+                    try:
+                        future.result()
+                        completed.add(unit.name)
+                    except BaseException as exc:
+                        if error is None:
+                            error = exc
+                        runner.fail(exc)
+            elif error is not None:
+                break
+            elif pending and not any(set(u.dependencies) <= completed for u in pending):
+                error = ValueError('Cyclic or unsatisfied unit dependencies')
+                runner.fail(error)
+    if error is not None:
+        raise error
+    return completed
 
 
 def files_of(paths):
     result = {}
     for path in paths:
-        path = Path(path).resolve()
+        path = resolved_path(path)
         if not path.exists():
             raise FileNotFoundError(path)
         candidates = sorted(path.rglob('*')) if path.is_dir() else [path]
@@ -165,31 +369,40 @@ def check_m0(directory):
 
 
 class Runner:
-    def __init__(self, root, code=CODE, synthetic=False):
-        self.root = Path(root).resolve()
+    def __init__(self, root, code=CODE, synthetic=False, par=1, min_free_gb=10, stage=None):
+        self.root = resolved_path(root)
         self.out = self.root / 'p4_r19_out'
-        self.code = Path(code).resolve()
+        self.code = resolved_path(code)
         self.synthetic = synthetic
+        self.legacy_finish_status = stage is None
+        self.stage = stage or 'S0'
+        self.par = 1 if self.stage in ('S0', 'S3') else par
+        if isinstance(par, bool) or not isinstance(par, int) or par < 1:
+            raise ValueError('par must be a positive integer')
+        if not math.isfinite(min_free_gb) or min_free_gb < 0:
+            raise ValueError('min_free_gb must be finite and nonnegative')
+        self.min_free_gb = min_free_gb
+        self.started_at = now_iso()
+        self.started_clock = time.perf_counter()
+        self.guard_lock = threading.RLock()
+        self.dispatch_lock = threading.RLock()
+        self.event_lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.first_error = None
+        self.events, self.records = [], {}
+        self.disk_start_gb = self.check_disk()
         self.protected = [self.root / n for n in ('p4_r15_out', 'p4_r17_out', 'p4_r18_out')]
-        for p in self.protected:
-            if self.out.is_relative_to(p) or p.is_relative_to(self.out):
+        for path in self.protected:
+            if self.out.is_relative_to(path) or path.is_relative_to(self.out):
                 raise ValueError('Output overlaps a protected directory')
-            if not p.is_dir():
-                raise FileNotFoundError(p)
+            if not path.is_dir():
+                raise FileNotFoundError(path)
         self.out.mkdir(parents=True, exist_ok=True)
         self.before = files_of(self.protected)
-        guard = self.out / 'checks/protected.json'
-        if guard.exists() and guard.read_bytes() != canonical(self.before):
-            raise ValueError('Protected directories differ from the recorded baseline')
-        if not guard.exists():
-            save(guard, self.before)
-        self.events = []
+        protected_baseline(self.out / 'checks/protected.json', self.before)
         self.env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
                         PYTHONDONTWRITEBYTECODE='1', OPENBLAS_NUM_THREADS='1',
                         OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
-        tmp = self.out / '_tmp'
-        tmp.mkdir(exist_ok=True)
-        self.env.update(TMP=str(tmp), TEMP=str(tmp), TMPDIR=str(tmp))
         self.env['PYTHONPATH'] = os.pathsep.join([str(self.code / 'tests/p4'),
                                                 str(self.code), self.env.get('PYTHONPATH', '')])
         self.code_hashes = source_signature(self.code)
@@ -199,20 +412,46 @@ class Runner:
         self.commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.code,
                                               text=True).strip()
 
+    def check_disk(self):
+        available = shutil.disk_usage(self.root).free / (1024 ** 3)
+        if available < self.min_free_gb:
+            raise RuntimeError(f'磁盘不足: available={available:.3f} GB; minimum={self.min_free_gb:g} GB')
+        return available
+
+    def fail(self, error):
+        with self.dispatch_lock:
+            if self.first_error is None:
+                self.first_error = error
+            self.stop_event.set()
+
+    def remember(self, name, directory, status, record=None):
+        with self.event_lock:
+            self.events.append({'unit': name, 'status': status})
+            self.records[name] = {'directory': str(directory), 'record': record or {}}
+
     def guard(self):
-        current = files_of(self.protected)
-        if current != self.before:
-            save(self.out / 'checks/protected_changed.json', current)
-            raise ValueError('Protected output changed; stopping')
-        print('[R19_GUARD] unchanged', len(current), flush=True)
+        with self.guard_lock:
+            current = files_of(self.protected)
+            if current != self.before:
+                save(self.out / 'checks/protected_changed.json', current)
+                raise ValueError('Protected output changed; stopping')
+            print('[R19_GUARD] unchanged', len(current), flush=True)
 
     def inside(self, path):
-        path = Path(path).resolve()
+        path = resolved_path(path)
         if not path.is_relative_to(self.out) or path == self.out:
             raise ValueError('R19 writes must remain under p4_r19_out: ' + str(path))
         return path
 
     def unit(self, name, directory, inputs, commands, parameters=None):
+        try:
+            self.check_disk()
+            return self._unit(name, directory, inputs, commands, parameters)
+        except BaseException as exc:
+            self.fail(exc)
+            raise
+
+    def _unit(self, name, directory, inputs, commands, parameters):
         directory = self.inside(directory)
         signature = canonical({'schema': 1, 'git_commit': self.commit,
                                'code': self.code_hashes, 'inputs': files_of(inputs),
@@ -220,52 +459,77 @@ class Runner:
                                'parameters': parameters or {},
                                'threads': {k: self.env[k] for k in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS')}})
         digest = hashlib.sha256(signature).hexdigest()
-        manifest = directory / 'manifest.json'
-        done = directory / '.done'
+        manifest, done = directory / 'manifest.json', directory / '.done'
         if directory.exists():
             same = manifest.is_file() and manifest.read_bytes() == signature and done.is_file() and done.read_text().strip() == digest
-            records = directory / 'driver_run_record.json'
-            if same and records.is_file():
-                previous = json.loads(records.read_text(encoding='utf-8'))
-                output_files = self.output_hashes(directory)
-                same = previous.get('outputs') == output_files
+            record_path = directory / 'driver_run_record.json'
+            if same and record_path.is_file():
+                previous = json.loads(record_path.read_text(encoding='utf-8'))
+                same = previous.get('outputs') == self.output_hashes(directory)
             else:
                 same = False
             if same:
-                print('[R19_REUSE]', name, flush=True)
-                self.events.append({'unit': name, 'status': 'reused'})
                 self.guard()
+                print('[R19_REUSE]', name, flush=True)
+                self.remember(name, directory, 'reused', previous)
                 return directory
-            stale = self.out / '_stale' / (name.replace('/', '_') + '_' + dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+            stale = self.out / '_stale' / (quote(name, safe='') + '_' + str(os.getpid()) + '_' + uuid.uuid4().hex)
             self.inside(stale)
             stale.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(directory), str(stale))
             print('[R19_STALE]', directory, '->', stale, flush=True)
         directory.mkdir(parents=True)
         manifest.write_bytes(signature)
-        start = time.perf_counter()
-        codes = []
-        with (directory / 'driver.log').open('wb') as log:
-            for command in commands:
-                command = [str(x) for x in command]
-                print('[R19_RUN]', name, ' '.join(command), flush=True)
-                result = subprocess.run(command, cwd=self.code, env=self.env,
-                                        stdout=log, stderr=subprocess.STDOUT)
-                codes.append(result.returncode)
-                self.guard()
-                if result.returncode:
-                    save(directory / 'driver_run_record.json', {'status': 'failed', 'unit': name,
-                         'git_commit': self.commit, 'exit_codes': codes,
-                         'wall_seconds': time.perf_counter() - start,
-                         'manifest_sha256': digest, 'peak_gpu_memory_bytes': None})
-                    raise subprocess.CalledProcessError(result.returncode, command)
-        save(directory / 'driver_run_record.json', {'status': 'complete', 'unit': name,
-             'git_commit': self.commit, 'exit_codes': codes,
-             'wall_seconds': time.perf_counter() - start, 'manifest_sha256': digest,
-             'peak_gpu_memory_bytes': None, 'peak_memory_note': 'CPU driver; GPU peaks remain in training run_record',
-             'outputs': self.output_hashes(directory)})
+        temporary = self.inside(self.out / '_tmp' / self.stage / quote(name, safe=''))
+        temporary.mkdir(parents=True, exist_ok=True)
+        env = dict(self.env, TMP=str(temporary), TEMP=str(temporary), TMPDIR=str(temporary))
+        start, started_at = time.perf_counter(), now_iso()
+        codes, peaks, error = [], [], None
+        try:
+            with (directory / 'driver.log').open('wb') as log:
+                for command in commands:
+                    command = [str(x) for x in command]
+                    print('[R19_RUN]', name, ' '.join(command), flush=True)
+                    process = subprocess.Popen(command, cwd=self.code, env=env,
+                                               stdout=log, stderr=subprocess.STDOUT)
+                    if hasattr(os, 'wait4'):
+                        while True:
+                            try:
+                                _, status, usage = os.wait4(process.pid, 0)
+                                break
+                            except InterruptedError:
+                                continue
+                        process.returncode = os.waitstatus_to_exitcode(status)
+                        peaks.append(int(usage.ru_maxrss * 1024))
+                    else:
+                        process.wait()
+                    codes.append(process.returncode)
+                    if process.returncode:
+                        raise subprocess.CalledProcessError(process.returncode, command)
+        except BaseException as exc:
+            error = exc
+            self.fail(exc)
+        try:
+            self.guard()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+            self.fail(exc)
+        record = {'status': 'failed' if error else 'complete', 'unit': name,
+                  'git_commit': self.commit, 'exit_codes': codes,
+                  'wall_seconds': time.perf_counter() - start, 'manifest_sha256': digest,
+                  'peak_gpu_memory_bytes': None, 'par': self.par,
+                  'started_at': started_at, 'finished_at': now_iso(),
+                  'peak_rss_bytes': max(peaks) if peaks else None}
+        if error is None:
+            record.update(peak_memory_note='CPU driver; GPU peaks remain in training run_record',
+                          outputs=self.output_hashes(directory))
+        save(directory / 'driver_run_record.json', record)
+        if error is not None:
+            self.remember(name, directory, 'failed', record)
+            raise error
         done.write_text(digest + '\n', encoding='utf-8', newline='\n')
-        self.events.append({'unit': name, 'status': 'complete'})
+        self.remember(name, directory, 'complete', record)
         return directory
 
     @staticmethod
@@ -279,18 +543,28 @@ class Runner:
         try:
             self.guard()
         except BaseException as exc:
-            guard_error = exc
-            status = 'STOPPED: PROTECTED_OUTPUT_CHANGED'
-            error = exc
+            guard_error, error = exc, exc
+            status = 'STOPPED: PROTECTED_OUTPUT_CHANGED' if self.legacy_finish_status else 'STOPPED'
         (self.out / ('STATUS_' + stage)).write_text(status + '\n', encoding='utf-8', newline='\n')
+        events = sorted(self.events, key=lambda x: x['unit'])
         digest = ['R19 ' + stage + ' post-hoc validation', 'STATUS ' + status,
                   'git_commit ' + self.commit, 'error ' + (str(error) if error else 'none'),
-                  'events ' + json.dumps(self.events, ensure_ascii=False)]
-        digest.extend('UNIT ' + str(p.relative_to(self.out)) + ' sha256=' + sha256(p)
-                      for p in sorted(self.out.rglob('driver_run_record.json')))
-        for p in sorted((self.out / 'reports' / stage).glob('*.md')) if (self.out / 'reports' / stage).exists() else []:
-            if p.suffix == '.md':
-                digest += ['REPORT ' + str(p.relative_to(self.out)), p.read_text(encoding='utf-8')]
+                  'events ' + json.dumps(events, ensure_ascii=False)]
+        for _, entry in sorted(self.records.items()):
+            path = Path(entry['directory']) / 'driver_run_record.json'
+            if path.is_file():
+                digest.append('UNIT ' + str(path.relative_to(self.out)) + ' sha256=' + sha256(path))
+        for path in sorted((self.out / 'reports' / stage).glob('*.md')) if (self.out / 'reports' / stage).exists() else []:
+            digest += ['REPORT ' + str(path.relative_to(self.out)), path.read_text(encoding='utf-8')]
+        rss = [(entry['record'].get('peak_rss_bytes'), name) for name, entry in self.records.items()
+               if entry['record'].get('peak_rss_bytes') is not None]
+        maximum = max(rss) if rss else (None, None)
+        summary = dict(unit_count=len(events), wall_seconds=time.perf_counter()-self.started_clock,
+                       peak_rss_bytes=maximum[0], peak_rss_unit=maximum[1],
+                       started_at=self.started_at, finished_at=now_iso(),
+                       free_gb_start=self.disk_start_gb,
+                       free_gb_end=shutil.disk_usage(self.root).free/(1024**3))
+        digest.append('SUMMARY ' + json.dumps(summary, ensure_ascii=False, sort_keys=True))
         (self.out / ('DIGEST19_' + stage + '.txt')).write_text('\n'.join(digest) + '\n', encoding='utf-8', newline='\n')
         if guard_error is not None:
             raise guard_error
@@ -358,7 +632,7 @@ def evaluation_commands(runner, cfg, seed, fit, directory, methods, mixes,
     return command, inputs
 
 
-def eval_unit(runner, spec, stage, dataset, seed, fit, *, methods, mixes=None,
+def evaluation_unit(runner, spec, stage, dataset, seed, fit, *, methods, mixes=None,
               fixed=True, lam_curve=False, extra=(), regress=False, cams=None):
     cfg = spec['datasets']['rgbnt' if dataset == 'rgbnt_sparse' else 'rgbnt_subset' if dataset == 'rgbnt_nested' else dataset][str(seed)]
     directory = runner.out / stage.lower() / dataset / f's{seed}_f{fit}'
@@ -367,10 +641,15 @@ def eval_unit(runner, spec, stage, dataset, seed, fit, *, methods, mixes=None,
                         lam_curve, extra, regress, cams)
     if '--assign_nested_from' in extra:
         inputs.append(extra[list(extra).index('--assign_nested_from') + 1])
-    runner.unit(f'{stage}/{dataset}/s{seed}_f{fit}', directory, inputs, [command],
+    return Unit(f'{stage}/{dataset}/s{seed}_f{fit}', directory, inputs, [command],
                 dict(stage=stage, dataset=dataset, seed=seed, fit=fit, methods=methods,
                      mixes=mixes or MIXES, assign_seeds=spec['assign_seeds'], post_hoc=True))
-    return directory
+
+
+def eval_unit(*args, **kwargs):
+    unit = evaluation_unit(*args, **kwargs)
+    args[0].unit(unit.name, unit.directory, unit.inputs, unit.commands, unit.parameters)
+    return unit.directory
 
 
 def s0(runner, spec):
@@ -391,40 +670,64 @@ def s0(runner, spec):
                 [[sys.executable, '-B', '-m', 'unittest', node, '-v']], {'test': node})
 
 
-def judge(runner, stage):
+def judge_unit(runner, stage, dependencies=()):
     directory = runner.out / 'reports' / stage
-    inputs = [p for base in ('s1', 's2', 'mlm1/eval') for p in (runner.out / base).rglob('*')
-              if p.is_file() and (p.name.endswith(('_cells.csv', '_diag_cells.csv', '_selection.json', '_perq_ext.pkl', '_run_record.json')))]
     command = [sys.executable, '-B', runner.code / 'tools/p4/r19/r19_judge.py', '--stage', stage, '--root', runner.out]
-    runner.unit('judge_' + stage, directory, inputs, [command], {'post_hoc': True})
+    return Unit('judge_' + stage, directory, lambda: stage_inputs(runner.out, stage), [command],
+                {'post_hoc': True}, tuple(dependencies), serial=True)
 
 
-def s1(runner, spec):
+def judge(runner, stage):
+    unit = judge_unit(runner, stage)
+    return runner.unit(unit.name, unit.directory, unit.inputs(), unit.commands, unit.parameters)
+
+
+def plan_s1(runner, spec):
+    units = []
     for dataset in ('rgbt', 'rgbnt', 'rgbnt_subset'):
         for seed in spec['seeds']:
             for fit in spec['fits']:
-                eval_unit(runner, spec, 'S1', dataset, seed, fit, methods=METHODS1, lam_curve=True)
-    judge(runner, 'S1')
+                units.append(evaluation_unit(runner, spec, 'S1', dataset, seed, fit,
+                                             methods=METHODS1, lam_curve=True))
+    units.append(judge_unit(runner, 'S1', [u.name for u in units]))
+    return units
 
 
-def s2(runner, spec):
+def s1(runner, spec):
+    return run_units(runner, plan_s1(runner, spec))
+
+
+def plan_s2(runner, spec):
+    units = []
     for seed in spec['seeds']:
         full = spec['datasets']['rgbnt'][str(seed)]
         subset = spec['datasets']['rgbnt_subset'][str(seed)]
         directory = runner.out / 's2/cameras' / f's{seed}'
         target = directory / 'subset.npz'
+        name = f'S2/cameras/s{seed}'
         cmd = [sys.executable, '-B', str(Path(__file__).resolve()), 'subset-cams',
                '--full', full['test'], '--subset', subset['test'], '--cams', full['cams'], '--output', str(target)]
-        runner.unit(f'S2/cameras/s{seed}', directory, [full['test'], subset['test'], full['cams']], [cmd])
+        units.append(Unit(name, directory, [full['test'], subset['test'], full['cams']], [cmd]))
         for fit in spec['fits']:
             for dataset, cams in [('rgbnt', full['cams']), ('rgbnt_subset', target)]:
-                eval_unit(runner, spec, 'S2', dataset, seed, fit, methods=METHODS2,
-                          mixes=MIXES + ['Mcam1', 'Mcam2'], cams=cams)
-            eval_unit(runner, spec, 'S2', 'rgbnt_nested', seed, fit, methods=METHODS_NESTED,
-                      extra=['--assign_nested_from', full['test']])
-            eval_unit(runner, spec, 'S2', 'rgbnt_sparse', seed, fit, methods=METHODS_NESTED,
-                      extra=['--max_per_id', '3', '--max_per_id_seed', '9101'])
-    judge(runner, 'S2')
+                unit = evaluation_unit(runner, spec, 'S2', dataset, seed, fit, methods=METHODS2,
+                                       mixes=MIXES + ['Mcam1', 'Mcam2'], cams=cams)
+                if dataset == 'rgbnt_subset':
+                    unit = Unit(unit.name, unit.directory, unit.inputs, unit.commands,
+                                unit.parameters, (name,))
+                units.append(unit)
+            units.append(evaluation_unit(runner, spec, 'S2', 'rgbnt_nested', seed, fit,
+                                          methods=METHODS_NESTED,
+                                          extra=['--assign_nested_from', full['test']]))
+            units.append(evaluation_unit(runner, spec, 'S2', 'rgbnt_sparse', seed, fit,
+                                          methods=METHODS_NESTED,
+                                          extra=['--max_per_id', '3', '--max_per_id_seed', '9101']))
+    units.append(judge_unit(runner, 'S2', [u.name for u in units]))
+    return units
+
+
+def s2(runner, spec):
+    return run_units(runner, plan_s2(runner, spec))
 
 
 def training_base(runner, dataset):
@@ -569,19 +872,43 @@ def s3(runner, spec):
     save(runner.out / 'mlm1/evaluation_inputs.json', fresh)
 
 
-def s4(runner, spec):
-    # A fresh spec is emitted by S3; the original input spec is never mutated.
+def plan_s4(runner, spec):
     generated = runner.out / 'mlm1/evaluation_inputs.json'
     if not generated.is_file():
         raise FileNotFoundError('S4 requires completed S3: ' + str(generated))
     fresh = json.loads(generated.read_text(encoding='utf-8'))
+    units = []
     for dataset in ('rgbt', 'rgbnt', 'rgbnt_subset'):
         for seed in fresh['seeds']:
             for fit in fresh['fits']:
-                # eval_unit's output stage can be a path relative to p4_r19_out.
-                eval_unit(runner, fresh, 'mlm1/eval', dataset, seed, fit, methods=METHODS4,
-                          fixed=False, extra=['--nogate_rmax'])
-    judge(runner, 'S4')
+                units.append(evaluation_unit(runner, fresh, 'mlm1/eval', dataset, seed, fit,
+                                              methods=METHODS4, fixed=False, extra=['--nogate_rmax']))
+    units.append(judge_unit(runner, 'S4', [u.name for u in units]))
+    return units
+
+
+def s4(runner, spec):
+    return run_units(runner, plan_s4(runner, spec))
+
+
+def positive_integer(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('par must be a positive integer')
+    if number < 1:
+        raise argparse.ArgumentTypeError('par must be a positive integer')
+    return number
+
+
+def minimum_free(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('min_free_gb must be finite and nonnegative')
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError('min_free_gb must be finite and nonnegative')
+    return number
 
 
 def main(argv=None):
@@ -599,37 +926,43 @@ def main(argv=None):
     ap.add_argument('--repo', default=None)
     ap.add_argument('--spec')
     ap.add_argument('--synthetic', action='store_true')
+    ap.add_argument('--par', type=positive_integer, default=1)
+    ap.add_argument('--min_free_gb', type=minimum_free, default=10)
     a = ap.parse_args(argv)
-    code = Path(a.repo) / 'IRRA-main' if a.repo else CODE
+    code = Path(a.repo).resolve() / 'IRRA-main' if a.repo else CODE
     out = Path(a.root).resolve() / 'p4_r19_out'
-    out.mkdir(parents=True, exist_ok=True)
-    lock = out / '.driver.lock'
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise RuntimeError('R19 driver is already running or was interrupted; inspect lock before proceeding')
-    os.close(fd)
-    error = None
-    runner = None
-    try:
-        runner = Runner(a.root, code, a.synthetic)
-        spec = json.loads(Path(a.spec).read_text(encoding='utf-8')) if a.spec else default_specs(a.root)
-        if a.synthetic and a.stage != 'S0':
-            raise ValueError('Synthetic shell rehearsal is limited to S0')
-        save(runner.out / ('checks/inputs_' + a.stage + '.json'), spec)
-        {'S0': s0, 'S1': s1, 'S2': s2, 'S3': s3, 'S4': s4}[a.stage](runner, spec)
-    except BaseException as exc:
-        error = exc
-        raise
-    finally:
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=code, text=True).strip()
+    # Lock refusal must not overwrite the active instance's STATUS or digest.
+    with stage_lock(out, a.stage, commit):
+        error, runner = None, None
+        started = time.perf_counter()
+        disk_start = shutil.disk_usage(Path(a.root)).free / (1024**3)
         try:
+            if disk_start < a.min_free_gb:
+                raise RuntimeError(f'磁盘不足: available={disk_start:.3f} GB; minimum={a.min_free_gb:g} GB')
+            require_prerequisites(out, a.stage, code)
+            if a.synthetic and a.stage == 'S3':
+                raise ValueError('Synthetic rehearsal cannot launch GPU training')
+            runner = Runner(a.root, code, a.synthetic, par=a.par,
+                            min_free_gb=a.min_free_gb, stage=a.stage)
+            spec = json.loads(Path(a.spec).read_text(encoding='utf-8')) if a.spec else default_specs(a.root)
+            save(runner.out / ('checks/inputs_' + a.stage + '.json'), spec)
+            {'S0': s0, 'S1': s1, 'S2': s2, 'S3': s3, 'S4': s4}[a.stage](runner, spec)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
             if runner is not None:
                 runner.finish(a.stage, 'COMPLETE' if error is None else 'STOPPED', error)
             else:
                 (out / ('STATUS_' + a.stage)).write_text('STOPPED\n', encoding='utf-8', newline='\n')
-                (out / ('DIGEST19_' + a.stage + '.txt')).write_text('R19 ' + a.stage + '\nSTOPPED\n' + str(error) + '\n', encoding='utf-8', newline='\n')
-        finally:
-            lock.unlink(missing_ok=True)
+                summary = dict(unit_count=0, wall_seconds=time.perf_counter()-started,
+                               peak_rss_bytes=None, peak_rss_unit=None, free_gb_start=disk_start,
+                               free_gb_end=shutil.disk_usage(Path(a.root)).free/(1024**3))
+                (out / ('DIGEST19_' + a.stage + '.txt')).write_text(
+                    'R19 ' + a.stage + '\nSTATUS STOPPED\ngit_commit ' + commit + '\nerror ' + str(error) +
+                    '\nSUMMARY ' + json.dumps(summary, ensure_ascii=False, sort_keys=True) + '\n',
+                    encoding='utf-8', newline='\n')
     return 0
 
 
