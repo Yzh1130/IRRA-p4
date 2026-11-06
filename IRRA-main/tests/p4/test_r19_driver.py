@@ -701,5 +701,207 @@ class HistoricalRunSelectionTests(unittest.TestCase):
             self.assertEqual(driver.training_base(SimpleNamespace(root=root), "rgbnt"), base)
 
 
+# These stubs preserve the tools' output-existence contracts, not their model
+# computation. They run in child processes after the real Runner has created
+# its manifest/log, so a directory/file collision is observable at execution.
+_S3_OUTPUT_CONTRACT_STUB = r"""
+import json,sys
+from pathlib import Path
+kind,encoded,directory,events=sys.argv[1:]
+argv=json.loads(encoded);directory=Path(directory)
+def arg(flag):return argv[argv.index(flag)+1]
+def load(path):return json.loads(Path(path).read_text(encoding='utf-8'))
+def write(path,value):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text(json.dumps(value,sort_keys=True)+'\n',encoding='utf-8')
+assert (directory/'manifest.json').is_file(), 'Runner manifest not pre-created'
+assert (directory/'driver.log').is_file(), 'Runner log not pre-created'
+if kind in ('derive','runtime'):
+    target=Path(arg('--output'))
+    sidecar=target.with_suffix('.derivation.json' if kind=='derive' else '.runtime.json')
+    targets=[(target,True),(sidecar,True)]
+elif kind=='train':
+    config=load(arg('--config_file'));target=Path(config['output_dir']);targets=[(target,False)]
+elif kind=='health':target=Path(arg('--out'));targets=[(target,False)]
+elif kind=='export':target=Path(arg('--output_dir'));targets=[(target,True)]
+elif kind=='pack':target=Path(arg('--out_dir'));targets=[(target,False)]
+else:target=Path(arg('--output'));targets=[(target,True)]
+event={'kind':kind,'unit_dir':str(directory),'argv':argv,
+       'manifest_exists':True,'driver_log_exists':True,
+       'targets':[{'path':str(p),'refuses_existing':refuse,'existed':p.exists()} for p,refuse in targets]}
+with Path(events).open('a',encoding='utf-8') as stream:stream.write(json.dumps(event)+'\n')
+for path,refuse in targets:
+    if refuse and path.exists():raise FileExistsError('Refusing existing '+kind+' output: '+str(path))
+if kind=='derive':
+    seed=int(arg('--seed'));dataset=arg('--dataset');smoke='--smoke' in argv
+    config=load(arg('--base'))
+    config.update(dataset_name=dataset,train_seed=seed,output_dir=arg('--output_dir'),
+                  root_dir=arg('--root_dir'),mlm_single_count=True)
+    if '--dev_split_file' in argv:config['dev_split_file']=arg('--dev_split_file')
+    config['name']=('base_mlm1_rgbnt' if dataset=='RGBNT201-PEDES' else 'base_mlm1')+f'_s{seed}'+('_smoke' if smoke else '')
+    write(target,config);write(sidecar,{'synthetic':True})
+elif kind=='runtime':write(target,load(arg('--config')));write(sidecar,{'synthetic':True})
+elif kind=='train':
+    run=target/config['dataset_name']/('20000101_000000_'+config['name']);run.mkdir(parents=True)
+    write(run/'configs.yaml',config);write(run/'run_record.json',{'synthetic':True})
+    (run/'last.pth').write_bytes(b'synthetic marker, not a trained checkpoint')
+    (run/'train_log.txt').write_text('synthetic training command\n',encoding='utf-8')
+elif kind=='health':write(target,{'ok':True,'synthetic':True})
+elif kind=='export':
+    target.mkdir(parents=True)
+    (target/'metrics.tsv').write_text('scene\tR1\nclean\t1\n',encoding='utf-8')
+    (target/'features').mkdir();(target/'features/payload.txt').write_text('synthetic export payload',encoding='utf-8')
+elif kind=='pack':
+    source=Path(arg('--export_dirs'));assert (source/'features/payload.txt').is_file()
+    target.mkdir(parents=True,exist_ok=True)
+    (target/(arg('--names')+'.npz')).write_bytes(b'synthetic packed marker')
+else:
+    target.parent.mkdir(parents=True,exist_ok=True)
+    with target.open('xb') as stream:stream.write(b'synthetic '+kind.encode()+b' marker')
+"""
+
+
+class _S3OutputContractRunner(driver.Runner):
+    def __init__(self, root, stub, event_path):
+        super().__init__(root, stage='S3', min_free_gb=0)
+        self.stub, self.event_path, self.planned = stub, event_path, []
+
+    def unit(self, name, directory, inputs, commands, parameters=None):
+        commands = [[str(value) for value in command] for command in commands]
+        self.planned.append(dict(name=name, directory=Path(directory),
+                                 inputs=list(inputs), commands=commands))
+        if name.startswith('derive_'):kind = 'derive'
+        elif name.startswith('runtime_health_base_'):kind = 'runtime'
+        elif name.startswith('train_ir_'):kind = 'train_ir'
+        elif name.startswith('train_'):kind = 'train'
+        elif name.startswith('health_'):kind = 'health'
+        elif name.startswith('export_'):kind = 'export'
+        elif name.startswith('pack12_'):kind = 'pack12'
+        elif name.startswith('pack_'):kind = 'pack'
+        elif name.startswith('subset_'):kind = 'subset'
+        else:raise AssertionError('Uncovered S3 tool: ' + name)
+        rewritten = [[sys.executable, '-B', str(self.stub), kind,
+                      json.dumps(command), str(directory), str(self.event_path)] for command in commands]
+        # Full original arguments remain in the manifest's command signature.
+        return super().unit(name, directory, inputs, rewritten, parameters)
+
+
+def _run_s3_output_contract(root, legacy=False):
+    from tools.p4.r19 import training
+    root = Path(root);root.mkdir()
+    _protected(root)
+    histories = {}
+    for dataset in ('rgbt', 'rgbnt'):
+        histories[dataset] = {}
+        for seed in driver.SEEDS:
+            path = root/'history'/dataset/f's{seed}.yaml';path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(json.dumps({'root_dir':str(root/'data'),'train_seed':seed}),encoding='utf-8')
+            histories[dataset][seed] = path
+    base = root/'base.yaml';split = root/'dev.json';annotation = root/'annotation.json';weights = root/'weights.marker'
+    split.write_text('{}');annotation.write_text('[]');weights.write_bytes(b'not model weights')
+    base.write_text(json.dumps({'dataset_name':'RGBT-PEDES','dev_split_file':str(split)}),encoding='utf-8')
+    stub = root/'output_contract_stub.py';stub.write_text(_S3_OUTPUT_CONTRACT_STUB,encoding='utf-8')
+    runner = _S3OutputContractRunner(root,stub,root/'events.jsonl')
+    spec = {'seeds':list(driver.SEEDS),'fits':[7001],'assign_seeds':[7031]}
+    def fingerprint(dataset, root_dir, output_path=None):
+        record = {'annotation_path':str(annotation),'synthetic':True}
+        driver.save(output_path,record)
+        return record
+    def compare(expected, historical, seed, output_path=None, smoke=False):
+        driver.save(output_path,{'ok':True,'synthetic':True})
+    error = None
+    with patch.object(driver,'historical_run_configs',side_effect=lambda root,dataset:histories[dataset]), \
+         patch.object(driver,'training_base',return_value=base), \
+         patch.object(driver,'pretrained_input',return_value={'path':str(weights),'sha256':driver.sha256(weights)}), \
+         patch.object(training,'data_fingerprint',side_effect=fingerprint), \
+         patch.object(training,'compare_recipe_history',side_effect=compare):
+        plan = driver.s3
+        if legacy:
+            import ast
+            old = subprocess.check_output(['git','show','9dfe09bbc67c8ea2233cf33c1c73d9b545d78f97:IRRA-main/tools/p4/r19/driver.py'],cwd=CODE.parent).decode('utf-8')
+            node = next(n for n in ast.parse(old).body if isinstance(n,ast.FunctionDef) and n.name=='s3')
+            scope = vars(driver).copy()
+            exec(compile(ast.Module(body=[node],type_ignores=[]),'git:9dfe09bb/driver.py','exec'),scope)
+            plan = scope['s3']
+        try:plan(runner,spec)
+        except subprocess.CalledProcessError as exc:error = exc
+        runner.finish('S3','STOPPED' if error else 'COMPLETE',error)
+    return runner,error
+
+
+class S3OutputContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='r19_s3_output_contract_')
+        cls.root = Path(cls.temp.name)
+        cls.runner,error = _run_s3_output_contract(cls.root/'current')
+        if error:
+            log = cls.runner.planned[-1]['directory']/'driver.log'
+            raise AssertionError(log.read_text(encoding='utf-8'))
+        cls.events = [json.loads(line) for line in cls.runner.event_path.read_text(encoding='utf-8').splitlines()]
+
+    @classmethod
+    def tearDownClass(cls):cls.temp.cleanup()
+
+    def test_legacy_s3_plan_fails_on_precreated_export_directory(self):
+        runner,error = _run_s3_output_contract(self.root/'legacy',legacy=True)
+        self.assertIsInstance(error,subprocess.CalledProcessError)
+        self.assertNotEqual(error.returncode,0)
+        self.assertEqual(runner.planned[-1]['name'],'export_rgbt_dev_s101')
+        directory = runner.planned[-1]['directory']
+        self.assertIn('FileExistsError',(directory/'driver.log').read_text(encoding='utf-8'))
+        self.assertFalse((directory/'.done').exists())
+        self.assertEqual((runner.out/'STATUS_S3').read_text(),'STOPPED\n')
+        self.assertEqual(runner.records['health_rgbt_s101']['record']['status'],'complete')
+        self.assertEqual(runner.records['health_rgbt_s101_smoke']['record']['status'],'complete')
+
+    def test_current_s3_chains_pack_input_to_export_payload_and_hashes_all_files(self):
+        planned = {unit['name']:unit for unit in self.runner.planned}
+        self.assertEqual(len(planned),77)
+        self.assertEqual((self.runner.out/'STATUS_S3').read_text(),'COMPLETE\n')
+        for dataset in ('rgbt','rgbnt'):
+            for seed in driver.SEEDS:
+                for split in ('dev','test'):
+                    label = f'{dataset}_{split}_s{seed}'
+                    export,pack = planned['export_'+label],planned['pack_'+label]
+                    command = export['commands'][0]
+                    target = Path(command[command.index('--output_dir')+1])
+                    self.assertEqual(target,export['directory']/'export')
+                    command = pack['commands'][0]
+                    self.assertEqual(Path(command[command.index('--export_dirs')+1]),target)
+                    manifest = json.loads((pack['directory']/'manifest.json').read_text(encoding='utf-8'))
+                    for path in target.rglob('*'):
+                        if path.is_file():
+                            item = manifest['inputs'][str(driver.resolved_path(path))]
+                            self.assertEqual(item['sha256'],driver.sha256(path))
+        self.assertEqual(set(json.loads((self.runner.out/'mlm1/evaluation_inputs.json').read_text())['datasets']),
+                         {'rgbt','rgbnt','rgbnt_subset'})
+
+    def test_all_refusing_outputs_are_absent_after_runner_creates_metadata(self):
+        self.assertEqual({event['kind'] for event in self.events},
+                         {'derive','runtime','train','health','export','pack','pack12','train_ir','subset'})
+        for event in self.events:
+            self.assertTrue(event['manifest_exists'])
+            self.assertTrue(event['driver_log_exists'])
+            for target in event['targets']:
+                if target['refuses_existing']:
+                    self.assertFalse(target['existed'],event)
+            if event['kind'] in ('train','pack'):
+                self.assertTrue(event['targets'][0]['existed'],event)
+
+    def test_file_output_stubs_refuse_existing_files_without_overwriting(self):
+        for kind in ('train_ir','pack12','subset'):
+            with self.subTest(kind=kind):
+                directory = self.root/'negative'/kind;directory.mkdir(parents=True)
+                (directory/'manifest.json').write_text('{}');(directory/'driver.log').touch()
+                target = directory/'existing.npz';target.write_bytes(b'keep existing bytes')
+                command = [sys.executable,'-B',str(self.runner.stub),kind,
+                           json.dumps(['stub','--output',str(target)]),str(directory),str(directory/'event.jsonl')]
+                result = subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn(b'FileExistsError',result.stdout)
+                self.assertEqual(target.read_bytes(),b'keep existing bytes')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -883,15 +883,16 @@ def s3(runner, spec):
                 for split_name in ('dev', 'test'):
                     label = f'{dataset}_{split_name}_s{seed}'
                     export = runner.out / 'mlm1/exports' / label
+                    export_output = export / 'export'
                     cmd = [*py, runner.code / 'tools/p4/export_eval_split.py', '--split', split_name,
                            '--checkpoint', run / 'last.pth', '--config_file', run / 'configs.yaml',
                            '--root_dir', export_root, '--dev_split_file', export_split,
                            '--eval_degrade_seed', '2026', '--device', 'cuda',
-                           '--save_modality_features', '--save_item_meta', '--output_dir', export]
+                           '--save_modality_features', '--save_item_meta', '--output_dir', export_output]
                     runner.unit('export_' + label, export, [run / 'last.pth', run / 'configs.yaml'], [cmd])
                     packed = runner.out / 'mlm1/packed' / label
-                    runner.unit('pack_' + label, packed, [export],
-                                [[*py, runner.code / 'tools/p4/pack_feats.py', '--export_dirs', export,
+                    runner.unit('pack_' + label, packed, [export_output],
+                                [[*py, runner.code / 'tools/p4/pack_feats.py', '--export_dirs', export_output,
                                   '--names', label, '--out_dir', packed]])
                     keys_dir = runner.out / 'mlm1/feats' / label
                     archive = keys_dir / (label + '.npz')

@@ -171,3 +171,21 @@ RGBNT 历史目录严格沿用冻结 `p4_r18.sh:203–207` 的 L1 规则：`p4_r
 每次训练前，parser-only `runtime-health-base` 写 expected.yaml，再与同种子有效历史配置逐键比较。仅放行 name/output_dir/config_file/mlm_single_count；两轮冒烟另放行 num_epoch。train_seed/deg_rng_seed 按 train.py 的运行种子及原退化种子规则解析后必须相等；任何其他差异停止。报告写 `checks/recipe_vs_history_<rgbt或rgbnt>_s<seed>[_smoke].json`，并作为训练单元的 manifest 输入。
 
 启动任何 GPU 工作前只读核对两个数据集：RGBT 按实际数据集类的 `_resolve_data_dir` 顺序解析，再记录标注 SHA256、RGB/T 文件数（必须各4723）；RGBNT 直接检查 `<root>/RGBNT201/{RGB,T,captionform0_8B.json}`，记录标注哈希和两目录计数。报告为 `checks/data_rgbt.json`、`checks/data_rgbnt.json`，缺目录/标注或 RGBT 数量不符即失败。本次新增的 S3 验收只用伪造目录/配置，没有连接 AutoDL，也没有训练或读取真实图像特征；全部既有测试中的 R15 回归仍按原规则读取本地保存的开发特征。
+
+## S3 单元目录与工具输出（提交 C）
+
+Runner.unit 先创建单元目录 U，并在其中写 manifest.json、driver.log；工具不得把一个要求“不存在”的输出目录直接设为 U。export 结果现在写 U/export，pack 的 --export_dirs 和输入哈希清单都使用同一子目录，覆盖其全部嵌套导出文件。单元目录、签名生成和 .done/manifest 复用规则均不变；本提交的源码/提交签名变化使原 S3 单元整体重跑，这是预期行为，不复用或手工放行旧签名。
+
+| S3 命令 / 参数 | 命令开始时的目标 | 工具对已存在目标的语义 | 结论 |
+|---|---|---|---|
+| training.py derive --output | U/config.yaml，不存在 | 拒绝已有 YAML 或 .derivation.json | 父目录已创建不冲突 |
+| training.py runtime-health-base --output | U/expected.yaml，不存在 | 拒绝已有 YAML 或 .runtime.json | 父目录已创建不冲突 |
+| train.py 配置 output_dir | U，已存在；实际运行写 U/数据集/时间戳_名称 | 允许已有父目录，按需创建运行目录 | 不冲突 |
+| workflow.py health --out | U/health.json，不存在 | 允许重写 JSON，允许已有父目录 | 不冲突 |
+| export_eval_split.py --output_dir | U/export，不存在 | 拒绝任何已存在的输出目录 | 已修复；旧 U 会被拒绝 |
+| pack_feats.py --out_dir | U，已存在 | 允许已有目录，写入名称对应的 npz/manifest | 不冲突；输入为上行 U/export |
+| workflow.py pack12 --output | U/标签.npz，不存在 | 拒绝已有文件 | 父目录已创建不冲突 |
+| export_train_ir_feats.py --output | U/train_ir.npz，不存在 | 拒绝已有文件 | 父目录已创建不冲突 |
+| r18_subset.py --output | U/rgbnt_testnov_s种子.npz，不存在 | 拒绝已有文件 | 父目录已创建不冲突 |
+
+新增离线测试执行真实 S3 调用顺序与 Runner.unit 的目录预建流程，子进程桩只模拟各工具的输出契约，不加载模型或真实数据。旧 9dfe09bb 的 S3 定义应在首个 export 单元失败，新路径应通过；同时核对所有拒绝输出的工具在执行前目标不存在，以及 export/pack 路径与哈希覆盖一致。完整审计的源码行号与验收结果见本机交付报告。
