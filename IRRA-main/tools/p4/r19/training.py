@@ -31,7 +31,7 @@ def config_differences(base, derived):
     }
 
 
-def validate_derivation(base, derived, dataset, smoke=False):
+def validate_derivation(base, derived, dataset, smoke=False, historical_root_dir=None):
     if dataset not in DATASETS:
         raise ValueError("Unsupported R19 dataset: " + str(dataset))
     if not isinstance(smoke, bool):
@@ -39,6 +39,10 @@ def validate_derivation(base, derived, dataset, smoke=False):
     allowed = set(COMMON_ALLOWED)
     if dataset == "RGBNT201-PEDES":
         allowed.update(RGBNT_ALLOWED)
+    elif historical_root_dir is not None:
+        if str(derived.get("root_dir")) != str(historical_root_dir):
+            raise ValueError("RGBT root_dir must equal the supplied historical root_dir")
+        allowed.add("root_dir")
     if smoke:
         allowed.add("num_epoch")
     changes = config_differences(base, derived)
@@ -56,12 +60,16 @@ def validate_derivation(base, derived, dataset, smoke=False):
 
 
 def derive_config(base, dataset, seed, output_dir, root_dir=None,
-                  dev_split_file=None, smoke=False):
+                  dev_split_file=None, smoke=False, historical_configs=None):
     """Copy a full historical recipe and alter only the authorized R19 keys.
 
     RGBNT201's dataset/root/split overrides are the same three dataset keys used
-    by the R18 L1 command. RGBT paths are inherited unchanged; an attempted
-    RGBT path override is rejected. Only the separately named smoke recipe may
+    by the R18 L1 command. The RGBT split remains inherited; its data root
+    may be replaced only with the common value authenticated by all
+    three historical configs. With no historical context the original pure
+    helper contract is retained: it can only inherit the original base path.
+    The production derive CLI always requires historical context for RGBT.
+    Only the separately named smoke recipe may
     change num_epoch. No random source is read or written.
     """
     if not isinstance(base, Mapping):
@@ -75,10 +83,16 @@ def derive_config(base, dataset, seed, output_dir, root_dir=None,
     if not str(output_dir).strip():
         raise ValueError("output_dir must be nonempty")
     derived = copy.deepcopy(dict(base))
+    history = load_historical_configs(historical_configs) if historical_configs is not None else None
     if dataset == "RGBT-PEDES":
         if base.get("dataset_name") != dataset:
             raise ValueError("RGBT must use its unchanged RGBT-PEDES base recipe")
-        for key, value in (("root_dir", root_dir), ("dev_split_file", dev_split_file)):
+        if history is not None:
+            if root_dir is None or str(root_dir) != history["historical_root_dir"]:
+                raise ValueError("RGBT requires its supplied historical root_dir")
+            derived["root_dir"] = str(root_dir)
+        for key, value in (("root_dir", root_dir if history is None else None),
+                           ("dev_split_file", dev_split_file)):
             if value is not None and str(value) != str(base.get(key, "")):
                 raise ValueError("RGBT " + key + " must be inherited from its base recipe")
     else:
@@ -98,7 +112,8 @@ def derive_config(base, dataset, seed, output_dir, root_dir=None,
     derived["mlm_single_count"] = True
     if smoke:
         derived["num_epoch"] = 2
-    validate_derivation(base, derived, dataset, smoke)
+    validate_derivation(base, derived, dataset, smoke,
+                        history["historical_root_dir"] if history and dataset == "RGBT-PEDES" else None)
     return derived
 
 
@@ -108,6 +123,144 @@ def _sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_historical_configs(paths):
+    """Authenticate three distinct saved configs and their common data root.
+
+    Entries may be paths or {path, sha256} records. When a caller supplies a
+    digest it is verified, never trusted as a substitute for reading the file.
+    Selection of successful checkpoint runs is the driver's responsibility.
+    """
+    if str(CODE) not in sys.path:
+        sys.path.insert(0, str(CODE))
+    from utils.config import load_config_mapping
+    entries = list(paths)
+    if len(entries) != 3:
+        raise ValueError("Exactly three historical configs are required")
+    records, roots = [], []
+    for entry in entries:
+        path = Path(entry["path"] if isinstance(entry, Mapping) else entry).resolve()
+        digest = _sha256(path)
+        if isinstance(entry, Mapping) and entry.get("sha256") != digest:
+            raise ValueError("Historical config SHA256 mismatch: " + str(path))
+        config = load_config_mapping(path)
+        root = config.get("root_dir")
+        if not isinstance(root, str) or not root.strip():
+            raise ValueError("Historical config has no valid root_dir: " + str(path))
+        roots.append(root)
+        records.append({"path": str(path), "sha256": digest})
+    if len({item["path"] for item in records}) != 3:
+        raise ValueError("Historical configs must be three distinct files")
+    if len(set(roots)) != 1:
+        raise ValueError("The three historical root_dir values disagree")
+    return {"historical_root_dir": roots[0], "historical_configs": records}
+
+
+def _write_check(path, record):
+    if path is not None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(_json_value(record), stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+    return record
+
+
+def _resolved_recipe_seeds(config, seed):
+    """Resolve only train.py's two seed assignments; do not fill other keys."""
+    result = copy.deepcopy(dict(config))
+    train_seed = result.get("train_seed")
+    train_seed = seed if train_seed is None else int(train_seed)
+    result["train_seed"] = train_seed
+    # train.py uses TRAIN_SEED (+ rank 0), then resolve_deg_rng_seed.
+    # Kept as the exact integer formula to avoid importing torch for a check.
+    value = result.get("deg_rng_seed")
+    result["deg_rng_seed"] = train_seed * 1000 + 7919 if value is None else int(value)
+    return result
+
+
+def compare_recipe_history(expected_path, historical_path, seed, output_path=None, smoke=False):
+    """Compare every runtime field before training and retain failed checks."""
+    if str(CODE) not in sys.path:
+        sys.path.insert(0, str(CODE))
+    from utils.config import load_config_mapping
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
+    if not isinstance(smoke, bool):
+        raise ValueError("smoke must be a boolean")
+    expected_path, historical_path = Path(expected_path), Path(historical_path)
+    expected_raw = load_config_mapping(expected_path)
+    historical_raw = load_config_mapping(historical_path)
+    expected = _resolved_recipe_seeds(expected_raw, seed)
+    historical = _resolved_recipe_seeds(historical_raw, seed)
+    allowed = {"name", "output_dir", "config_file", "mlm_single_count"}
+    if smoke:
+        allowed.add("num_epoch")
+    differences = config_differences(historical, expected)
+    forbidden = {key: value for key, value in differences.items() if key not in allowed}
+    seed_ok = expected["train_seed"] == historical["train_seed"] == seed
+    record = {"expected": str(expected_path.resolve()), "expected_sha256": _sha256(expected_path),
+              "historical": str(historical_path.resolve()), "historical_sha256": _sha256(historical_path),
+              "seed": seed, "smoke": smoke, "allowed_keys": sorted(allowed),
+              "differences": differences, "forbidden_differences": forbidden,
+              "resolved_seeds": {"expected": {key: expected[key] for key in ("train_seed", "deg_rng_seed")},
+                                 "historical": {key: historical[key] for key in ("train_seed", "deg_rng_seed")}},
+              "seed_matches_requested": seed_ok, "ok": not forbidden and seed_ok,
+              "training_ran": False}
+    _write_check(output_path, record)
+    if not record["ok"]:
+        raise ValueError("Recipe differs from historical config: " +
+                         (", ".join(sorted(forbidden)) if forbidden else "train_seed does not match requested seed"))
+    return record
+
+
+def data_fingerprint(dataset, root_dir, output_path=None):
+    """Read only annotation bytes and directory entries; never decode images.
+
+    RGBT resolution executes only its two path resolver methods extracted from
+    the actual loader, avoiding package imports that could construct datasets.
+    """
+    import ast
+    import os.path as op
+    if dataset not in DATASETS:
+        raise ValueError("Unsupported R19 dataset: " + str(dataset))
+    root = Path(root_dir)
+    if dataset == "RGBT-PEDES":
+        source = CODE / "datasets/rgbtpedes.py"
+        tree = ast.parse(source.read_text(encoding="utf-8-sig"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RGBTPEDES")
+        names = {"_resolve_data_dir", "_resolve_anno_path"}
+        methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        if {node.name for node in methods} != names:
+            raise ValueError("RGBT path resolvers are missing")
+        namespace = {"op": op}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+        directory = Path(namespace["_resolve_data_dir"](None, str(root / "RGBT-PEDES")))
+        annotation = Path(namespace["_resolve_anno_path"](None, str(directory)))
+    else:
+        source = CODE / "datasets/rgbnt201pedes.py"
+        directory = root / "RGBNT201"
+        annotation = directory / "captionform0_8B.json"
+    rgb, thermal = directory / "RGB", directory / "T"
+    missing = [str(path) for path in (annotation, rgb, thermal)
+               if not (path.is_file() if path == annotation else path.is_dir())]
+    counts = {"RGB": sum(path.is_file() for path in rgb.rglob("*")) if rgb.is_dir() else 0,
+              "T": sum(path.is_file() for path in thermal.rglob("*")) if thermal.is_dir() else 0}
+    expected_counts = {"RGB": 4723, "T": 4723} if dataset == "RGBT-PEDES" else None
+    counts_ok = counts == expected_counts if expected_counts is not None else all(counts.values())
+    record = {"dataset": dataset, "root_dir": str(root), "data_dir": str(directory),
+              "annotation_path": str(annotation),
+              "annotation_sha256": _sha256(annotation) if annotation.is_file() else None,
+              "rgb_dir": str(rgb), "t_dir": str(thermal), "counts": counts,
+              "expected_counts": expected_counts, "missing": missing,
+              "resolver": str(source), "resolver_sha256": _sha256(source),
+              "ok": not missing and bool(counts_ok), "images_decoded": False, "training_ran": False}
+    _write_check(output_path, record)
+    if not record["ok"]:
+        raise ValueError("Data fingerprint failed: " + ("missing " + ", ".join(missing) if missing else
+                         "RGB/T file counts " + str(counts) + "; expected " + str(expected_counts)))
+    return record
 
 
 def _json_value(value):
@@ -122,7 +275,7 @@ def _json_value(value):
 
 def write_derived_config(base_path, output_path, dataset, seed, output_dir,
                          root_dir=None, dev_split_file=None, smoke=False,
-                         override_path=OVERRIDE_PATH):
+                         override_path=OVERRIDE_PATH, historical_configs=None):
     """Write a new YAML plus its SHA/difference provenance; never overwrite."""
     import yaml
     if str(CODE) not in sys.path:
@@ -140,8 +293,11 @@ def write_derived_config(base_path, output_path, dataset, seed, output_dir,
     if override != expected:
         raise ValueError("The path-free R19 override specification differs from the frozen contract")
     base = load_config_mapping(base_path)
-    derived = derive_config(base, dataset, seed, output_dir, root_dir, dev_split_file, smoke)
-    validation = validate_derivation(base, derived, dataset, smoke)
+    history = load_historical_configs(historical_configs) if historical_configs is not None else None
+    historical_root = history["historical_root_dir"] if history and dataset == "RGBT-PEDES" else None
+    derived = derive_config(base, dataset, seed, output_dir, root_dir, dev_split_file, smoke,
+                            historical_configs=historical_configs)
+    validation = validate_derivation(base, derived, dataset, smoke, historical_root)
     class RecipeDumper(yaml.SafeDumper):
         pass
 
@@ -157,7 +313,7 @@ def write_derived_config(base_path, output_path, dataset, seed, output_dir,
     reloaded = load_config_mapping(output_path)
     if config_differences(derived, reloaded):
         raise ValueError("The generated YAML changed recipe values or types on reload")
-    validate_derivation(base, reloaded, dataset, smoke)
+    validate_derivation(base, reloaded, dataset, smoke, historical_root)
     try:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=CODE.parent,
                                          text=True, stderr=subprocess.DEVNULL).strip()
@@ -172,6 +328,8 @@ def write_derived_config(base_path, output_path, dataset, seed, output_dir,
                              "smoke": smoke},
               "validation": validation, "elapsed_seconds": time.perf_counter() - started,
               "peak_memory_bytes": 0, "peak_memory_note": "CPU recipe generation; no CUDA allocation"}
+    if history is not None:
+        record.update(history)
     with provenance.open("x", encoding="utf-8", newline="\n") as stream:
         json.dump(_json_value(record), stream, ensure_ascii=False, indent=2)
         stream.write("\n")
@@ -256,19 +414,37 @@ def main(argv=None):
     derive.add_argument("--dev_split_file", "--dev-split-file", dest="dev_split_file")
     derive.add_argument("--output", required=True)
     derive.add_argument("--override", default=str(OVERRIDE_PATH))
+    derive.add_argument("--historical_configs", nargs=3,
+                        help="three successful saved configs authenticating the RGBT data root")
     derive.add_argument("--smoke", action="store_true")
     expected = sub.add_parser("runtime-health-base", help="parse the derived recipe for strict health; no training")
     expected.add_argument("--config", required=True)
     expected.add_argument("--output", required=True)
+    compare = sub.add_parser("compare-history", help="check expected runtime recipe against its saved historical run")
+    compare.add_argument("--expected", required=True)
+    compare.add_argument("--historical", required=True)
+    compare.add_argument("--seed", type=int, required=True)
+    compare.add_argument("--output", required=True)
+    compare.add_argument("--smoke", action="store_true")
+    fingerprint = sub.add_parser("data-fingerprint", help="check annotation hash and RGB/T file counts without loading images")
+    fingerprint.add_argument("--dataset", choices=DATASETS, required=True)
+    fingerprint.add_argument("--root_dir", required=True)
+    fingerprint.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.operation == "runtime-health-base":
             record = runtime_health_base(args.config, args.output)
+        elif args.operation == "compare-history":
+            record = compare_recipe_history(args.expected, args.historical, args.seed, args.output, args.smoke)
+        elif args.operation == "data-fingerprint":
+            record = data_fingerprint(args.dataset, args.root_dir, args.output)
         else:
+            if args.dataset == "RGBT-PEDES" and (args.historical_configs is None or args.root_dir is None):
+                raise ValueError("RGBT derive requires --root_dir and --historical_configs from successful runs")
             record = write_derived_config(args.base, args.output, args.dataset, args.seed,
                                           args.output_dir, args.root_dir, args.dev_split_file,
-                                          args.smoke, args.override)
-    except (ValueError, TypeError, FileExistsError) as exc:
+                                          args.smoke, args.override, args.historical_configs)
+    except (ValueError, TypeError, OSError) as exc:
         parser.error(str(exc))
     print(json.dumps(record, ensure_ascii=False, indent=2))
     return 0

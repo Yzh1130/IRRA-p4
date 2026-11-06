@@ -162,4 +162,12 @@ ViT-L/14 仅核查：配置入口 utils/options.py:108，模型 URL 在 model/cl
 
 S3 启动前只读核对基准配方的 pretrain_choice 对应权重：已知 CLIP 名称按原代码的 `~/.cache/clip/<文件名>` 和 URL 钉住的 SHA-256 检查，本地权重路径则记录其哈希。缺失或不符立即停止，不下载、不替换缓存；合格权重也进入训练单元的输入 manifest。该检查不切换骨干。
 
-服务器输入尚未实地核实：已归档的 RGBT 原 base_clean.yaml 的 root_dir 为 `/root/autodl-tmp/MRAF_DATA_ROOT`，驱动按要求原样继承；不能仅因 s102 的保存配置使用 TextReID 就覆盖原配方。启动 S3 前该基准目录及其中的 RGBT-PEDES 标注/图像必须存在。本机没有连接 AutoDL 验证此路径。
+## S3 历史配方与数据预检
+
+原 RGBT `base_clean.yaml` 中的 `/root/autodl-tmp/MRAF_DATA_ROOT` 是占位值。S3 从 `p4_preexp/runs/base_clean_s{seed}/RGBT-PEDES/` 按 `_base_clean_s{seed}` 后缀选择含 `last.pth` 的唯一目录；没有权重的中止尝试不参与，两个有效候选即失败。101/102/103 三份 `configs.yaml` 的 root_dir 必须一致，三份路径和 SHA256 写进 derivation.json；只允许用这个历史有效值修正 RGBT root_dir，其他配方白名单不扩大。生产 derive CLI 对 RGBT 必须同时收到显式 root_dir 和三份历史配置。原直接 Python helper 的无历史参数调用仍只允许继承基准 root，以保持原有调用兼容；S3 不走该兼容入口。
+
+RGBNT 历史目录严格沿用冻结 `p4_r18.sh:203–207` 的 L1 规则：`p4_r18_out/runs/r201_base_s{seed}/RGBNT201-PEDES/*_r201_base_s{seed}`，同样要求唯一且含 `last.pth`。本机归档确认三次运行时间戳分别为 20261029_213129、20261029_214725、20261029_220323；归档不含权重，服务器实际存在性由运行时核对。其数据集三项覆盖仍使用 R18 原方式，不猜新路径。
+
+每次训练前，parser-only `runtime-health-base` 写 expected.yaml，再与同种子有效历史配置逐键比较。仅放行 name/output_dir/config_file/mlm_single_count；两轮冒烟另放行 num_epoch。train_seed/deg_rng_seed 按 train.py 的运行种子及原退化种子规则解析后必须相等；任何其他差异停止。报告写 `checks/recipe_vs_history_<rgbt或rgbnt>_s<seed>[_smoke].json`，并作为训练单元的 manifest 输入。
+
+启动任何 GPU 工作前只读核对两个数据集：RGBT 按实际数据集类的 `_resolve_data_dir` 顺序解析，再记录标注 SHA256、RGB/T 文件数（必须各4723）；RGBNT 直接检查 `<root>/RGBNT201/{RGB,T,captionform0_8B.json}`，记录标注哈希和两目录计数。报告为 `checks/data_rgbt.json`、`checks/data_rgbnt.json`，缺目录/标注或 RGBT 数量不符即失败。本次新增的 S3 验收只用伪造目录/配置，没有连接 AutoDL，也没有训练或读取真实图像特征；全部既有测试中的 R15 回归仍按原规则读取本地保存的开发特征。

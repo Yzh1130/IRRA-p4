@@ -219,5 +219,187 @@ class RuntimeRecipeTests(unittest.TestCase):
                 write_derived_config(base, output, "RGBT-PEDES", 101, "new")
 
 
+class HistoricalRecipeGateTests(unittest.TestCase):
+    def histories(self, root, data_root="historical_data"):
+        import yaml
+        paths = []
+        for seed in (101, 102, 103):
+            path = Path(root) / ("history_s" + str(seed) + ".yaml")
+            config = dict(fake_recipe(), root_dir=data_root, train_seed=seed, deg_rng_seed=seed * 1000 + 7919)
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def test_authenticated_rgbt_root_derivation_and_recorded_hashes(self):
+        from tools.p4.r19.training import load_historical_configs
+        import yaml
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); paths = self.histories(root)
+            base = dict(fake_recipe(), root_dir="nonexistent_placeholder")
+            derived = derive_config(base, "RGBT-PEDES", 101, "new_runs", root_dir="historical_data",
+                                    historical_configs=paths)
+            self.assertEqual(derived["root_dir"], "historical_data")
+            self.assertEqual(base["root_dir"], "nonexistent_placeholder")
+            for override in (None, "wrong_data", "nonexistent_placeholder"):
+                with self.subTest(override=override), self.assertRaisesRegex(ValueError, "historical root_dir"):
+                    derive_config(base, "RGBT-PEDES", 101, "new_runs", root_dir=override,
+                                  historical_configs=paths)
+            source = root / "base.yaml"; source.write_text(yaml.safe_dump(base), encoding="utf-8")
+            record = write_derived_config(source, root / "derived.yaml", "RGBT-PEDES", 101, "new_runs",
+                                          root_dir="historical_data", historical_configs=paths)
+            self.assertEqual(record["historical_root_dir"], "historical_data")
+            self.assertEqual(record["historical_configs"], load_historical_configs(paths)["historical_configs"])
+            self.assertEqual(len(record["historical_configs"]), 3)
+            self.assertIn("root_dir", record["validation"]["differences"])
+            for item, path in zip(record["historical_configs"], paths):
+                self.assertEqual(item, {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+
+    def test_history_roots_distinct_paths_and_supplied_hash_are_checked(self):
+        from tools.p4.r19.training import load_historical_configs
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); paths = self.histories(root)
+            checked = load_historical_configs(paths)
+            self.assertEqual(load_historical_configs(checked["historical_configs"]), checked)
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                load_historical_configs([paths[0], paths[0], paths[2]])
+            with self.assertRaisesRegex(ValueError, "Exactly three"):
+                load_historical_configs(paths[:2])
+            paths[2].write_text(paths[2].read_text().replace("historical_data", "another_data"), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                load_historical_configs(paths)
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                load_historical_configs(checked["historical_configs"])
+
+    def test_production_rgbt_cli_requires_history_and_explicit_root(self):
+        from tools.p4.r19 import training
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = ["derive", "--base", str(root / "base.yaml"), "--output", str(root / "new.yaml"),
+                       "--dataset", "RGBT-PEDES", "--seed", "101", "--output_dir", "runs"]
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                training.main(command)
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse((root / "new.yaml").exists())
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                training.main(command + ["--root_dir", "placeholder"])
+            self.assertEqual(error.exception.code, 2)
+
+    def comparison_pair(self, root, **expected_changes):
+        import yaml
+        original = dict(fake_recipe(), train_seed=101, deg_rng_seed=108919, config_file="historical.yaml")
+        expected = dict(original, name="base_mlm1_s101", output_dir="new", config_file="derived.yaml", mlm_single_count=True)
+        expected.update(expected_changes)
+        old, new = Path(root) / "historical.yaml", Path(root) / "expected.yaml"
+        old.write_text(yaml.safe_dump(original), encoding="utf-8")
+        new.write_text(yaml.safe_dump(expected), encoding="utf-8")
+        return new, old
+
+    def test_equivalence_only_allows_four_explicit_keys_and_writes_report(self):
+        from tools.p4.r19.training import compare_recipe_history
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); expected, history = self.comparison_pair(root)
+            output = root / "checks/recipe.json"
+            record = compare_recipe_history(expected, history, 101, output)
+            self.assertTrue(record["ok"])
+            self.assertEqual(set(record["differences"]), {"name", "output_dir", "config_file", "mlm_single_count"})
+            self.assertEqual(json.loads(output.read_text()), record)
+            self.assertEqual(record["historical_sha256"], hashlib.sha256(history.read_bytes()).hexdigest())
+            expected, history = self.comparison_pair(root, batch_size=32)
+            with self.assertRaisesRegex(ValueError, "batch_size"):
+                compare_recipe_history(expected, history, 101, output)
+            failed = json.loads(output.read_text())
+            self.assertFalse(failed["ok"])
+            self.assertEqual(set(failed["forbidden_differences"]), {"batch_size"})
+
+    def test_smoke_is_the_only_extra_epoch_permission(self):
+        from tools.p4.r19.training import compare_recipe_history
+        with tempfile.TemporaryDirectory() as temporary:
+            expected, history = self.comparison_pair(Path(temporary), num_epoch=2)
+            with self.assertRaisesRegex(ValueError, "num_epoch"):
+                compare_recipe_history(expected, history, 101)
+            self.assertTrue(compare_recipe_history(expected, history, 101, smoke=True)["ok"])
+
+    def test_unresolved_seed_rules_match_train_and_explicit_mismatch_stops(self):
+        from tools.p4.r19.training import compare_recipe_history
+        import yaml
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); expected, history = self.comparison_pair(root, train_seed=None, deg_rng_seed=None)
+            result = compare_recipe_history(expected, history, 101)
+            self.assertEqual(result["resolved_seeds"]["expected"], {"train_seed": 101, "deg_rng_seed": 108919})
+            self.assertEqual(result["resolved_seeds"]["expected"], result["resolved_seeds"]["historical"])
+            saved = yaml.safe_load(history.read_text()); saved.pop("train_seed"); saved.pop("deg_rng_seed")
+            history.write_text(yaml.safe_dump(saved), encoding="utf-8")
+            self.assertTrue(compare_recipe_history(expected, history, 101)["ok"])
+            expected, history = self.comparison_pair(root, deg_rng_seed=123)
+            with self.assertRaisesRegex(ValueError, "deg_rng_seed"):
+                compare_recipe_history(expected, history, 101)
+            expected, history = self.comparison_pair(root, train_seed=102)
+            with self.assertRaisesRegex(ValueError, "train_seed"):
+                compare_recipe_history(expected, history, 101)
+
+    def test_missing_non_seed_fields_are_not_defaulted_away(self):
+        from tools.p4.r19.training import compare_recipe_history
+        import yaml
+        with tempfile.TemporaryDirectory() as temporary:
+            expected, history = self.comparison_pair(Path(temporary))
+            value = yaml.safe_load(history.read_text()); value.pop("batch_size")
+            history.write_text(yaml.safe_dump(value), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "batch_size"):
+                compare_recipe_history(expected, history, 101)
+
+    def test_rgbnt_fingerprint_hash_counts_and_no_image_decoding(self):
+        from tools.p4.r19.training import data_fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); data = root / "RGBNT201"
+            for modality in ("RGB", "T"):
+                directory = data / modality; directory.mkdir(parents=True)
+                # Invalid image bytes intentionally prove no image feature/decoder path runs.
+                for i in range(3): (directory / (str(i) + ".jpg")).write_bytes(b"not an image")
+            annotation = data / "captionform0_8B.json"; annotation.write_bytes(b"[]\n")
+            result = data_fingerprint("RGBNT201-PEDES", root, root / "check.json")
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["images_decoded"])
+            self.assertEqual(result["counts"], {"RGB": 3, "T": 3})
+            self.assertEqual(result["annotation_sha256"], hashlib.sha256(annotation.read_bytes()).hexdigest())
+            self.assertEqual(Path(result["annotation_path"]), annotation)
+
+    def test_rgbt_loader_path_priority_and_exact_expected_counts(self):
+        from tools.p4.r19.training import data_fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); outer = root / "RGBT-PEDES"
+            for layout in (outer, outer / "RGBT-PEDES", outer / "RGBT-PEDES-Final"):
+                for modality in ("RGB", "T"):
+                    (layout / modality).mkdir(parents=True)
+                (layout / "Caption.json").write_bytes(b"[]\n")
+            preferred = outer / "RGBT-PEDES-Final"
+            for modality in ("RGB", "T"):
+                for i in range(4723): (preferred / modality / (str(i) + ".jpg")).touch()
+            result = data_fingerprint("RGBT-PEDES", root)
+            self.assertEqual(result["data_dir"], str(preferred))
+            self.assertEqual(result["counts"], {"RGB": 4723, "T": 4723})
+            (preferred / "RGB/4723.jpg").touch()
+            with self.assertRaisesRegex(ValueError, "file counts"):
+                data_fingerprint("RGBT-PEDES", root)
+
+    def test_data_missing_modality_or_annotation_stops_and_preserves_failure_report(self):
+        from tools.p4.r19.training import data_fingerprint
+        for dataset, dirname, filename in (("RGBT-PEDES", "RGBT-PEDES", "Caption.json"),
+                                            ("RGBNT201-PEDES", "RGBNT201", "captionform0_8B.json")):
+            for missing in ("RGB", "T", "annotation"):
+                with self.subTest(dataset=dataset, missing=missing), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary); data = root / dirname
+                    for name in ("RGB", "T"):
+                        if name != missing:
+                            directory = data / name; directory.mkdir(parents=True)
+                            (directory / "1.jpg").touch()
+                    if missing != "annotation": (data / filename).write_bytes(b"[]")
+                    report = root / "check.json"
+                    with self.assertRaisesRegex(ValueError, "missing"):
+                        data_fingerprint(dataset, root, report)
+                    record = json.loads(report.read_text())
+                    self.assertFalse(record["ok"])
+                    self.assertEqual(len(record["missing"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

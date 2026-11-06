@@ -650,5 +650,56 @@ class ParallelFeatureEquivalenceTests(unittest.TestCase):
                                 max(datetime.fromisoformat(r['finished_at']) for r in records.values()))
 
 
+class HistoricalRunSelectionTests(unittest.TestCase):
+    @staticmethod
+    def history(root, dataset="rgbt"):
+        paths = {}
+        for seed in driver.SEEDS:
+            name = ("base_clean" if dataset == "rgbt" else "r201_base") + f"_s{seed}"
+            prefix = "p4_preexp" if dataset == "rgbt" else "p4_r18_out"
+            label = "RGBT-PEDES" if dataset == "rgbt" else "RGBNT201-PEDES"
+            run = root / prefix / "runs" / name / label / ("20260101_000000_" + name)
+            run.mkdir(parents=True)
+            (run / "last.pth").write_bytes(b"synthetic checkpoint marker")
+            (run / "configs.yaml").write_text("root_dir: synthetic_data\n", encoding="utf-8")
+            paths[seed] = run
+        return paths
+
+    def test_three_completed_histories_exclude_aborted_attempt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for dataset in ("rgbt", "rgbnt"):
+                paths = self.history(root, dataset)
+                for seed, run in paths.items():
+                    aborted = run.with_name(run.name.replace("000000", "000001"))
+                    aborted.mkdir()
+                    (aborted / "configs.yaml").write_text("root_dir: placeholder\n")
+                self.assertEqual(driver.historical_run_configs(root, dataset),
+                                 {seed: run / "configs.yaml" for seed, run in paths.items()})
+
+    def test_duplicate_completed_or_missing_config_or_seed_fails(self):
+        for problem in ("duplicate", "config", "checkpoint"):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp); paths = self.history(root)
+                if problem == "duplicate":
+                    run = paths[101].with_name("20260102_000000_base_clean_s101")
+                    run.mkdir(); (run / "last.pth").write_bytes(b"another")
+                else:
+                    (paths[101] / ("configs.yaml" if problem == "config" else "last.pth")).unlink()
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    driver.historical_run_configs(root, "rgbt")
+
+    def test_rgbnt_base_yaml_uses_completed_rgbt_s102_provenance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); paths = self.history(root)
+            base = root / "original.yaml"; base.write_text("dataset_name: RGBT-PEDES\n")
+            (paths[102] / "configs.yaml").write_text(
+                "config_file: " + base.as_posix() + "\n", encoding="utf-8")
+            aborted = paths[102].with_name("20260102_000000_base_clean_s102")
+            aborted.mkdir(); (aborted / "configs.yaml").write_text("config_file: absent\n")
+            from types import SimpleNamespace
+            self.assertEqual(driver.training_base(SimpleNamespace(root=root), "rgbnt"), base)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

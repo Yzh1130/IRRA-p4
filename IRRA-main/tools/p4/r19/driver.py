@@ -730,7 +730,34 @@ def s2(runner, spec):
     return run_units(runner, plan_s2(runner, spec))
 
 
-def training_base(runner, dataset):
+def historical_run_configs(root, dataset):
+    """Find the three completed historical runs; never select an aborted try."""
+    root = Path(root)
+    result = {}
+    for seed in SEEDS:
+        if dataset == 'rgbt':
+            name = f'base_clean_s{seed}'
+            parent = root / 'p4_preexp/runs' / name / 'RGBT-PEDES'
+        elif dataset == 'rgbnt':
+            # p4_r18.sh L1-5 writes OUT/runs/r201_base_s{seed} and find_run
+            # searches this exact dataset directory and suffix (lines 203-207).
+            name = f'r201_base_s{seed}'
+            parent = root / 'p4_r18_out/runs' / name / 'RGBNT201-PEDES'
+        else:
+            raise ValueError('Unknown historical dataset: ' + str(dataset))
+        runs = sorted(p for p in parent.glob('*_' + name)
+                      if p.is_dir() and (p / 'last.pth').is_file())
+        if len(runs) != 1:
+            raise ValueError(f'Expected one completed historical {dataset} s{seed} run with last.pth; '
+                             f'found {len(runs)} under {parent}')
+        config = runs[0] / 'configs.yaml'
+        if not config.is_file():
+            raise FileNotFoundError('Historical configs.yaml missing: ' + str(config))
+        result[seed] = config
+    return result
+
+
+def training_base(runner, dataset, rgbt_history=None):
     if dataset == 'rgbt':
         path = runner.root / 'p4_preexp/configs/p4/base_clean.yaml'
         if not path.is_file():
@@ -738,7 +765,7 @@ def training_base(runner, dataset):
         return path
     # This is exactly R18 L1's BASE_YAML provenance, without changing that file.
     from utils.config import load_config_mapping
-    cfg = unique(runner.root / 'p4_preexp/runs/base_clean_s102/RGBT-PEDES', '*_base_clean_s102/configs.yaml')
+    cfg = (rgbt_history or historical_run_configs(runner.root, 'rgbt'))[102]
     path = Path(load_config_mapping(cfg)['config_file'])
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -773,14 +800,26 @@ def pretrained_input(base, code=CODE, cache=None, models=None):
 def s3(runner, spec):
     """Explicit GPU stage; one two-epoch smoke per dataset before six formal runs."""
     from tools.p4.r18 import workflow
+    from tools.p4.r19.training import (load_historical_configs, data_fingerprint,
+                                       compare_recipe_history)
     fresh = {'seeds': list(spec['seeds']), 'fits': list(spec['fits']),
              'assign_seeds': list(spec['assign_seeds']), 'grid': 'v3',
              'datasets': {'rgbt': {}, 'rgbnt': {}, 'rgbnt_subset': {}}}
     r18 = runner.code / 'tools/p4/r18'
     py = [sys.executable, '-B']
     data_root = runner.code / 'datasets/TextReID'
+    # Resolve both complete three-seed histories before launching any GPU work.
+    histories = {dataset: historical_run_configs(runner.root, dataset)
+                 for dataset in ('rgbt', 'rgbnt')}
+    rgbt_history = load_historical_configs(list(histories['rgbt'].values()))
+    roots = {'rgbt': rgbt_history['historical_root_dir'], 'rgbnt': str(data_root)}
+    fingerprints = {}
     for dataset, dataset_name in [('rgbt', 'RGBT-PEDES'), ('rgbnt', 'RGBNT201-PEDES')]:
-        base = training_base(runner, dataset)
+        fingerprint = data_fingerprint(dataset_name, roots[dataset],
+                                       output_path=runner.out / f'checks/data_{dataset}.json')
+        fingerprints[dataset] = fingerprint
+    for dataset, dataset_name in [('rgbt', 'RGBT-PEDES'), ('rgbnt', 'RGBNT201-PEDES')]:
+        base = training_base(runner, dataset, histories['rgbt'])
         pretrained = pretrained_input(base, runner.code)
         save(runner.out / ('checks/pretrained_' + dataset + '.json'), pretrained)
         for smoke, seeds in [(True, [101]), (False, spec['seeds'])]:
@@ -793,10 +832,13 @@ def s3(runner, spec):
                 command = [*py, runner.code / 'tools/p4/r19/training.py', 'derive',
                            '--base', base, '--dataset', dataset_name, '--seed', str(seed),
                            '--output_dir', run_parent, '--output', config]
-                cfg_inputs = [base]
+                cfg_inputs = [base, *histories[dataset].values()]
+                command += ['--root_dir', roots[dataset]]
+                if dataset == 'rgbt':
+                    command += ['--historical_configs', *histories['rgbt'].values()]
                 if dataset == 'rgbnt':
                     split = runner.code / 'splits/rgbnt201_dev30.json'
-                    command += ['--root_dir', data_root, '--dev_split_file', split]
+                    command += ['--dev_split_file', split]
                     cfg_inputs.append(split)
                 if smoke:
                     command += ['--smoke']
@@ -809,12 +851,18 @@ def s3(runner, spec):
                             [[*py, runner.code / 'tools/p4/r19/training.py', 'runtime-health-base',
                               '--config', config, '--output', expected_config]],
                             {'parser_only': True, 'train_seed': seed, 'smoke': smoke})
+                recipe_check = runner.out / ('checks/recipe_vs_history_' + suffix + '.json')
+                compare_recipe_history(expected_config, histories[dataset][seed], seed,
+                                       output_path=recipe_check, smoke=smoke)
                 # TRAIN_SEED is scoped to this subprocess only; no stage-global RNG.
                 train_command = [*py, '-c',
                     'import os,runpy,sys;os.environ["TRAIN_SEED"]=sys.argv.pop(1);'
                     'script=sys.argv.pop(1);sys.argv[0]=script;runpy.run_path(script,run_name="__main__")',
                     str(seed), runner.code / 'train.py', '--config_file', config]
-                runner.unit('train_' + suffix, run_parent, [config, pretrained['path'], *cfg_inputs[1:]], [train_command],
+                runner.unit('train_' + suffix, run_parent,
+                            [config, expected_config, recipe_check, pretrained['path'],
+                             runner.out / f'checks/data_{dataset}.json',
+                             fingerprints[dataset]['annotation_path'], *cfg_inputs[1:]], [train_command],
                             {'dataset': dataset_name, 'train_seed': seed, 'smoke': smoke,
                              'mlm_single_count': True})
                 run = workflow.find_run(run_parent / dataset_name, name)
